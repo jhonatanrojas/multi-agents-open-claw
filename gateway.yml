@@ -1,0 +1,41 @@
+## gateway.yml — Dev Squad Multi-Agent Config
+## Place at: ~/.openclaw/gateway.yml
+
+agents:
+  list:
+    - id: "arch"
+      name: "ARCH — Coordinator"
+      workspace: "./workspaces/coordinator"
+      model: "anthropic/claude-opus-4-6"
+      agentDir: "~/.openclaw/agents/arch"
+
+    - id: "byte"
+      name: "BYTE — Programmer"
+      workspace: "./workspaces/programmer"
+      model: "anthropic/claude-sonnet-4-6"
+      agentDir: "~/.openclaw/agents/byte"
+
+    - id: "pixel"
+      name: "PIXEL — Designer"
+      workspace: "./workspaces/designer"
+      model: "anthropic/claude-sonnet-4-6"
+      agentDir: "~/.openclaw/agents/pixel"
+
+## Shared memory — all agents mount the same directory
+sharedMemory:
+  enabled: true
+  path: "./shared"           # All agents read/write shared/MEMORY.json
+
+## Skills available to ALL agents
+skills:
+  shared:
+    - path: "~/.openclaw/skills/fs-read"       # read files
+    - path: "~/.openclaw/skills/fs-write"      # write files
+    - path: "~/.openclaw/skills/code-exec"     # run code snippets
+    - path: "./skills/stack-router"            # stack-aware skill routing
+    - path: "./skills/miniverse-bridge"        # custom Miniverse heartbeat skill
+
+## Channels (optional — remove if not using messaging channels)
+# channels:
+#   slack:
+#     token: "${SLACK_BOT_TOKEN}"

@@ -1,0 +1,35 @@
+{
+  "schema_version": "2.0",
+  "project": {
+    "id": null,
+    "name": null,
+    "description": null,
+    "tech_stack": {},
+    "output_dir": "./output",
+    "repo_url": null,
+    "repo_name": null,
+    "repo_path": null,
+    "branch": null,
+    "bootstrap_status": "idle",
+    "status": "idle",
+    "created_at": null,
+    "updated_at": null,
+    "task_skill_summary": {}
+  },
+  "plan": {
+    "phases": [],
+    "current_phase": null
+  },
+  "tasks": [],
+  "agents": {
+    "arch": { "status": "idle", "current_task": null, "last_seen": null },
+    "byte": { "status": "idle", "current_task": null, "last_seen": null },
+    "pixel": { "status": "idle", "current_task": null, "last_seen": null }
+  },
+  "blockers": [],
+  "milestones": [],
+  "files_produced": [],
+  "progress_files": [],
+  "messages": [],
+  "log": []
+}

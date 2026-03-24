@@ -1,0 +1,2 @@
+"""OpenClaw skill package namespace."""
+
