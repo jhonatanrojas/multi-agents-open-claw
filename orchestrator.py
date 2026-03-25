@@ -21,7 +21,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from openclaw_sdk import OpenClawClient
+from openclaw_sdk import OpenClawClient, ProgressCallback
 
 from coordination import (
     RepositoryApprovalRequired,
@@ -46,6 +46,17 @@ DEFAULT_PHASE_TIMEOUT_SEC = 7200
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY_SEC = 2.0
 DEFAULT_DRY_RUN_SUMMARY_FILE = "dry-run-summary.md"
+AGENT_LOG_DIR = LOG_DIR / "agents"
+
+# Labels shown in Telegram/logs for each progress classification.
+_PROGRESS_EMOJI = {
+    "tool_use": "\u2699\ufe0f",   # ⚙️
+    "thinking": "\U0001f9e0",     # 🧠
+    "writing": "\u270d\ufe0f",    # ✍️
+    "reading": "\U0001f50d",      # 🔍
+    "working": "\U0001f527",      # 🔧
+    "done": "\u2705",             # ✅
+}
 
 
 def utc_now() -> str:
@@ -53,9 +64,83 @@ def utc_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
 
 
+def _append_agent_log(agent_id: str, record: dict[str, Any]) -> None:
+    """Append a JSONL record to the per-agent log file."""
+    agent_log = AGENT_LOG_DIR / f"{agent_id}.jsonl"
+    agent_log.parent.mkdir(parents=True, exist_ok=True)
+    with agent_log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def make_progress_callback(
+    *,
+    notify_telegram: bool = True,
+    telegram_throttle_sec: float = 30.0,
+) -> ProgressCallback:
+    """Build a progress callback that logs, notifies Telegram, and updates heartbeats.
+
+    The callback is throttled internally for Telegram (default every 30s)
+    while still logging every line to the per-agent JSONL log.
+    """
+    _last_tg: dict[str, float] = {}  # agent_id -> last telegram ts
+
+    def _callback(agent_id: str, classification: str, line: str, elapsed_sec: float) -> None:
+        emoji = _PROGRESS_EMOJI.get(classification, "\U0001f527")
+        short = line[:120]
+
+        # 1. Per-agent JSONL log (every line).
+        _append_agent_log(agent_id, {
+            "ts": utc_now(),
+            "agent": agent_id,
+            "type": classification,
+            "elapsed_sec": round(elapsed_sec, 1),
+            "line": line[:500],
+        })
+
+        # 2. Miniverse heartbeat (every line, cheap).
+        try:
+            bridge = get_bridge(agent_id)
+            bridge.heartbeat("working", f"{emoji} {short[:60]}")
+        except Exception:
+            pass
+
+        # 3. Orchestrator JSONL log.
+        _append_jsonl_record({
+            "ts": utc_now(),
+            "agent": agent_id,
+            "level": "debug",
+            "msg": f"[progress] {classification}: {short}",
+            "elapsed_sec": round(elapsed_sec, 1),
+        })
+
+        # 4. Telegram notification (throttled per agent).
+        if notify_telegram and classification != "done":
+            now = time.monotonic()
+            prev = _last_tg.get(agent_id, 0.0)
+            if (now - prev) >= telegram_throttle_sec:
+                _last_tg[agent_id] = now
+                try:
+                    send_telegram_message(
+                        f"{emoji} *{agent_id.upper()}* ({elapsed_sec:.0f}s): {short}",
+                    )
+                except Exception:
+                    pass
+
+        # 5. "done" always notifies Telegram.
+        if classification == "done":
+            try:
+                send_telegram_message(
+                    f"{emoji} *{agent_id.upper()}* terminó — {line}",
+                )
+            except Exception:
+                pass
+
+    return _callback
+
+
 def ensure_runtime_dirs() -> None:
     """Create runtime directories used by the orchestrator."""
-    for path in (OUTPUT_DIR, LOG_DIR, PROJECTS_DIR, BASE_DIR / "shared", BASE_DIR / "workspaces"):
+    for path in (OUTPUT_DIR, LOG_DIR, PROJECTS_DIR, BASE_DIR / "shared", BASE_DIR / "workspaces", AGENT_LOG_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -422,10 +507,12 @@ async def relay_team_messages(client: OpenClawClient) -> None:
         return
 
     arch = client.get_agent("arch")
+    coord_cb = make_progress_callback(notify_telegram=False)
     result = await arch.execute(
         COORDINATION_PROMPT.format(
             messages=json.dumps(arch_messages, indent=2, ensure_ascii=False),
-        )
+        ),
+        on_progress=coord_cb,
     )
 
     try:
@@ -681,20 +768,33 @@ async def plan_project(
         if client is None:
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
         arch = client.get_agent("arch")
+        progress_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
+        planner_prompt = PLANNER_PROMPT.format(project_brief=brief)
         result = await retry_async(
             "Planner execution",
-            lambda: arch.execute(PLANNER_PROMPT.format(project_brief=brief)),
+            lambda: arch.execute(planner_prompt, on_progress=progress_cb),
             timeout_sec=phase_timeout_sec,
             retries=retry_attempts,
             delay_sec=retry_delay_sec,
             agent="arch",
         )
 
+        log_event(
+            f"ARCH respondió en {result.elapsed_sec:.0f}s "
+            f"(content_len={len(result.content)}, stderr_lines={len(result.stderr_lines)})",
+            "arch",
+        )
+
         try:
             plan_json = json.loads(result.content)
         except json.JSONDecodeError as exc:
             update_agent_status("arch", "error", "planning_failed")
-            log_event(f"El planificador devolvió JSON inválido: {exc}", "arch", level="error")
+            log_event(
+                f"El planificador devolvió JSON inválido: {exc} — "
+                f"content[:300]={result.content[:300]}",
+                "arch",
+                level="error",
+            )
             update_orchestrator_state("error", phase="planning", detail="El planificador devolvió JSON inválido", dry_run=dry_run)
             raise RuntimeError("El planificador devolvió JSON inválido") from exc
 
@@ -848,13 +948,15 @@ async def execute_task(
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
         agent = client.get_agent(agent_id)
 
+    task_progress_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
+
     try:
         if dry_run:
             result = None
         else:
             result = await retry_async(
                 f"Ejecución de tarea del agente {agent_id}",
-                (lambda _a=agent, _p=prompt: lambda: _a.execute(_p))(),
+                (lambda _a=agent, _p=prompt, _cb=task_progress_cb: lambda: _a.execute(_p, on_progress=_cb))(),
                 timeout_sec=task_timeout_sec,
                 retries=retry_attempts,
                 delay_sec=retry_delay_sec,
@@ -873,6 +975,13 @@ async def execute_task(
         update_agent_status(agent_id, "error", task_id)
         update_orchestrator_state("error", phase="execution", task_id=task_id, detail=str(exc), dry_run=dry_run)
         return
+
+    if not dry_run and result is not None:
+        log_event(
+            f"{agent_id.upper()} respondió en {result.elapsed_sec:.0f}s "
+            f"(content_len={len(result.content)}, stderr_lines={len(result.stderr_lines)})",
+            agent_id,
+        )
 
     try:
         if not dry_run:
@@ -999,13 +1108,20 @@ async def final_review(
         if client is None:
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
         arch = client.get_agent("arch")
+        review_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
+        review_prompt = REVIEW_PROMPT.format(memory=json.dumps(mem, indent=2, ensure_ascii=False))
         result = await retry_async(
             "Final review",
-            lambda: arch.execute(REVIEW_PROMPT.format(memory=json.dumps(mem, indent=2, ensure_ascii=False))),
+            lambda: arch.execute(review_prompt, on_progress=review_cb),
             timeout_sec=phase_timeout_sec,
             retries=retry_attempts,
             delay_sec=retry_delay_sec,
             agent="arch",
+        )
+        log_event(
+            f"Review completado en {result.elapsed_sec:.0f}s "
+            f"(content_len={len(result.content)}, stderr_lines={len(result.stderr_lines)})",
+            "arch",
         )
         result_content = result.content
 

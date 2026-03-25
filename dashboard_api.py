@@ -11,8 +11,12 @@ Endpoints:
   GET  /api/agents/world   -> proxies Miniverse /api/agents
   GET  /api/logs           -> last log entries
   POST /api/project/start  -> triggers orchestrator
-  GET  /api/models         -> current model configuration (GAP-5)
-  PUT  /api/models         -> update model configuration (GAP-5)
+  GET  /api/models           -> current agent models + available models from OpenClaw
+  GET  /api/models/available -> flat list of all models across providers
+  GET  /api/models/providers -> provider configs (without API keys)
+  PUT  /api/models           -> bulk-update arch/byte/pixel models
+  PUT  /api/models/agent     -> change model for a single agent
+  PUT  /api/models/defaults  -> change global default model + fallbacks
 
 Auth (GAP-1 / P5):
   All endpoints except /health and /api/health require the header
@@ -39,12 +43,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
+from openclaw_sdk import (
+    get_available_models,
+    get_agent_models,
+    load_openclaw_config,
+    set_agent_model as sdk_set_agent_model,
+    set_default_model as sdk_set_default_model,
+)
 from shared_state import BASE_DIR, load_memory, _pid_is_alive
 
 MINIVERSE_URL = os.getenv("MINIVERSE_URL", "https://miniverse-public-production.up.railway.app")
 LOCK_FILE = BASE_DIR / "logs" / "orchestrator.lock"
 JSONL_LOG_FILE = BASE_DIR / "logs" / "orchestrator.jsonl"
-MODELS_CONFIG_FILE = BASE_DIR / "models_config.json"
 
 # GAP-1 / P5 — API key auth (empty string = disabled)
 _API_KEY: str = os.getenv("DASHBOARD_API_KEY", "")
@@ -149,35 +159,15 @@ def _validate_brief(brief: str) -> str:
 
 
 def _load_models_config() -> dict[str, Any]:
-    if MODELS_CONFIG_FILE.exists():
-        try:
-            return json.loads(MODELS_CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    # Defaults matching the project's model choices (GAP-5 / P6)
+    """Build models config from the live OpenClaw configuration."""
+    agents = get_agent_models()
+    available = get_available_models()
+    defaults = agents.pop("_defaults", {})
     return {
-        "arch": "nvidia/z-ai/glm5",
-        "byte": "nvidia/moonshotai/kimi-k2.5",
-        "byte_fallback": "deepseek/deepseek-chat",
-        "pixel": "deepseek/deepseek-chat",
-        "available": [
-            "nvidia/z-ai/glm5",
-            "nvidia/moonshotai/kimi-k2.5",
-            "deepseek/deepseek-chat",
-            "anthropic/claude-opus-4-6",
-            "anthropic/claude-sonnet-4-6",
-            "anthropic/claude-haiku-4-5-20251001",
-            "openai/gpt-4o",
-            "google/gemini-2.0-flash",
-        ],
+        "agents": agents,
+        "available": available,
+        "defaults": defaults,
     }
-
-
-def _save_models_config(config: dict[str, Any]) -> None:
-    MODELS_CONFIG_FILE.write_text(
-        json.dumps(config, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
 
 
 def build_health_snapshot() -> dict[str, Any]:
@@ -270,32 +260,106 @@ def agents_in_world():
 
 @app.get("/api/models")
 def get_models():
-    """Return the current model configuration and list of available models."""
+    """Return current model assignments and all available models from OpenClaw config."""
     return _load_models_config()
 
 
+@app.get("/api/models/available")
+def get_available():
+    """Return flat list of all models available across configured providers."""
+    return {"models": get_available_models()}
+
+
+class AgentModelUpdate(BaseModel):
+    """Update the model for a single agent."""
+    agent_id: str
+    model: str
+
+
 class ModelsUpdate(BaseModel):
+    """Bulk update: change model for one or more agents at once."""
     arch: str | None = None
     byte: str | None = None
-    byte_fallback: str | None = None
     pixel: str | None = None
+
+
+class DefaultModelUpdate(BaseModel):
+    """Update the global default model and optional fallbacks."""
+    primary: str
+    fallbacks: list[str] | None = None
+
+
+@app.put("/api/models/agent")
+def update_agent_model(update: AgentModelUpdate):
+    """Change the model for a single agent in openclaw.json.
+
+    The change takes effect on the next ``openclaw agent`` invocation —
+    no gateway restart needed.
+    """
+    try:
+        updated = sdk_set_agent_model(update.agent_id, update.model)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    return {
+        "saved": True,
+        "agent": updated,
+        "config": _load_models_config(),
+    }
 
 
 @app.put("/api/models")
 def update_models(update: ModelsUpdate):
-    """Update model assignments.  Changes take effect on the next project run.
+    """Bulk-update model assignments for arch/byte/pixel.
 
-    Restart the openclaw-gateway service after saving so the new models load.
+    Writes directly to ``~/.openclaw/openclaw.json``.
+    Changes take effect on the next agent invocation.
     """
-    config = _load_models_config()
-    for field, value in update.model_dump(exclude_none=True).items():
-        config[field] = value
-    _save_models_config(config)
+    errors: list[str] = []
+    updated: dict[str, Any] = {}
+    for agent_id, model in update.model_dump(exclude_none=True).items():
+        try:
+            sdk_set_agent_model(agent_id, model)
+            updated[agent_id] = model
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if errors and not updated:
+        return JSONResponse({"errors": errors}, status_code=422)
+
     return {
         "saved": True,
-        "config": config,
-        "note": "Reinicia openclaw-gateway para aplicar los cambios de modelo.",
+        "updated": updated,
+        "errors": errors or None,
+        "config": _load_models_config(),
     }
+
+
+@app.put("/api/models/defaults")
+def update_default_model(update: DefaultModelUpdate):
+    """Change the global default model (used by agents without explicit model)."""
+    try:
+        result = sdk_set_default_model(update.primary, update.fallbacks)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    return {
+        "saved": True,
+        "defaults": result,
+        "config": _load_models_config(),
+    }
+
+
+@app.get("/api/models/providers")
+def get_providers():
+    """Return the raw providers block from openclaw.json (without secrets)."""
+    cfg = load_openclaw_config()
+    providers = cfg.get("models", {}).get("providers", {})
+    # Strip API keys from the response.
+    safe: dict[str, Any] = {}
+    for pid, pcfg in providers.items():
+        entry = {k: v for k, v in pcfg.items() if k != "apiKey"}
+        entry["has_api_key"] = "apiKey" in pcfg
+        safe[pid] = entry
+    return {"providers": safe}
 
 
 # ── Project launch ────────────────────────────────────────────────────────────
