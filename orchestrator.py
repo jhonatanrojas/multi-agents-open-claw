@@ -9,10 +9,15 @@ bootstrap, stack-aware skill routing, Telegram notifications, and Miniverse.
 from __future__ import annotations
 
 import argparse
+import atexit
 import asyncio
 import datetime
 import json
+import os
+import subprocess
 import sys
+import time
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -23,21 +28,29 @@ from coordination import (
     RepositoryBootstrapError,
     bootstrap_repository,
     build_task_skill_profile,
+    commit_task_output,
     send_telegram_message,
     write_agent_workspace_files,
 )
-from shared_state import BASE_DIR, ensure_memory_file, load_memory, save_memory
+from shared_state import BASE_DIR, ensure_memory_file, load_memory, save_memory, _pid_is_alive
 from skills.shared.miniverse_bridge import get_bridge
 
 OUTPUT_DIR = BASE_DIR / "output"
 LOG_DIR = BASE_DIR / "logs"
 PROJECTS_DIR = BASE_DIR / "projects"
+LOCK_FILE = LOG_DIR / "orchestrator.lock"
+JSONL_LOG_FILE = LOG_DIR / "orchestrator.jsonl"
 AGENT_IDS = ("arch", "byte", "pixel")
+DEFAULT_TASK_TIMEOUT_SEC = 1800
+DEFAULT_PHASE_TIMEOUT_SEC = 7200
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_DELAY_SEC = 2.0
+DEFAULT_DRY_RUN_SUMMARY_FILE = "dry-run-summary.md"
 
 
 def utc_now() -> str:
     """Return an ISO-8601 UTC timestamp."""
-    return datetime.datetime.utcnow().isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
 
 
 def ensure_runtime_dirs() -> None:
@@ -102,20 +115,29 @@ def append_progress_event(progress_path: Path, event_type: str, message: str, **
     return payload
 
 
-def log_event(message: str, agent: str = "system") -> None:
+def _append_jsonl_record(record: dict[str, Any]) -> None:
+    """Append a structured JSONL record for operational logs."""
+    JSONL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with JSONL_LOG_FILE.open("a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def log_event(message: str, agent: str = "system", level: str = "info", **extra: Any) -> None:
     """Append a log event to shared memory."""
+    record = {
+        "ts": utc_now(),
+        "agent": agent,
+        "level": level,
+        "msg": message,
+        **{k: v for k, v in extra.items() if v is not None},
+    }
     mem = load_memory()
     mem.setdefault("log", [])
-    mem["log"].append(
-        {
-            "ts": utc_now(),
-            "agent": agent,
-            "msg": message,
-        }
-    )
+    mem["log"].append(record)
     mem.setdefault("project", {})
     mem["project"]["updated_at"] = utc_now()
     save_memory(mem)
+    _append_jsonl_record(record)
 
 
 def update_agent_status(agent_id: str, status: str, task: str | None = None) -> None:
@@ -127,6 +149,35 @@ def update_agent_status(agent_id: str, status: str, task: str | None = None) -> 
     mem["agents"][agent_id]["last_seen"] = utc_now()
     mem["agents"][agent_id]["current_task"] = task
     mem.setdefault("project", {})
+    mem["project"]["updated_at"] = utc_now()
+    save_memory(mem)
+
+
+def update_orchestrator_state(
+    status: str,
+    phase: str | None = None,
+    task_id: str | None = None,
+    detail: str | None = None,
+    dry_run: bool | None = None,
+) -> None:
+    """Persist the orchestrator runtime state for health checks and dashboards."""
+    mem = load_memory()
+    mem.setdefault("project", {})
+    orchestrator_state = mem["project"].setdefault("orchestrator", {})
+    orchestrator_state.update(
+        {
+            "status": status,
+            "phase": phase,
+            "task_id": task_id,
+            "detail": detail,
+            "pid": os.getpid(),
+            "updated_at": utc_now(),
+        }
+    )
+    if "started_at" not in orchestrator_state or orchestrator_state["started_at"] is None:
+        orchestrator_state["started_at"] = utc_now()
+    if dry_run is not None:
+        orchestrator_state["dry_run"] = dry_run
     mem["project"]["updated_at"] = utc_now()
     save_memory(mem)
 
@@ -145,6 +196,83 @@ def record_blocker(message: str, source: str = "system") -> None:
     save_memory(mem)
 
 
+def acquire_run_lock() -> dict[str, Any]:
+    """Acquire an exclusive lock for the orchestrator process."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "started_at": utc_now(),
+        "argv": sys.argv,
+    }
+    if LOCK_FILE.exists():
+        try:
+            existing = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+        existing_pid = existing.get("pid")
+        if _pid_is_alive(existing_pid) and existing_pid != os.getpid():
+            raise RuntimeError(
+                f"Ya hay otro orquestador en ejecución con PID {existing_pid}."
+            )
+    LOCK_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _release() -> None:
+        release_run_lock()
+
+    atexit.register(_release)
+    return payload
+
+
+def release_run_lock() -> None:
+    """Release the orchestrator lock if owned by the current process."""
+    if not LOCK_FILE.exists():
+        return
+    try:
+        existing = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        existing = {}
+    if existing.get("pid") in {None, os.getpid()}:
+        try:
+            LOCK_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+
+async def retry_async(
+    label: str,
+    factory: Any,
+    *,
+    timeout_sec: int,
+    retries: int,
+    delay_sec: float,
+    agent: str = "system",
+) -> Any:
+    """Run an async factory with timeout and exponential backoff retries."""
+    attempt_delay = max(0.5, float(delay_sec))
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            return await asyncio.wait_for(factory(), timeout=timeout_sec)
+        except Exception as exc:
+            last_exc = exc
+            log_event(
+                f"{label} falló en el intento {attempt}/{max(1, retries)}: {exc}",
+                agent,
+                level="warning",
+                attempt=attempt,
+                retries=max(1, retries),
+                timeout_sec=timeout_sec,
+            )
+            if attempt < max(1, retries):
+                await asyncio.sleep(attempt_delay)
+                attempt_delay *= 2
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{label} failed without a captured exception")
+
+
 def normalize_message(agent_id: str, raw: dict[str, Any]) -> dict[str, Any]:
     """Normalize a Miniverse inbox payload."""
     sender = raw.get("from") or raw.get("sender") or raw.get("agent") or "unknown"
@@ -158,6 +286,77 @@ def normalize_message(agent_id: str, raw: dict[str, Any]) -> dict[str, Any]:
         "raw": raw,
         "received_at": utc_now(),
     }
+
+
+def infer_tech_stack_from_brief(brief: str) -> dict[str, str]:
+    """Infer a coarse tech stack from the project brief for dry-run validation."""
+    text = brief.lower()
+    if any(token in text for token in ("laravel", "php", "artisan", "eloquent")):
+        return {"frontend": "Blade", "backend": "Laravel", "database": "MySQL"}
+    if any(token in text for token in ("express", "node", "nestjs", "fastify", "npm")):
+        return {"frontend": "Web UI", "backend": "Node/Express", "database": "SQLite"}
+    if any(token in text for token in ("react", "typescript", "vite", "next.js", "nextjs")):
+        return {"frontend": "React/TypeScript", "backend": "API", "database": "SQLite"}
+    if any(token in text for token in ("devops", "apache", "nginx", "backup", "cron")):
+        return {"frontend": "Admin UI", "backend": "Operations", "database": "N/A"}
+    return {"frontend": "Frontend", "backend": "Backend", "database": "SQLite"}
+
+
+def build_dry_run_plan(brief: str) -> dict[str, Any]:
+    """Create a deterministic local plan used for dry-run validation."""
+    stack = infer_tech_stack_from_brief(brief)
+    project_name = brief[:60].strip() or "Dry Run Project"
+    project = {
+        "name": project_name,
+        "description": brief,
+        "tech_stack": stack,
+    }
+
+    base_tasks = [
+        {
+            "id": "T-001",
+            "agent": "byte",
+            "title": "Audit project structure and integration points",
+            "description": "Inspect the repository, identify the main modules, and map the integration surface.",
+            "acceptance": [
+                "Repository layout is documented",
+                "Integration points are listed",
+                "Risks and dependencies are identified",
+            ],
+            "depends_on": [],
+        },
+        {
+            "id": "T-002",
+            "agent": "byte",
+            "title": "Implement core orchestration safeguards",
+            "description": "Add lockfile, health, retries, and timeout handling around the orchestrator flow.",
+            "acceptance": [
+                "Only one orchestrator process can run at a time",
+                "Health state is exposed in shared memory",
+                "Retries and timeouts are configurable",
+            ],
+            "depends_on": ["T-001"],
+        },
+        {
+            "id": "T-003",
+            "agent": "pixel",
+            "title": "Validate dashboard and operational reporting",
+            "description": "Confirm the dashboard can surface state and logs without requiring the UI.",
+            "acceptance": [
+                "Health endpoint is available",
+                "Structured logs are accessible",
+                "State payload is consistent",
+            ],
+            "depends_on": ["T-002"],
+        },
+    ]
+
+    plan = {
+        "project": project,
+        "plan": {"phases": [{"id": "phase-1", "name": "Dry-run validation", "tasks": base_tasks}]},
+        "milestones": ["Dry-run validation complete"],
+    }
+    return plan
 
 
 def build_project_context(mem: dict[str, Any], repo_state: dict[str, Any]) -> str:
@@ -184,6 +383,7 @@ async def relay_team_messages(client: OpenClawClient) -> None:
     """Drain team inboxes, update memory, and let ARCH answer blockers."""
     bridges = {agent_id: get_bridge(agent_id) for agent_id in AGENT_IDS}
     mem = load_memory()
+    existing_message_ids: set[str] = {m.get("id", "") for m in mem.get("messages", [])}
     arch_messages: list[dict[str, Any]] = []
 
     for agent_id, bridge in bridges.items():
@@ -195,6 +395,9 @@ async def relay_team_messages(client: OpenClawClient) -> None:
 
         for raw in inbox or []:
             normalized = normalize_message(agent_id, raw)
+            if normalized["id"] in existing_message_ids:
+                continue
+            existing_message_ids.add(normalized["id"])
             mem.setdefault("messages", [])
             mem["messages"].append(normalized)
             log_event(
@@ -206,9 +409,9 @@ async def relay_team_messages(client: OpenClawClient) -> None:
             if "BLOCKER:" in message_upper:
                 record_blocker(normalized["message"], normalized["from"])
                 try:
-                    send_telegram_message(f"BLOCKER from {normalized['from']}: {normalized['message']}")
+                    send_telegram_message(f"BLOQUEO de {normalized['from']}: {normalized['message']}")
                 except Exception as exc:
-                    log_event(f"Telegram notify failed: {exc}", "system")
+                    log_event(f"Falló la notificación por Telegram: {exc}", "system")
 
             if agent_id == "arch" and normalized["from"] in {"byte", "pixel"}:
                 arch_messages.append(normalized)
@@ -255,22 +458,43 @@ async def relay_team_messages(client: OpenClawClient) -> None:
         log_event(f"ARCH -> {target}: {message}", "arch")
 
 
-# ── Phase 1: Planning ──────────────────────────────────────────────────────────
+# ── Gateway health check ───────────────────────────────────────────────────────
+
+
+async def _check_gateway_health(client: "OpenClawClient") -> None:
+    """Raise RuntimeError with a clear message if the gateway is unreachable.
+
+    Tries to resolve each registered agent; any failure is treated as a
+    gateway connectivity problem so the operator gets an actionable error
+    before any API credits are consumed (GAP-6).
+    """
+    try:
+        for agent_id in AGENT_IDS:
+            client.get_agent(agent_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Gateway OpenClaw no responde. "
+            f"Verifica que el proceso openclaw-gateway esté activo y que "
+            f"gateway.yml sea accesible. Detalle: {exc}"
+        ) from exc
+
+
+# ── Fase 1: Planificación ──────────────────────────────────────────────────────
 
 PLANNER_PROMPT = """
-You are ARCH, the senior project coordinator of a multi-agent engineering team.
-Analyze the project brief and produce a structured JSON plan that can be
-executed by BYTE and PIXEL.
+Eres ARCH, el coordinador senior de un equipo multiagente de ingeniería.
+Analiza la descripción del proyecto y produce un plan JSON estructurado que pueda ser
+ejecutado por BYTE y PIXEL.
 
-Requirements:
-- Decompose the work into atomic tasks with clear acceptance criteria.
-- Assign code-focused work to BYTE and UI/design work to PIXEL.
-- When the stack is obvious, make the planned tasks stack-aware
-  (for example Laravel/PHP, Node/Express, React/TypeScript, DevOps, docs).
-- Include optional "skills" and "workspace_notes" arrays for each task when
-  they help the downstream agent specialize.
+Requisitos:
+- Divide el trabajo en tareas atómicas con criterios de aceptación claros.
+- Asigna el trabajo de código a BYTE y el trabajo de UI/diseño a PIXEL.
+- Cuando el stack sea evidente, haz que las tareas sean conscientes del stack
+  (por ejemplo Laravel/PHP, Node/Express, React/TypeScript, DevOps o documentación).
+- Incluye de forma opcional los arreglos "skills" y "workspace_notes" en cada tarea cuando
+  ayuden a especializar al agente downstream.
 
-Respond ONLY with valid JSON. No markdown fences.
+Responde SOLO con JSON válido. No uses fences de markdown.
 
 Schema:
 {{
@@ -306,110 +530,110 @@ Schema:
   "milestones": ["..."]
 }}
 
-PROJECT REQUEST: {project_brief}
+SOLICITUD DEL PROYECTO: {project_brief}
 """
 
 COORDINATION_PROMPT = """
-You are ARCH, coordinating the team.
-Respond to the incoming messages from BYTE and PIXEL.
+Eres ARCH, coordinando al equipo.
+Responde a los mensajes entrantes de BYTE y PIXEL.
 
-Return valid JSON only with this schema:
+Devuelve solo JSON válido con este esquema:
 {{
   "responses": [
     {{
       "to": "byte|pixel",
-      "message": "short, actionable reply",
-      "in_reply_to": "optional message id"
+      "message": "respuesta breve y accionable",
+      "in_reply_to": "id de mensaje opcional"
     }}
   ]
 }}
 
-MESSAGES:
+MENSAJES:
 {messages}
 """
 
 BYTE_TASK_PROMPT = """
-You are BYTE, a senior full-stack engineer. Implement the following task.
-Read the project context and the workspace files before coding.
+Eres BYTE, un ingeniero senior full-stack. Implementa la siguiente tarea.
+Lee el contexto del proyecto y los archivos del workspace antes de programar.
 
-PROJECT CONTEXT:
+CONTEXTO DEL PROYECTO:
 {context}
 
-REPO CONTEXT:
+CONTEXTO DEL REPOSITORIO:
 {repo_context}
 
-SKILL PROFILE:
-- Family: {skill_family}
-- Focus: {skill_focus}
-- Skills:
+PERFIL DE HABILIDADES:
+- Familia: {skill_family}
+- Enfoque: {skill_focus}
+- Habilidades:
 {skill_list}
-- Instructions:
+- Instrucciones:
 {instruction_list}
 
-WORKSPACE FILES:
+ARCHIVOS DEL WORKSPACE:
 - Markdown context: {workspace_md_path}
 - JSON context: {workspace_json_path}
 - Progress JSON: {progress_path}
 
-YOUR TASK:
+TU TAREA:
 ID: {task_id}
-Title: {title}
-Description: {description}
-Acceptance Criteria:
+Título: {title}
+Descripción: {description}
+Criterios de aceptación:
 {acceptance}
 
-COORDINATION PROTOCOL:
-- If you are blocked, DM ARCH with `BLOCKER:{task_id} <issue>`.
-- If you need clarification, DM ARCH with `QUESTION:{task_id} <question>`.
-- Keep the progress JSON updated when your environment allows writes.
+PROTOCOLO DE COORDINACIÓN:
+- Si te bloqueas, envía a ARCH `BLOCKER:{task_id} <problema>`.
+- Si necesitas aclaración, envía a ARCH `QUESTION:{task_id} <pregunta>`.
+- Mantén actualizado el JSON de progreso cuando tu entorno permita escribir.
 
-Output the complete file contents in this JSON format:
+Devuelve el contenido completo de los archivos en este formato JSON:
 {{
   "files": [
     {{"path": "relative/path/file.py", "content": "..."}}
   ],
   "notes": "..."
 }}
-Respond with valid JSON only.
+Responde solo con JSON válido.
 """
 
 PIXEL_TASK_PROMPT = """
-You are PIXEL, a senior UI/UX designer and frontend engineer. Create the
-design artifacts for the following task.
-Read the project context and the workspace files before designing.
+Eres PIXEL, un diseñador UI/UX senior e ingeniero frontend. Crea los
+artefactos de diseño para la siguiente tarea.
+Lee el contexto del proyecto y los archivos del workspace antes de diseñar.
 
-PROJECT CONTEXT:
+CONTEXTO DEL PROYECTO:
 {context}
 
-REPO CONTEXT:
+CONTEXTO DEL REPOSITORIO:
 {repo_context}
 
-SKILL PROFILE:
-- Family: {skill_family}
-- Focus: {skill_focus}
-- Skills:
+PERFIL DE HABILIDADES:
+- Familia: {skill_family}
+- Enfoque: {skill_focus}
+- Habilidades:
 {skill_list}
-- Instructions:
+- Instrucciones:
 {instruction_list}
 
-WORKSPACE FILES:
+ARCHIVOS DEL WORKSPACE:
 - Markdown context: {workspace_md_path}
 - JSON context: {workspace_json_path}
 - Progress JSON: {progress_path}
 
-YOUR TASK:
+TU TAREA:
 ID: {task_id}
-Title: {title}
-Description: {description}
-Acceptance Criteria:
+Título: {title}
+Descripción: {description}
+Criterios de aceptación:
 {acceptance}
 
-COORDINATION PROTOCOL:
-- If you are blocked, DM ARCH with `BLOCKER:{task_id} <issue>`.
-- If you need clarification, DM ARCH with `QUESTION:{task_id} <question>`.
-- Keep the progress JSON updated when your environment allows writes.
+PROTOCOLO DE COORDINACIÓN:
+- Si te bloqueas, envía a ARCH `BLOCKER:{task_id} <problema>`.
+- Si necesitas aclaración, envía a ARCH `QUESTION:{task_id} <pregunta>`.
+- Mantén actualizado el JSON de progreso cuando tu entorno permita escribir.
 
-Output design artifacts in this JSON format:
+Devuelve los artefactos de diseño en este formato JSON:
 {{
   "files": [
     {{"path": "design/{task_id}/component.tsx", "content": "..."}},
@@ -417,41 +641,62 @@ Output design artifacts in this JSON format:
   ],
   "notes": "..."
 }}
-Respond with valid JSON only.
+Responde solo con JSON válido.
 """
 
 REVIEW_PROMPT = """
-You are ARCH. All tasks are complete. Review the project outcome below and
-produce a final delivery summary.
+Eres ARCH. Todas las tareas están completas. Revisa el resultado del proyecto y
+produce un resumen final de entrega.
 
-MEMORY STATE:
+ESTADO DE MEMORIA:
 {memory}
 
-Write a markdown summary (## Delivery Summary) covering:
-1. What was built
-2. Files produced (list them)
-3. How to run the project
-4. Known limitations or next steps
+Escribe un resumen en markdown (## Resumen de entrega) que cubra:
+1. Qué se construyó
+2. Archivos producidos (listarlos)
+3. Cómo ejecutar el proyecto
+4. Limitaciones conocidas o siguientes pasos
 """
 
 
-async def plan_project(client: OpenClawClient, brief: str) -> dict[str, Any]:
+async def plan_project(
+    client: OpenClawClient | None,
+    brief: str,
+    *,
+    dry_run: bool = False,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+    retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
+    phase_timeout_sec: int = DEFAULT_PHASE_TIMEOUT_SEC,
+) -> dict[str, Any]:
     """Ask ARCH to produce a plan and persist it to shared memory."""
-    arch = client.get_agent("arch")
     arch_bridge = get_bridge("arch")
-
-    arch_bridge.heartbeat("thinking", f"Planning: {brief[:60]}")
+    arch_bridge.heartbeat("thinking", f"Planificando: {brief[:60]}")
     update_agent_status("arch", "thinking", "initial_planning")
-    log_event(f"Planning project: {brief}", "arch")
+    update_orchestrator_state("planning", phase="planning", detail="Creando el plan del proyecto", dry_run=dry_run)
+    log_event(f"Planificando proyecto: {brief}", "arch")
 
-    result = await arch.execute(PLANNER_PROMPT.format(project_brief=brief))
+    if dry_run:
+        plan_json = build_dry_run_plan(brief)
+    else:
+        if client is None:
+            raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
+        arch = client.get_agent("arch")
+        result = await retry_async(
+            "Planner execution",
+            lambda: arch.execute(PLANNER_PROMPT.format(project_brief=brief)),
+            timeout_sec=phase_timeout_sec,
+            retries=retry_attempts,
+            delay_sec=retry_delay_sec,
+            agent="arch",
+        )
 
-    try:
-        plan_json = json.loads(result.content)
-    except json.JSONDecodeError as exc:
-        update_agent_status("arch", "error", "planning_failed")
-        log_event(f"Planner returned invalid JSON: {exc}", "arch")
-        raise RuntimeError("Planner returned invalid JSON") from exc
+        try:
+            plan_json = json.loads(result.content)
+        except json.JSONDecodeError as exc:
+            update_agent_status("arch", "error", "planning_failed")
+            log_event(f"El planificador devolvió JSON inválido: {exc}", "arch", level="error")
+            update_orchestrator_state("error", phase="planning", detail="El planificador devolvió JSON inválido", dry_run=dry_run)
+            raise RuntimeError("El planificador devolvió JSON inválido") from exc
 
     mem = load_memory()
     project_patch = plan_json.get("project", {})
@@ -486,10 +731,11 @@ async def plan_project(client: OpenClawClient, brief: str) -> dict[str, Any]:
     save_memory(mem)
 
     arch_bridge.speak(
-        f"Plan ready! {len(all_tasks)} tasks across {len(mem['plan'].get('phases', []))} phases."
+        f"Plan listo. {len(all_tasks)} tareas en {len(mem['plan'].get('phases', []))} fases."
     )
-    log_event(f"Plan created: {len(all_tasks)} tasks", "arch")
+    log_event(f"Plan creado: {len(all_tasks)} tareas", "arch")
     update_agent_status("arch", "idle", None)
+    update_orchestrator_state("planned", phase="planning", detail=f"{len(all_tasks)} tareas planificadas", dry_run=dry_run)
     return plan_json
 
 
@@ -497,10 +743,15 @@ async def plan_project(client: OpenClawClient, brief: str) -> dict[str, Any]:
 
 
 async def execute_task(
-    client: OpenClawClient,
+    client: OpenClawClient | None,
     task: dict[str, Any],
     project_context: str,
     repo_state: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    task_timeout_sec: int = DEFAULT_TASK_TIMEOUT_SEC,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+    retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
 ) -> None:
     """Execute one task with the assigned agent and persist progress."""
     agent_id = task["agent"]
@@ -509,6 +760,8 @@ async def execute_task(
     mem = load_memory()
     project = mem.get("project", {})
     output_dir = resolve_path(project.get("output_dir"), OUTPUT_DIR)
+    if dry_run:
+        output_dir = OUTPUT_DIR / "dry-run" / task_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
     skill_profile = task.get("skill_profile") or build_task_skill_profile(project, task)
@@ -516,9 +769,10 @@ async def execute_task(
     progress_path = workspace_files["progress_path"]
 
     update_agent_status(agent_id, "working", task_id)
-    bridge.heartbeat("working", f"Task {task_id}: {task['title'][:50]}")
-    bridge.speak(f"Starting {task_id}: {task['title']}")
-    log_event(f"Starting task {task_id}", agent_id)
+    update_orchestrator_state("executing", phase="execution", task_id=task_id, detail=f"Ejecutando {task_id}", dry_run=dry_run)
+    bridge.heartbeat("working", f"Tarea {task_id}: {task['title'][:50]}")
+    bridge.speak(f"Iniciando {task_id}: {task['title']}")
+    log_event(f"Iniciando tarea {task_id}", agent_id)
 
     mem = load_memory()
     for t in mem.get("tasks", []):
@@ -535,10 +789,11 @@ async def execute_task(
     append_progress_event(
         progress_path,
         "started",
-        "Task started",
+        "Tarea iniciada",
         status="in_progress",
         skill_profile=skill_profile,
         repo_state=repo_state,
+        dry_run=dry_run,
     )
 
     acceptance_str = "\n".join(f"- {a}" for a in task.get("acceptance", []))
@@ -567,30 +822,66 @@ async def execute_task(
     else:
         prompt = PIXEL_TASK_PROMPT.format(**prompt_kwargs)
 
-    agent = client.get_agent(agent_id)
+    if dry_run:
+        data = {
+            "files": [
+                {
+                    "path": f"{task_id.lower()}/dry-run-summary.md",
+                    "content": "\n".join(
+                        [
+                            f"# Resultado de dry-run para {task_id}",
+                            "",
+                            f"- Agent: {agent_id}",
+                            f"- Title: {task['title']}",
+                            f"- Family: {skill_profile.get('family', 'general')}",
+                            "",
+                            "Esta tarea se ejecutó en modo dry-run.",
+                            "No se ejecutó ningún agente externo ni se modificó el repositorio.",
+                        ]
+                    ),
+                }
+            ],
+            "notes": "Dry-run completado correctamente.",
+        }
+    else:
+        if client is None:
+            raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
+        agent = client.get_agent(agent_id)
 
     try:
-        result = await agent.execute(prompt)
+        if dry_run:
+            result = None
+        else:
+            result = await retry_async(
+                f"Ejecución de tarea del agente {agent_id}",
+                (lambda _a=agent, _p=prompt: lambda: _a.execute(_p))(),
+                timeout_sec=task_timeout_sec,
+                retries=retry_attempts,
+                delay_sec=retry_delay_sec,
+                agent=agent_id,
+            )
     except Exception as exc:
-        append_progress_event(progress_path, "error", f"Agent execution failed: {exc}", status="error")
+        append_progress_event(progress_path, "error", f"Falló la ejecución del agente: {exc}", status="error")
         mem = load_memory()
         for t in mem.get("tasks", []):
             if t.get("id") == task_id:
                 t["status"] = "error"
                 t["error"] = str(exc)
         save_memory(mem)
-        bridge.heartbeat("error", f"Error on {task_id}")
-        log_event(f"Task {task_id} FAILED: agent execution error {exc}", agent_id)
+        bridge.heartbeat("error", f"Error en {task_id}")
+        log_event(f"La tarea {task_id} FALLÓ: error de ejecución del agente {exc}", agent_id, level="error")
         update_agent_status(agent_id, "error", task_id)
+        update_orchestrator_state("error", phase="execution", task_id=task_id, detail=str(exc), dry_run=dry_run)
         return
 
     try:
-        data = json.loads(result.content)
+        if not dry_run:
+            data = json.loads(result.content)
     except json.JSONDecodeError:
         append_progress_event(
             progress_path,
             "error",
-            "Invalid JSON response from agent",
+            "Respuesta JSON inválida del agente",
             status="error",
             raw_response=result.content[:1000],
         )
@@ -600,9 +891,10 @@ async def execute_task(
                 t["status"] = "error"
                 t["error"] = "Invalid JSON response"
         save_memory(mem)
-        bridge.heartbeat("error", f"Error on {task_id}")
-        log_event(f"Task {task_id} FAILED: bad JSON response", agent_id)
+        bridge.heartbeat("error", f"Error en {task_id}")
+        log_event(f"La tarea {task_id} FALLÓ: respuesta JSON incorrecta", agent_id, level="error")
         update_agent_status(agent_id, "error", task_id)
+        update_orchestrator_state("error", phase="execution", task_id=task_id, detail="Invalid JSON response", dry_run=dry_run)
         return
 
     try:
@@ -629,87 +921,186 @@ async def execute_task(
         append_progress_event(
             progress_path,
             "completed",
-            "Task completed successfully",
+            "Tarea completada correctamente",
             status="done",
             files=files_written,
             notes=data.get("notes", ""),
+            dry_run=dry_run,
         )
 
+        # Git auto-commit (GAP-7 / P4) — non-fatal if repo has no changes
+        if repo_state.get("action") not in ("dry-run", None) and files_written:
+            try:
+                committed = commit_task_output(
+                    Path(repo_state["repo_path"]),
+                    agent_id,
+                    task_id,
+                    task.get("title", task_id),
+                )
+                if committed:
+                    log_event(f"Git commit creado para {task_id}", agent_id)
+            except Exception as exc:
+                log_event(f"Git commit falló (no crítico): {exc}", agent_id, level="warning")
+
         bridge.heartbeat("idle", f"Done: {task_id}")
-        bridge.speak(f"Completed {task_id}: {len(files_written)} file(s) written.")
-        log_event(f"Task {task_id} done. Files: {files_written}", agent_id)
+        bridge.speak(f"Completada {task_id}: se escribieron {len(files_written)} archivo(s).")
+        log_event(f"Tarea {task_id} completada. Archivos: {files_written}", agent_id)
         update_agent_status(agent_id, "idle", None)
+        update_orchestrator_state("idle", phase="execution", task_id=None, detail=f"Completed {task_id}", dry_run=dry_run)
         try:
             send_telegram_message(
-                f"Task complete: {task_id} ({agent_id}) - {len(files_written)} file(s) written."
+                f"Tarea completada: {task_id} ({agent_id}) - se escribieron {len(files_written)} archivo(s)."
             )
         except Exception as exc:
-            log_event(f"Telegram notify failed: {exc}", "system")
+            log_event(f"Falló la notificación por Telegram: {exc}", "system")
     except Exception as exc:
-        append_progress_event(progress_path, "error", f"File write failed: {exc}", status="error")
+        append_progress_event(progress_path, "error", f"Falló la escritura de archivos: {exc}", status="error")
         mem = load_memory()
         for t in mem.get("tasks", []):
             if t.get("id") == task_id:
                 t["status"] = "error"
                 t["error"] = str(exc)
         save_memory(mem)
-        bridge.heartbeat("error", f"Error on {task_id}")
-        log_event(f"Task {task_id} FAILED: file write error {exc}", agent_id)
+        bridge.heartbeat("error", f"Error en {task_id}")
+        log_event(f"La tarea {task_id} FALLÓ: error al escribir archivos {exc}", agent_id, level="error")
         update_agent_status(agent_id, "error", task_id)
+        update_orchestrator_state("error", phase="execution", task_id=task_id, detail=str(exc), dry_run=dry_run)
 
 
-# ── Phase 3: Final Review ──────────────────────────────────────────────────────
+# ── Fase 3: Revisión final ─────────────────────────────────────────────────────
 
 
-async def final_review(client: OpenClawClient) -> None:
+async def final_review(
+    client: OpenClawClient | None,
+    *,
+    dry_run: bool = False,
+    phase_timeout_sec: int = DEFAULT_PHASE_TIMEOUT_SEC,
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS,
+    retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
+) -> None:
     """Ask ARCH for the delivery summary and persist it."""
-    arch = client.get_agent("arch")
     arch_bridge = get_bridge("arch")
 
-    arch_bridge.heartbeat("thinking", "Reviewing all completed work")
+    arch_bridge.heartbeat("thinking", "Revisando todo el trabajo completado")
     mem = load_memory()
-    result = await arch.execute(REVIEW_PROMPT.format(memory=json.dumps(mem, indent=2, ensure_ascii=False)))
+    update_orchestrator_state("review", phase="review", detail="Revisión final en progreso", dry_run=dry_run)
+
+    if dry_run:
+        result_content = "\n".join(
+            [
+                "# Delivery Summary",
+                "",
+                "Dry-run completado correctamente.",
+                "",
+                "No se ejecutaron agentes externos ni se modificó el repositorio.",
+            ]
+        )
+    else:
+        if client is None:
+            raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
+        arch = client.get_agent("arch")
+        result = await retry_async(
+            "Final review",
+            lambda: arch.execute(REVIEW_PROMPT.format(memory=json.dumps(mem, indent=2, ensure_ascii=False))),
+            timeout_sec=phase_timeout_sec,
+            retries=retry_attempts,
+            delay_sec=retry_delay_sec,
+            agent="arch",
+        )
+        result_content = result.content
 
     project_output_dir = resolve_path(mem.get("project", {}).get("output_dir"), OUTPUT_DIR)
     project_output_dir.mkdir(parents=True, exist_ok=True)
     delivery_path = project_output_dir / "DELIVERY.md"
-    delivery_path.write_text(result.content, encoding="utf-8")
+    delivery_path.write_text(result_content, encoding="utf-8")
 
     if delivery_path.resolve() != (OUTPUT_DIR / "DELIVERY.md").resolve():
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        (OUTPUT_DIR / "DELIVERY.md").write_text(result.content, encoding="utf-8")
+        (OUTPUT_DIR / "DELIVERY.md").write_text(result_content, encoding="utf-8")
 
     mem = load_memory()
     mem.setdefault("project", {})
     mem["project"]["status"] = "delivered"
     mem["project"]["updated_at"] = utc_now()
     mem.setdefault("milestones", [])
-    mem["milestones"].append(f"Project delivered at {utc_now()}")
+    mem["milestones"].append(f"Proyecto entregado en {utc_now()}")
     save_memory(mem)
 
-    arch_bridge.speak("Project delivered! See DELIVERY.md")
-    log_event("Project delivered. See DELIVERY.md", "arch")
+    arch_bridge.speak("Proyecto entregado. Revisa DELIVERY.md")
+    log_event("Proyecto entregado. Revisa DELIVERY.md", "arch")
     try:
-        send_telegram_message(f"Project delivered: {mem.get('project', {}).get('name') or 'unnamed project'}")
+        send_telegram_message(f"Proyecto entregado: {mem.get('project', {}).get('name') or 'proyecto sin nombre'}")
     except Exception as exc:
-        log_event(f"Telegram notify failed: {exc}", "system")
+        log_event(f"Falló la notificación por Telegram: {exc}", "system")
+    update_orchestrator_state("idle", phase="review", detail="Proyecto entregado", dry_run=dry_run)
 
     print("\n" + "=" * 60)
-    print(result.content)
+    print(result_content)
     print("=" * 60)
 
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
-    parser = argparse.ArgumentParser(description="Run the Dev Squad orchestrator.")
-    parser.add_argument("brief", nargs="*", help="Project brief")
-    parser.add_argument("--repo-url", dest="repo_url", help="Existing repository URL to clone")
-    parser.add_argument("--repo-name", dest="repo_name", help="Repository name for local creation")
-    parser.add_argument("--branch", dest="branch", help="Branch name to create or switch to")
+    parser = argparse.ArgumentParser(description="Ejecutar el orquestador de Dev Squad.")
+    parser.add_argument("brief", nargs="*", help="Descripción del proyecto")
+    parser.add_argument("--repo-url", dest="repo_url", help="URL del repositorio existente para clonar")
+    parser.add_argument("--repo-name", dest="repo_name", help="Nombre del repositorio para creación local")
+    parser.add_argument("--branch", dest="branch", help="Nombre de la rama a crear o usar")
     parser.add_argument(
         "--allow-init-repo",
         action="store_true",
-        help="Initialize a local git repository when no repo URL is provided",
+        help="Inicializar un repositorio git local cuando no se provee URL",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validar la orquestación sin llamar a OpenClaw ni modificar el repositorio",
+    )
+    parser.add_argument(
+        "--task-timeout-sec",
+        type=int,
+        default=DEFAULT_TASK_TIMEOUT_SEC,
+        help="Tiempo máximo por intento de ejecución de tarea",
+    )
+    parser.add_argument(
+        "--phase-timeout-sec",
+        type=int,
+        default=DEFAULT_PHASE_TIMEOUT_SEC,
+        help="Tiempo máximo para las fases de planificación y revisión",
+    )
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=DEFAULT_RETRY_ATTEMPTS,
+        help="Número de reintentos para agentes y operaciones de red",
+    )
+    parser.add_argument(
+        "--retry-delay-sec",
+        type=float,
+        default=DEFAULT_RETRY_DELAY_SEC,
+        help="Retraso inicial entre reintentos en segundos",
+    )
+    # GAP-8 / P8 — configurable parallelism
+    parser.add_argument(
+        "--max-parallel-byte",
+        type=int,
+        default=1,
+        dest="max_parallel_byte",
+        help="Número máximo de tareas BYTE en paralelo (default 1)",
+    )
+    parser.add_argument(
+        "--max-parallel-pixel",
+        type=int,
+        default=1,
+        dest="max_parallel_pixel",
+        help="Número máximo de tareas PIXEL en paralelo (default 1)",
+    )
+    # P9 — webhook post-entrega
+    parser.add_argument(
+        "--webhook-url",
+        dest="webhook_url",
+        default=None,
+        help="URL para enviar un POST con el estado final cuando el proyecto se entrega",
     )
     return parser.parse_args()
 
@@ -717,139 +1108,276 @@ def parse_args() -> argparse.Namespace:
 async def main(args: argparse.Namespace) -> None:
     """Run the full orchestration lifecycle."""
     project_brief = " ".join(args.brief).strip() or (
-        "Build a simple TODO app with React + TypeScript frontend, "
-        "FastAPI backend, SQLite database, REST API, and a clean UI."
+        "Construye una aplicación simple de tareas con frontend en React + TypeScript, "
+        "backend en FastAPI, base de datos SQLite, API REST y una interfaz limpia."
     )
 
     ensure_runtime_dirs()
     ensure_memory_file()
-    print(f"\nDev Squad starting - Project: {project_brief}\n")
+    success = False
 
-    for agent_id in AGENT_IDS:
-        bridge = get_bridge(agent_id)
-        bridge.heartbeat("idle", "Warming up")
+    try:
+        acquire_run_lock()
+        update_orchestrator_state("starting", phase="startup", detail="Secuencia de arranque iniciada", dry_run=args.dry_run)
+        print(f"\nDev Squad iniciando - Proyecto: {project_brief}\n")
+        log_event(f"Orquestador iniciando. dry_run={args.dry_run}", "system")
 
-    async with OpenClawClient.connect() as client:
-        print("Phase 1: Planning...")
-        try:
-            await plan_project(client, project_brief)
-        except Exception as exc:
-            log_event(f"Planning failed: {exc}", "arch")
-            try:
-                send_telegram_message(f"Planning failed: {exc}")
-            except Exception:
-                pass
-            print(f"Planning failed: {exc}")
-            return
-
+        # GAP-3 / P3 — recover tasks that were in_progress when the last run crashed
         mem = load_memory()
-        try:
-            repo_state = bootstrap_repository(
-                mem.get("project", {}),
-                repo_url=args.repo_url,
-                repo_name=args.repo_name,
-                branch=args.branch,
-                allow_init_repo=args.allow_init_repo,
-            )
-            mem = load_memory()
-            mem.setdefault("project", {})
-            mem["project"]["bootstrap_status"] = repo_state.get("action")
-            mem["project"]["repo_path"] = repo_state.get("repo_path")
-            mem["project"]["branch"] = repo_state.get("branch")
-            mem["project"]["output_dir"] = repo_state.get("repo_path")
-            mem["project"]["updated_at"] = utc_now()
+        stale = [t for t in mem.get("tasks", []) if t.get("status") == "in_progress"]
+        if stale:
+            for task in mem["tasks"]:
+                if task.get("status") == "in_progress":
+                    task["status"] = "pending"
             save_memory(mem)
             log_event(
-                f"Repository ready: {repo_state.get('action')} -> {repo_state.get('repo_path')} @ {repo_state.get('branch')}",
-                "arch",
+                f"Recuperadas {len(stale)} tarea(s) bloqueadas en in_progress → pending",
+                "system",
+                level="warning",
             )
-            try:
-                send_telegram_message(
-                    f"Repository ready: {repo_state.get('action')} -> {repo_state.get('repo_path')} @ {repo_state.get('branch')}"
-                )
-            except Exception as exc:
-                log_event(f"Telegram notify failed: {exc}", "system")
-        except RepositoryApprovalRequired as exc:
+            print(f"[recovery] {len(stale)} tarea(s) reseteadas a pending.")
+
+        for agent_id in AGENT_IDS:
+            bridge = get_bridge(agent_id)
+            bridge.heartbeat("idle", "Preparando entorno")
+
+        if args.dry_run:
+            print("Fase 1: Planificación (dry-run)...")
+            await plan_project(
+                None,
+                project_brief,
+                dry_run=True,
+                retry_attempts=args.retry_attempts,
+                retry_delay_sec=args.retry_delay_sec,
+                phase_timeout_sec=args.phase_timeout_sec,
+            )
             mem = load_memory()
             mem.setdefault("project", {})
-            mem["project"]["bootstrap_status"] = "approval_required"
+            mem["project"]["output_dir"] = str(OUTPUT_DIR / "dry-run")
             mem["project"]["updated_at"] = utc_now()
-            mem.setdefault("blockers", [])
-            mem["blockers"].append(
-                {
-                    "ts": utc_now(),
-                    "source": "arch",
-                    "msg": str(exc),
-                }
-            )
             save_memory(mem)
-            log_event(f"Repository approval required: {exc}", "arch")
+            repo_state = {
+                "repo_url": args.repo_url,
+                "repo_name": args.repo_name,
+                "repo_path": args.repo_name or "dry-run-repo",
+                "branch": args.branch or "codex/dry-run",
+                "action": "dry-run",
+                "git_available": shutil.which("git") is not None,
+            }
+            project_context = build_project_context(mem, repo_state)
+            for task in list(mem.get("tasks", [])):
+                if task.get("status") == "pending":
+                    await execute_task(
+                        None,
+                        task,
+                        project_context,
+                        repo_state,
+                        dry_run=True,
+                        task_timeout_sec=args.task_timeout_sec,
+                        retry_attempts=args.retry_attempts,
+                        retry_delay_sec=args.retry_delay_sec,
+                    )
+            print("\nFase 3: Revisión final...")
+            await final_review(
+                None,
+                dry_run=True,
+                phase_timeout_sec=args.phase_timeout_sec,
+                retry_attempts=args.retry_attempts,
+                retry_delay_sec=args.retry_delay_sec,
+            )
+        else:
+            async with OpenClawClient.connect() as client:
+                # GAP-6 — verify gateway is reachable before consuming any tokens
+                try:
+                    await _check_gateway_health(client)
+                    log_event("Gateway OpenClaw verificado correctamente", "system")
+                except RuntimeError as exc:
+                    log_event(str(exc), "system", level="error")
+                    update_orchestrator_state("error", phase="startup", detail=str(exc), dry_run=args.dry_run)
+                    print(f"\n{exc}")
+                    return
+
+                print("Fase 1: Planificación...")
+                try:
+                    await plan_project(
+                        client,
+                        project_brief,
+                        dry_run=False,
+                        retry_attempts=args.retry_attempts,
+                        retry_delay_sec=args.retry_delay_sec,
+                        phase_timeout_sec=args.phase_timeout_sec,
+                    )
+                except Exception as exc:
+                    log_event(f"Falló la planificación: {exc}", "arch", level="error")
+                    try:
+                        send_telegram_message(f"Falló la planificación: {exc}")
+                    except Exception:
+                        pass
+                    update_orchestrator_state("error", phase="planning", detail=str(exc), dry_run=args.dry_run)
+                    print(f"Falló la planificación: {exc}")
+                    return
+
+                mem = load_memory()
+                try:
+                    repo_state = bootstrap_repository(
+                        mem.get("project", {}),
+                        repo_url=args.repo_url,
+                        repo_name=args.repo_name,
+                        branch=args.branch,
+                        allow_init_repo=args.allow_init_repo,
+                    )
+                    mem = load_memory()
+                    mem.setdefault("project", {})
+                    mem["project"]["bootstrap_status"] = repo_state.get("action")
+                    mem["project"]["repo_path"] = repo_state.get("repo_path")
+                    mem["project"]["branch"] = repo_state.get("branch")
+                    mem["project"]["output_dir"] = repo_state.get("repo_path")
+                    mem["project"]["updated_at"] = utc_now()
+                    save_memory(mem)
+                    log_event(
+                        f"Repositorio listo: {repo_state.get('action')} -> {repo_state.get('repo_path')} @ {repo_state.get('branch')}",
+                        "arch",
+                    )
+                    try:
+                        send_telegram_message(
+                            f"Repositorio listo: {repo_state.get('action')} -> {repo_state.get('repo_path')} @ {repo_state.get('branch')}"
+                        )
+                    except Exception as exc:
+                        log_event(f"Falló la notificación por Telegram: {exc}", "system", level="warning")
+                except RepositoryApprovalRequired as exc:
+                    mem = load_memory()
+                    mem.setdefault("project", {})
+                    mem["project"]["bootstrap_status"] = "approval_required"
+                    mem["project"]["updated_at"] = utc_now()
+                    mem.setdefault("blockers", [])
+                    mem["blockers"].append(
+                        {
+                            "ts": utc_now(),
+                            "source": "arch",
+                            "msg": str(exc),
+                        }
+                    )
+                    save_memory(mem)
+                    log_event(f"Se requiere aprobación del repositorio: {exc}", "arch", level="warning")
+                    try:
+                        send_telegram_message(f"Se requiere aprobación del repositorio: {exc}")
+                    except Exception:
+                        pass
+                    print(str(exc))
+                    return
+                except RepositoryBootstrapError as exc:
+                    log_event(f"Falló el bootstrap del repositorio: {exc}", "arch", level="error")
+                    try:
+                        send_telegram_message(f"Falló el bootstrap del repositorio: {exc}")
+                    except Exception:
+                        pass
+                    print(f"Falló el bootstrap del repositorio: {exc}")
+                    return
+
+                print("\nFase 2: Ejecutando tareas...")
+                mem = load_memory()
+                completed_ids: set[str] = set()
+                pending_tasks = [task for task in mem.get("tasks", [])]
+                max_rounds = len(pending_tasks) + 8
+                rounds = 0
+                project_context = build_project_context(mem, repo_state)
+                phase_deadline = time.monotonic() + max(60, args.phase_timeout_sec)
+
+                while pending_tasks and rounds < max_rounds:
+                    if time.monotonic() > phase_deadline:
+                        raise TimeoutError("La fase de ejecución excedió el tiempo permitido")
+                    rounds += 1
+                    await relay_team_messages(client)
+
+                    ready = [
+                        task
+                        for task in pending_tasks
+                        if all(dep in completed_ids for dep in task.get("depends_on", []))
+                        and task.get("status") == "pending"
+                    ]
+
+                    if not ready:
+                        await asyncio.sleep(2)
+                        mem = load_memory()
+                        pending_tasks = [
+                            task for task in mem.get("tasks", []) if task.get("status") not in ("done", "error")
+                        ]
+                        completed_ids = {task["id"] for task in mem.get("tasks", []) if task.get("status") == "done"}
+                        continue
+
+                    byte_tasks = [task for task in ready if task["agent"] == "byte"]
+                    pixel_tasks = [task for task in ready if task["agent"] == "pixel"]
+
+                    # GAP-8 / P8 — run up to N tasks per agent type in parallel
+                    _task_kwargs = dict(
+                        project_context=project_context,
+                        repo_state=repo_state,
+                        dry_run=args.dry_run,
+                        task_timeout_sec=args.task_timeout_sec,
+                        retry_attempts=args.retry_attempts,
+                        retry_delay_sec=args.retry_delay_sec,
+                    )
+                    coros = [
+                        execute_task(client, t, **_task_kwargs)
+                        for t in byte_tasks[: args.max_parallel_byte]
+                    ] + [
+                        execute_task(client, t, **_task_kwargs)
+                        for t in pixel_tasks[: args.max_parallel_pixel]
+                    ]
+                    if not coros and ready:
+                        coros.append(execute_task(client, ready[0], **_task_kwargs))
+
+                    await asyncio.gather(*coros)
+                    await relay_team_messages(client)
+
+                    mem = load_memory()
+                    pending_tasks = [
+                        task for task in mem.get("tasks", []) if task.get("status") not in ("done", "error")
+                    ]
+                    completed_ids = {
+                        task["id"] for task in mem.get("tasks", []) if task.get("status") == "done"
+                    }
+
+                print("\nFase 3: Revisión final...")
+                await relay_team_messages(client)
+                await final_review(
+                    client,
+                    dry_run=args.dry_run,
+                    phase_timeout_sec=args.phase_timeout_sec,
+                    retry_attempts=args.retry_attempts,
+                    retry_delay_sec=args.retry_delay_sec,
+                )
+
+        # P9 — webhook post-entrega
+        if getattr(args, "webhook_url", None):
             try:
-                send_telegram_message(f"Repository approval required: {exc}")
-            except Exception:
-                pass
+                import requests as _req
+                _req.post(
+                    args.webhook_url,
+                    json=load_memory(),
+                    timeout=15,
+                )
+                log_event(f"Webhook enviado a {args.webhook_url}", "system")
+            except Exception as exc:
+                log_event(f"Webhook falló (no crítico): {exc}", "system", level="warning")
+
+        print("\nDev Squad finalizado. Revisa ./output/ para ver todos los archivos.")
+        success = True
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and "Ya hay otro orquestador en ejecución" in str(exc):
             print(str(exc))
             return
-        except RepositoryBootstrapError as exc:
-            log_event(f"Repository bootstrap failed: {exc}", "arch")
-            try:
-                send_telegram_message(f"Repository bootstrap failed: {exc}")
-            except Exception:
-                pass
-            print(f"Repository bootstrap failed: {exc}")
-            return
-
-        print("\nPhase 2: Executing tasks...")
-        mem = load_memory()
-        completed_ids: set[str] = set()
-        pending_tasks = [task for task in mem.get("tasks", [])]
-        max_rounds = len(pending_tasks) + 8
-        rounds = 0
-
-        project_context = build_project_context(mem, repo_state)
-
-        while pending_tasks and rounds < max_rounds:
-            rounds += 1
-            await relay_team_messages(client)
-
-            ready = [
-                task
-                for task in pending_tasks
-                if all(dep in completed_ids for dep in task.get("depends_on", []))
-                and task.get("status") == "pending"
-            ]
-
-            if not ready:
-                await asyncio.sleep(2)
-                mem = load_memory()
-                pending_tasks = [task for task in mem.get("tasks", []) if task.get("status") not in ("done", "error")]
-                completed_ids = {task["id"] for task in mem.get("tasks", []) if task.get("status") == "done"}
-                continue
-
-            byte_tasks = [task for task in ready if task["agent"] == "byte"]
-            pixel_tasks = [task for task in ready if task["agent"] == "pixel"]
-
-            coros = []
-            if byte_tasks:
-                coros.append(execute_task(client, byte_tasks[0], project_context, repo_state))
-            if pixel_tasks:
-                coros.append(execute_task(client, pixel_tasks[0], project_context, repo_state))
-            if not coros and ready:
-                coros.append(execute_task(client, ready[0], project_context, repo_state))
-
-            await asyncio.gather(*coros)
-            await relay_team_messages(client)
-
-            mem = load_memory()
-            pending_tasks = [task for task in mem.get("tasks", []) if task.get("status") not in ("done", "error")]
-            completed_ids = {task["id"] for task in mem.get("tasks", []) if task.get("status") == "done"}
-
-        print("\nPhase 3: Final review...")
-        await relay_team_messages(client)
-        await final_review(client)
-
-    print("\nDev Squad done. Check ./output/ for all files.")
+        log_event(f"El orquestador falló: {exc}", "system", level="error")
+        update_orchestrator_state("error", phase="runtime", detail=str(exc), dry_run=args.dry_run)
+        raise
+    finally:
+        if success:
+            update_orchestrator_state("idle", phase="shutdown", detail="Orquestador detenido", dry_run=args.dry_run)
+        release_run_lock()
 
 
 if __name__ == "__main__":
-    asyncio.run(main(parse_args()))
+    try:
+        asyncio.run(main(parse_args()))
+    except RuntimeError as exc:
+        print(str(exc))

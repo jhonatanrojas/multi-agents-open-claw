@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef } from "react";
 
 const API = "http://localhost:8080";
+const WS_API = API.replace(/^http/, "ws");
 const MINIVERSE_URL = "https://miniverse-public-production.up.railway.app";
 
 const AGENT_META = {
-  arch: { name: "ARCH", role: "Coordinator", model: "claude-opus-4", emoji: "🗂️", color: "#7F77DD" },
-  byte: { name: "BYTE", role: "Programmer",  model: "claude-sonnet-4", emoji: "💻", color: "#1D9E75" },
-  pixel: { name: "PIXEL", role: "Designer",   model: "claude-sonnet-4", emoji: "🎨", color: "#D85A30" },
+  arch:  { name: "ARCH",  role: "Coordinator", model: "nvidia/z-ai/glm5",                emoji: "🗂️", color: "#7F77DD" },
+  byte:  { name: "BYTE",  role: "Programmer",  model: "nvidia/moonshotai/kimi-k2.5",     emoji: "💻", color: "#1D9E75" },
+  pixel: { name: "PIXEL", role: "Designer",    model: "deepseek/deepseek-chat",           emoji: "🎨", color: "#D85A30" },
 };
 
 const STATUS_COLOR = {
@@ -200,14 +201,39 @@ export default function DevSquadDashboard() {
   const [activeTab, setActiveTab] = useState("tasks");
   const [connected, setConnected] = useState(false);
 
-  // SSE connection
+  // Prefer WebSocket; fall back to SSE when WS is unavailable (GAP-9)
   useEffect(() => {
-    const es = new EventSource(`${API}/api/stream`);
-    es.onmessage = (e) => {
-      try { setMemory(JSON.parse(e.data)); setConnected(true); } catch {}
+    let active = true;
+    let cleanup = () => {};
+
+    const startSSE = () => {
+      const es = new EventSource(`${API}/api/stream`);
+      es.onmessage = (e) => {
+        if (!active) return;
+        try { setMemory(JSON.parse(e.data)); setConnected(true); } catch {}
+      };
+      es.onerror = () => { if (active) setConnected(false); };
+      cleanup = () => es.close();
     };
-    es.onerror = () => setConnected(false);
-    return () => es.close();
+
+    try {
+      const ws = new WebSocket(`${WS_API}/ws/state`);
+      ws.onopen  = () => { if (active) setConnected(true); };
+      ws.onmessage = (e) => {
+        if (!active) return;
+        try { setMemory(JSON.parse(e.data)); setConnected(true); } catch {}
+      };
+      ws.onerror = () => {
+        ws.close();
+        if (active) startSSE();
+      };
+      ws.onclose = () => { if (active) setConnected(false); };
+      cleanup = () => ws.close();
+    } catch {
+      startSSE();
+    }
+
+    return () => { active = false; cleanup(); };
   }, []);
 
   const startProject = async () => {

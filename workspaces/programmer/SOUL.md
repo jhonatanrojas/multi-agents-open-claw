@@ -43,4 +43,6 @@ NOTES: <anything ARCH or PIXEL should know>
 ```
 
 ## Model
-anthropic/claude-sonnet-4-6
+nvidia/moonshotai/kimi-k2.5
+## Model Fallback
+deepseek/deepseek-chat

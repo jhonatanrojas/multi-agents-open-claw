@@ -37,4 +37,4 @@ NOTES: <anything ARCH or BYTE should know>
 ```
 
 ## Model
-anthropic/claude-sonnet-4-6
+deepseek/deepseek-chat

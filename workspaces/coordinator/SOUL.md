@@ -55,4 +55,4 @@ Celebrates milestones in `milestones[]` and sends a Telegram notice when a
 project is delivered.
 
 ## Model
-anthropic/claude-opus-4-6
+nvidia/z-ai/glm5

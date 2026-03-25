@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import shutil
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -24,11 +25,11 @@ WORKSPACE_NAMES = {
 
 
 class RepositoryBootstrapError(RuntimeError):
-    """Raised when repository bootstrap cannot continue safely."""
+    """Se lanza cuando el bootstrap del repositorio no puede continuar de forma segura."""
 
 
 class RepositoryApprovalRequired(RuntimeError):
-    """Raised when the coordinator needs repo approval/details via Telegram."""
+    """Se lanza cuando el coordinador necesita aprobación o datos del repositorio por Telegram."""
 
 
 @dataclass
@@ -97,65 +98,65 @@ def _base_skills_for_stack(stack: str, agent_id: str) -> tuple[list[str], list[s
         return (
             ["PHP", "Laravel", "Artisan", "Eloquent", "Composer", "Migrations", "Testing"],
             [
-                "Use Laravel conventions and clean service boundaries.",
-                "Prefer Eloquent models, migrations, and reusable services.",
-                "If authentication is involved, plan the auth flow before coding.",
+                "Usa las convenciones de Laravel y límites claros entre servicios.",
+                "Prioriza modelos Eloquent, migraciones y servicios reutilizables.",
+                "Si hay autenticación, planifica el flujo antes de escribir código.",
             ],
-            "Laravel specialist",
+            "Especialista en Laravel",
         )
 
     if stack == "node-express":
         return (
             ["Node.js", "Express", "REST APIs", "Middleware", "NPM", "Testing"],
             [
-                "Use Express routing, middleware, and clear module boundaries.",
-                "Keep API contracts explicit and document request/response shapes.",
-                "Prefer TypeScript when the repo already uses it.",
+                "Usa rutas de Express, middleware y límites claros entre módulos.",
+                "Mantén explícitos los contratos de API y documenta las estructuras de request/response.",
+                "Prefiere TypeScript cuando el repositorio ya lo use.",
             ],
-            "Node/Express specialist",
+            "Especialista en Node/Express",
         )
 
     if stack == "frontend":
         return (
             ["React", "TypeScript", "Accessibility", "Responsive UI", "Component Design"],
             [
-                "Preserve existing design language and keep the UI accessible.",
-                "Break complex UI into reusable components and keep state predictable.",
-                "If the project already uses a design system, extend it instead of replacing it.",
+                "Respeta el lenguaje visual existente y mantén la interfaz accesible.",
+                "Divide la UI compleja en componentes reutilizables y conserva un estado predecible.",
+                "Si el proyecto ya usa un sistema de diseño, extiéndelo en vez de reemplazarlo.",
             ],
-            "Frontend specialist",
+            "Especialista en frontend",
         )
 
     if stack == "devops":
         return (
             ["Bash", "Apache", "Nginx", "Cron", "Backups", "Health Checks", "Deployment"],
             [
-                "Prefer idempotent scripts and clear operational runbooks.",
-                "Validate ports, health checks, and backup/restore flows explicitly.",
-                "Document any required secrets or environment variables.",
+                "Prefiere scripts idempotentes y runbooks operativos claros.",
+                "Valida puertos, health checks y flujos de backup/restore de forma explícita.",
+                "Documenta cualquier secreto o variable de entorno necesaria.",
             ],
-            "DevOps specialist",
+            "Especialista en DevOps",
         )
 
     if stack == "documentation":
         return (
             ["Markdown", "Information Architecture", "User Guides", "Installation Flows"],
             [
-                "Keep documentation structured, searchable, and task-oriented.",
-                "Include install, usage, troubleshooting, and examples where relevant.",
-                "Prefer clear headings and concise procedural steps.",
+                "Mantén la documentación estructurada, localizable y orientada a tareas.",
+                "Incluye instalación, uso, solución de problemas y ejemplos cuando aplique.",
+                "Prefiere encabezados claros y pasos procedimentales concisos.",
             ],
-            "Documentation specialist",
+            "Especialista en documentación",
         )
 
     return (
         ["Task Decomposition", "Repository Hygiene", "Testing", "Coordination"],
         [
-            "Inspect the current repository before making changes.",
-            "Use the stack already present in the repository unless the brief says otherwise.",
-            "Ask ARCH for clarification if a dependency or interface is missing.",
+            "Inspecciona el repositorio actual antes de hacer cambios.",
+            "Usa el stack ya presente en el repositorio salvo que el brief indique otra cosa.",
+            "Pide aclaración a ARCH si falta una dependencia o una interfaz.",
         ],
-        "General engineering specialist",
+        "Especialista general en ingeniería",
     )
 
 
@@ -169,7 +170,7 @@ def build_task_skill_profile(project: dict[str, Any], task: dict[str, Any]) -> d
 
     if "auth" in title_text or "authentication" in title_text:
         skills.append("Authentication")
-        instructions.append("Validate auth flows and protect sensitive routes.")
+        instructions.append("Valida los flujos de autenticación y protege las rutas sensibles.")
     if "dashboard" in title_text or "admin" in title_text:
         skills.append("Dashboard UX")
     if "api" in title_text or "rest" in title_text:
@@ -184,7 +185,7 @@ def build_task_skill_profile(project: dict[str, Any], task: dict[str, Any]) -> d
         skills.append("Apache")
 
     if task.get("agent") == "pixel" and "frontend" not in stack:
-        instructions.append("Coordinate with BYTE on UI surface area and file boundaries.")
+        instructions.append("Coordínate con BYTE sobre el alcance de la UI y los límites de archivos.")
 
     return asdict(
         TaskSkillProfile(
@@ -214,36 +215,36 @@ def render_task_context_md(
     branch = repo_state.get("branch") or project.get("branch") or "n/a"
 
     lines = [
-        f"# Active Task: {task.get('id')}",
+        f"# Tarea activa: {task.get('id')}",
         "",
-        f"- Agent: {agent_id}",
-        f"- Family: {skill_profile.get('family', 'general')}",
-        f"- Focus: {skill_profile.get('prompt_focus', 'General engineering specialist')}",
-        f"- Repo path: {repo_path}",
-        f"- Branch: {branch}",
+        f"- Agente: {agent_id}",
+        f"- Familia: {skill_profile.get('family', 'general')}",
+        f"- Enfoque: {skill_profile.get('prompt_focus', 'Especialista general en ingeniería')}",
+        f"- Ruta del repo: {repo_path}",
+        f"- Rama: {branch}",
         "",
-        "## Task",
-        f"- Title: {task.get('title', '')}",
-        f"- Description: {task.get('description', '')}",
+        "## Tarea",
+        f"- Título: {task.get('title', '')}",
+        f"- Descripción: {task.get('description', '')}",
         "",
-        "## Acceptance Criteria",
+        "## Criterios de aceptación",
     ]
-    lines.extend(f"- {item}" for item in acceptance or ["No criteria provided."])
+    lines.extend(f"- {item}" for item in acceptance or ["No se proporcionaron criterios."])
     lines.append("")
-    lines.append("## Skill Focus")
-    lines.extend(f"- {item}" for item in skills or ["Repository inspection", "Task decomposition"])
+    lines.append("## Enfoque de habilidades")
+    lines.extend(f"- {item}" for item in skills or ["Inspección del repositorio", "Descomposición de tareas"])
     lines.append("")
-    lines.append("## Coordination Rules")
+    lines.append("## Reglas de coordinación")
     lines.extend(
         [
-            "- If you are blocked, DM ARCH with `BLOCKER:<task_id> <issue>`.",
-            "- If you need a decision, DM ARCH with `QUESTION:<task_id> <question>`.",
-            "- Keep your progress JSON updated under `progress/` in this workspace.",
+            "- Si te bloqueas, envía a ARCH `BLOCKER:<task_id> <problema>`.",
+            "- Si necesitas una decisión, envía a ARCH `QUESTION:<task_id> <pregunta>`.",
+            "- Mantén actualizado tu JSON de progreso en `progress/` dentro de este workspace.",
         ]
     )
     lines.append("")
-    lines.append("## Agent Notes")
-    lines.extend(f"- {item}" for item in instructions or ["Follow the stack already present in the repo."])
+    lines.append("## Notas del agente")
+    lines.extend(f"- {item}" for item in instructions or ["Sigue el stack ya presente en el repositorio."])
     return "\n".join(lines)
 
 
@@ -293,7 +294,7 @@ def write_agent_workspace_files(
             {
                 "ts": timestamp,
                 "type": "queued",
-                "message": "Task queued for execution",
+                "message": "Tarea en cola para ejecución",
             }
         ],
     }
@@ -322,6 +323,34 @@ def write_agent_workspace_files(
 
 def _run_git(args: list[str], cwd: Path | None = None) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True)
+
+
+def commit_task_output(
+    repo_path: Path,
+    agent_id: str,
+    task_id: str,
+    task_title: str,
+) -> bool:
+    """Stage all changes and commit them.  Returns True when a commit was made.
+
+    Non-fatal: if git is unavailable or nothing to commit, returns False quietly.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        if not result.stdout.strip():
+            return False  # Nothing to commit
+        _run_git(["add", "-A"], cwd=repo_path)
+        commit_msg = f"[{agent_id}] {task_id}: {task_title[:72]}"
+        _run_git(["commit", "-m", commit_msg], cwd=repo_path)
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
 
 
 def _ensure_git_identity(repo_path: Path) -> None:
@@ -404,7 +433,7 @@ def bootstrap_repository(
         raise RepositoryBootstrapError(f"Repository bootstrap failed: {exc}") from exc
 
     raise RepositoryApprovalRequired(
-        "Repository details are missing. Send the repository URL over Telegram or allow local init."
+        "Faltan los datos del repositorio. Envía la URL por Telegram o permite la inicialización local."
     )
 
 
@@ -412,6 +441,9 @@ def send_telegram_message(
     message: str,
     token: str | None = None,
     chat_id: str | None = None,
+    retries: int = 3,
+    timeout: int = 15,
+    backoff_seconds: float = 2.0,
 ) -> dict[str, Any]:
     """Send a Telegram notification when credentials are available."""
     resolved_token = token or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -420,21 +452,39 @@ def send_telegram_message(
     if not resolved_token or not resolved_chat_id:
         return {
             "sent": False,
-            "reason": "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
+            "reason": "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID",
         }
 
-    response = requests.post(
-        f"https://api.telegram.org/bot{resolved_token}/sendMessage",
-        json={
-            "chat_id": resolved_chat_id,
-            "text": message,
-            "disable_web_page_preview": True,
-        },
-        timeout=15,
-    )
-    response.raise_for_status()
+    delay = max(0.5, float(backoff_seconds))
+    last_error: str | None = None
+
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{resolved_token}/sendMessage",
+                json={
+                    "chat_id": resolved_chat_id,
+                    "text": message,
+                    "disable_web_page_preview": True,
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            return {
+                "sent": True,
+                "status_code": response.status_code,
+                "response": response.json() if response.content else {},
+                "attempt": attempt,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt >= max(1, retries):
+                break
+            time.sleep(delay)
+            delay *= 2
+
     return {
-        "sent": True,
-        "status_code": response.status_code,
-        "response": response.json() if response.content else {},
+        "sent": False,
+        "reason": last_error or "Falló el envío de Telegram",
+        "attempts": max(1, retries),
     }

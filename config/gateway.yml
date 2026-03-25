@@ -1,24 +1,26 @@
-## gateway.yml - Dev Squad Multi-Agent Config
+## gateway.yml — Dev Squad Multi-Agent Config
 ## Place at: ~/.openclaw/gateway.yml
+## Model overrides: set ARCH_MODEL / BYTE_MODEL / PIXEL_MODEL env vars,
+## or use PUT /api/models on the dashboard to update models_config.json.
 
 agents:
   list:
     - id: "arch"
       name: "ARCH - Coordinator"
       workspace: "./workspaces/coordinator"
-      model: "anthropic/claude-opus-4-6"
+      model: "nvidia/z-ai/glm5"          # override: ARCH_MODEL env var
       agentDir: "~/.openclaw/agents/arch"
 
     - id: "byte"
       name: "BYTE - Programmer"
       workspace: "./workspaces/programmer"
-      model: "anthropic/claude-sonnet-4-6"
+      model: "nvidia/moonshotai/kimi-k2.5"   # fallback: deepseek/deepseek-chat
       agentDir: "~/.openclaw/agents/byte"
 
     - id: "pixel"
       name: "PIXEL - Designer"
       workspace: "./workspaces/designer"
-      model: "anthropic/claude-sonnet-4-6"
+      model: "deepseek/deepseek-chat"
       agentDir: "~/.openclaw/agents/pixel"
 
 ## Shared memory - all agents mount the same directory
@@ -35,7 +37,7 @@ skills:
     - path: "./skills/stack-router"
     - path: "./skills/miniverse-bridge"
 
-## Channels (optional - remove if not using messaging channels)
+## Channels (optional)
 # channels:
 #   slack:
 #     token: "${SLACK_BOT_TOKEN}"

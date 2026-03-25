@@ -1,31 +1,101 @@
 #!/usr/bin/env python3
 """
-dashboard_api.py - SSE + REST API for the Dev Squad Dashboard
--------------------------------------------------------------
-Serves:
+dashboard_api.py - SSE + WebSocket + REST API for the Dev Squad Dashboard
+--------------------------------------------------------------------------
+Endpoints:
+  GET  /health             -> health check (no auth required)
+  GET  /api/health         -> alias
   GET  /api/state          -> current shared memory snapshot
-  GET  /api/stream         -> SSE stream of state changes (polls every 2s)
+  GET  /api/stream         -> SSE stream of state changes
+  WS   /ws/state           -> WebSocket push of state changes (GAP-9)
   GET  /api/agents/world   -> proxies Miniverse /api/agents
-  POST /api/project/start  -> triggers orchestrator with a project brief
+  GET  /api/logs           -> last log entries
+  POST /api/project/start  -> triggers orchestrator
+  GET  /api/models         -> current model configuration (GAP-5)
+  PUT  /api/models         -> update model configuration (GAP-5)
+
+Auth (GAP-1 / P5):
+  All endpoints except /health and /api/health require the header
+    X-API-Key: <value of DASHBOARD_API_KEY env var>
+  when DASHBOARD_API_KEY is set.  Set to the empty string to disable auth.
+  Example key for development: dev-squad-api-key-2026
 """
 
 import json
 import asyncio
+import re
 import sys
 import subprocess
+import os
+from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-from shared_state import load_memory
-MINIVERSE_URL = "https://miniverse-public-production.up.railway.app"
+from shared_state import BASE_DIR, load_memory, _pid_is_alive
 
-app = FastAPI(title="Dev Squad Dashboard API")
+MINIVERSE_URL = os.getenv("MINIVERSE_URL", "https://miniverse-public-production.up.railway.app")
+LOCK_FILE = BASE_DIR / "logs" / "orchestrator.lock"
+JSONL_LOG_FILE = BASE_DIR / "logs" / "orchestrator.jsonl"
+MODELS_CONFIG_FILE = BASE_DIR / "models_config.json"
+
+# GAP-1 / P5 — API key auth (empty string = disabled)
+_API_KEY: str = os.getenv("DASHBOARD_API_KEY", "")
+
+# Endpoints exempt from auth (public monitoring + streaming)
+_AUTH_EXEMPT = {"/health", "/api/health"}
+
+
+# ── WebSocket broadcaster (GAP-9) ─────────────────────────────────────────────
+
+class _StateBroadcaster:
+    """Single background loop that pushes state to all WebSocket clients."""
+
+    def __init__(self) -> None:
+        self._clients: set[WebSocket] = set()
+        self._last: str | None = None
+
+    def add(self, ws: WebSocket) -> None:
+        self._clients.add(ws)
+
+    def remove(self, ws: WebSocket) -> None:
+        self._clients.discard(ws)
+
+    async def run(self) -> None:
+        while True:
+            if self._clients:
+                current = json.dumps(load_memory(), sort_keys=True)
+                if current != self._last:
+                    self._last = current
+                    dead: set[WebSocket] = set()
+                    for ws in list(self._clients):
+                        try:
+                            await ws.send_text(current)
+                        except Exception:
+                            dead.add(ws)
+                    self._clients -= dead
+            await asyncio.sleep(1)
+
+
+_broadcaster = _StateBroadcaster()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    asyncio.create_task(_broadcaster.run())
+    yield
+
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Dev Squad Dashboard API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,6 +105,120 @@ app.add_middleware(
 )
 
 
+# ── Auth middleware (GAP-1 / P5) ──────────────────────────────────────────────
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    if _API_KEY and request.url.path not in _AUTH_EXEMPT:
+        if request.headers.get("X-API-Key") != _API_KEY:
+            return JSONResponse(
+                {"error": "Unauthorized — provide a valid X-API-Key header"},
+                status_code=401,
+            )
+    return await call_next(request)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _read_jsonl_tail(path: Path, limit: int = 100) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    tail: deque[str] = deque(maxlen=limit)
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            tail.append(line)
+    records: list[dict[str, Any]] = []
+    for line in tail:
+        try:
+            records.append(json.loads(line))
+        except Exception:
+            continue
+    return records
+
+
+def _validate_brief(brief: str) -> str:
+    """Sanitize and validate the project brief (GAP-2)."""
+    brief = brief.strip()
+    if len(brief) < 10:
+        raise ValueError("El brief debe tener al menos 10 caracteres.")
+    if len(brief) > 2000:
+        raise ValueError("El brief no puede superar los 2000 caracteres.")
+    # Strip ASCII control chars except tab and newline
+    brief = re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]", "", brief)
+    return brief
+
+
+def _load_models_config() -> dict[str, Any]:
+    if MODELS_CONFIG_FILE.exists():
+        try:
+            return json.loads(MODELS_CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    # Defaults matching the project's model choices (GAP-5 / P6)
+    return {
+        "arch": "nvidia/z-ai/glm5",
+        "byte": "nvidia/moonshotai/kimi-k2.5",
+        "byte_fallback": "deepseek/deepseek-chat",
+        "pixel": "deepseek/deepseek-chat",
+        "available": [
+            "nvidia/z-ai/glm5",
+            "nvidia/moonshotai/kimi-k2.5",
+            "deepseek/deepseek-chat",
+            "anthropic/claude-opus-4-6",
+            "anthropic/claude-sonnet-4-6",
+            "anthropic/claude-haiku-4-5-20251001",
+            "openai/gpt-4o",
+            "google/gemini-2.0-flash",
+        ],
+    }
+
+
+def _save_models_config(config: dict[str, Any]) -> None:
+    MODELS_CONFIG_FILE.write_text(
+        json.dumps(config, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def build_health_snapshot() -> dict[str, Any]:
+    mem = load_memory()
+    orchestrator_state = mem.get("project", {}).get("orchestrator", {}) or {}
+    lock_state: dict[str, Any] = {"exists": LOCK_FILE.exists(), "pid": None, "alive": False}
+    if LOCK_FILE.exists():
+        try:
+            lock_payload = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            lock_payload = {}
+        lock_state["pid"] = lock_payload.get("pid")
+        lock_state["alive"] = _pid_is_alive(lock_state["pid"])
+        lock_state["started_at"] = lock_payload.get("started_at")
+    issues: list[str] = []
+    if lock_state["exists"] and not lock_state["alive"] and lock_state["pid"] is not None:
+        issues.append("lockfile obsoleto")
+    if orchestrator_state.get("status") == "error":
+        issues.append("error del orquestador")
+    ok = len(issues) == 0
+    return {
+        "ok": ok,
+        "service": "dashboard_api",
+        "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "lockfile": lock_state,
+        "orchestrator": orchestrator_state,
+        "issues": issues,
+        "memory_updated_at": mem.get("project", {}).get("updated_at"),
+        "auth_enabled": bool(_API_KEY),
+    }
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+@app.get("/api/health")
+def health():
+    snapshot = build_health_snapshot()
+    return JSONResponse(snapshot, status_code=200 if snapshot["ok"] else 503)
+
+
 @app.get("/api/state")
 def get_state():
     return load_memory()
@@ -42,7 +226,7 @@ def get_state():
 
 @app.get("/api/stream")
 async def stream_state():
-    """Server-Sent Events stream — pushes state every 2 seconds."""
+    """Server-Sent Events stream — pushes state every 2 s with keepalive."""
     async def generator():
         last = None
         while True:
@@ -50,9 +234,26 @@ async def stream_state():
             if current != last:
                 last = current
                 yield f"data: {current}\n\n"
+            else:
+                yield ": keepalive\n\n"
             await asyncio.sleep(2)
 
     return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+@app.websocket("/ws/state")
+async def ws_state(websocket: WebSocket):
+    """WebSocket endpoint — receives push updates at ~1 s interval (GAP-9)."""
+    await websocket.accept()
+    _broadcaster.add(websocket)
+    # Send current snapshot immediately on connect
+    await websocket.send_text(json.dumps(load_memory(), sort_keys=True))
+    try:
+        while True:
+            # Keep alive; detect client disconnect via receive
+            await asyncio.wait_for(websocket.receive_text(), timeout=30)
+    except (WebSocketDisconnect, asyncio.TimeoutError, Exception):
+        _broadcaster.remove(websocket)
 
 
 @app.get("/api/agents/world")
@@ -65,18 +266,66 @@ def agents_in_world():
         return {"error": str(e), "agents": []}
 
 
+# ── Models config (GAP-5 / P6) ────────────────────────────────────────────────
+
+@app.get("/api/models")
+def get_models():
+    """Return the current model configuration and list of available models."""
+    return _load_models_config()
+
+
+class ModelsUpdate(BaseModel):
+    arch: str | None = None
+    byte: str | None = None
+    byte_fallback: str | None = None
+    pixel: str | None = None
+
+
+@app.put("/api/models")
+def update_models(update: ModelsUpdate):
+    """Update model assignments.  Changes take effect on the next project run.
+
+    Restart the openclaw-gateway service after saving so the new models load.
+    """
+    config = _load_models_config()
+    for field, value in update.model_dump(exclude_none=True).items():
+        config[field] = value
+    _save_models_config(config)
+    return {
+        "saved": True,
+        "config": config,
+        "note": "Reinicia openclaw-gateway para aplicar los cambios de modelo.",
+    }
+
+
+# ── Project launch ────────────────────────────────────────────────────────────
+
 class ProjectRequest(BaseModel):
     brief: str
     repo_url: str | None = None
     repo_name: str | None = None
     branch: str | None = None
     allow_init_repo: bool = False
+    dry_run: bool = False
+    task_timeout_sec: int = 1800
+    phase_timeout_sec: int = 7200
+    retry_attempts: int = 3
+    retry_delay_sec: float = 2.0
+    max_parallel_byte: int = 1   # GAP-8
+    max_parallel_pixel: int = 1  # GAP-8
+    webhook_url: str | None = None  # P9
 
 
 @app.post("/api/project/start")
 async def start_project(req: ProjectRequest):
     """Spawn orchestrator in background."""
-    args = [sys.executable, "orchestrator.py"]
+    # GAP-2 — validate brief before spawning subprocess
+    try:
+        safe_brief = _validate_brief(req.brief)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+
+    args = [sys.executable, str(BASE_DIR / "orchestrator.py")]
     if req.repo_url:
         args.extend(["--repo-url", req.repo_url])
     if req.repo_name:
@@ -85,20 +334,39 @@ async def start_project(req: ProjectRequest):
         args.extend(["--branch", req.branch])
     if req.allow_init_repo:
         args.append("--allow-init-repo")
-    args.append(req.brief)
+    if req.dry_run:
+        args.append("--dry-run")
+    args.extend(["--task-timeout-sec", str(req.task_timeout_sec)])
+    args.extend(["--phase-timeout-sec", str(req.phase_timeout_sec)])
+    args.extend(["--retry-attempts", str(req.retry_attempts)])
+    args.extend(["--retry-delay-sec", str(req.retry_delay_sec)])
+    args.extend(["--max-parallel-byte", str(req.max_parallel_byte)])
+    args.extend(["--max-parallel-pixel", str(req.max_parallel_pixel)])
+    if req.webhook_url:
+        args.extend(["--webhook-url", req.webhook_url])
+    args.append(safe_brief)
 
-    log_path = Path("logs/orchestrator.log")
+    log_path = BASE_DIR / "logs" / "orchestrator.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as log_file:
         subprocess.Popen(
             args,
             stdout=log_file,
             stderr=subprocess.STDOUT,
+            cwd=BASE_DIR,
         )
-    return {"status": "started", "brief": req.brief, "ts": datetime.utcnow().isoformat()}
+    return {
+        "status": "started",
+        "message": "Orquestador iniciado correctamente",
+        "brief": safe_brief,
+        "ts": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+    }
 
 
 @app.get("/api/logs")
 def get_logs():
     mem = load_memory()
-    return {"log": mem.get("log", [])[-100:]}  # last 100 entries
+    return {
+        "log": mem.get("log", [])[-100:],
+        "structured_log": _read_jsonl_tail(JSONL_LOG_FILE, 100),
+    }

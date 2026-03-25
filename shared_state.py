@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import threading
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -9,6 +12,12 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 PRIMARY_MEMORY = BASE_DIR / "shared" / "MEMORY.json"
 LEGACY_MEMORY = BASE_DIR / "MEMORY.json"
+_FLOCK_PATH = PRIMARY_MEMORY.with_suffix(".lock")
+
+# Limits for unbounded-growth arrays (GAP-4 / P2)
+MAX_LOG_ENTRIES = 500
+MAX_MESSAGES = 200
+MAX_BLOCKERS = 100
 
 DEFAULT_MEMORY: dict[str, Any] = {
     "schema_version": "2.0",
@@ -26,6 +35,15 @@ DEFAULT_MEMORY: dict[str, Any] = {
         "status": "idle",
         "created_at": None,
         "updated_at": None,
+        "orchestrator": {
+            "status": "idle",
+            "pid": None,
+            "phase": None,
+            "task_id": None,
+            "started_at": None,
+            "updated_at": None,
+            "dry_run": False,
+        },
     },
     "plan": {
         "phases": [],
@@ -46,6 +64,29 @@ DEFAULT_MEMORY: dict[str, Any] = {
 }
 
 _MEMORY_LOCK = threading.RLock()
+
+
+@contextmanager
+def _cross_process_lock():
+    """Exclusive file lock that works across processes (POSIX/Linux)."""
+    _FLOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_FLOCK_PATH, "w") as _lf:
+        fcntl.flock(_lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(_lf, fcntl.LOCK_UN)
+
+
+def _pid_is_alive(pid: int | None) -> bool:
+    """Return True when *pid* appears to be running."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _deep_merge(base: Any, incoming: Any) -> Any:
@@ -88,7 +129,11 @@ def default_memory() -> dict[str, Any]:
 
 
 def load_memory() -> dict[str, Any]:
-    """Load shared memory, preferring the canonical shared/ location."""
+    """Load shared memory, preferring the canonical shared/ location.
+
+    Reads do NOT need a file lock: _write_atomic uses an atomic tmp-file
+    replace, so any read always sees a complete, valid JSON snapshot.
+    """
     with _MEMORY_LOCK:
         source: dict[str, Any] | None = None
         source_path: Path | None = None
@@ -107,14 +152,25 @@ def load_memory() -> dict[str, Any]:
 
         merged = _deep_merge(DEFAULT_MEMORY, source)
         if source_path != PRIMARY_MEMORY or merged != source:
+            # Migrate / normalise – go through save_memory for truncation.
             save_memory(merged)
         return merged
 
 
 def save_memory(data: dict[str, Any]) -> dict[str, Any]:
-    """Persist shared memory to both the canonical and legacy paths."""
-    with _MEMORY_LOCK:
+    """Persist shared memory to both paths under an exclusive cross-process lock.
+
+    Also truncates unbounded arrays so the JSON never grows without limit.
+    """
+    with _MEMORY_LOCK, _cross_process_lock():
         payload = _deep_merge(DEFAULT_MEMORY, data)
+        # Truncate growing arrays (GAP-4 / P2)
+        if len(payload.get("log", [])) > MAX_LOG_ENTRIES:
+            payload["log"] = payload["log"][-MAX_LOG_ENTRIES:]
+        if len(payload.get("messages", [])) > MAX_MESSAGES:
+            payload["messages"] = payload["messages"][-MAX_MESSAGES:]
+        if len(payload.get("blockers", [])) > MAX_BLOCKERS:
+            payload["blockers"] = payload["blockers"][-MAX_BLOCKERS:]
         for path in (PRIMARY_MEMORY, LEGACY_MEMORY):
             _write_atomic(path, payload)
         return payload
