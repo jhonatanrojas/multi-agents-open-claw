@@ -48,6 +48,7 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY_SEC = 2.0
 DEFAULT_DRY_RUN_SUMMARY_FILE = "dry-run-summary.md"
 AGENT_LOG_DIR = LOG_DIR / "agents"
+RESUME_FAILURE_THRESHOLD = 2
 
 # Labels shown in Telegram/logs for each progress classification.
 _PROGRESS_EMOJI = {
@@ -327,6 +328,17 @@ def record_blocker(
         }
     )
     save_memory(mem)
+
+
+def _has_open_tasks(tasks: list[dict[str, Any]]) -> bool:
+    return any(task.get("status") != "done" for task in tasks if isinstance(task, dict))
+
+
+def _fallback_agent_for(task: dict[str, Any], agent_id: str) -> str | None:
+    family = str(task.get("skill_family") or "").lower()
+    if agent_id == "pixel" and family in {"vanilla-frontend", "frontend"}:
+        return "byte"
+    return None
 
 
 def acquire_run_lock() -> dict[str, Any]:
@@ -1142,14 +1154,26 @@ async def execute_task(
             raw_response=(raw_response[:1000] if isinstance(raw_response, str) else None),
         )
         mem = load_memory()
+        fallback_agent: str | None = None
         for t in mem.get("tasks", []):
             if t.get("id") == task_id:
+                failure_count = int(t.get("failure_count") or 0) + 1
                 t["status"] = "error"
                 t["error"] = detail
                 t["retryable"] = retryable
                 t["next_action"] = "review" if not retryable else "retry_or_reassign"
+                t["failure_count"] = failure_count
+                t["last_failure_at"] = utc_now()
                 if raw_response:
                     t["raw_response"] = raw_response[:2000]
+                fallback_agent = _fallback_agent_for(t, agent_id)
+                if retryable and fallback_agent and failure_count >= RESUME_FAILURE_THRESHOLD:
+                    t["previous_agent"] = agent_id
+                    t["agent"] = fallback_agent
+                    t["status"] = "pending"
+                    t["next_action"] = f"reassigned_to_{fallback_agent}"
+                    t["suggested_agent"] = fallback_agent
+                    t["reassigned_at"] = utc_now()
         save_memory(mem)
         record_blocker(
             f"Tarea {task_id} ({agent_id}) falló: {detail}",
@@ -1158,6 +1182,12 @@ async def execute_task(
             agent_id=agent_id,
             retryable=retryable,
         )
+        if fallback_agent and retryable and failure_count >= RESUME_FAILURE_THRESHOLD:
+            log_event(
+                f"Tarea {task_id} reasignada automáticamente a {fallback_agent} tras {failure_count} fallos",
+                "system",
+                level="warning",
+            )
         bridge.heartbeat("error", f"Error en {task_id}")
         update_agent_status(agent_id, "error", task_id)
         update_orchestrator_state("error", phase="execution", task_id=task_id, detail=detail, dry_run=dry_run)
@@ -1342,6 +1372,25 @@ async def final_review(
             "arch",
         )
         result_content = result.content
+
+    if _has_open_tasks(mem.get("tasks", [])):
+        mem = load_memory()
+        mem.setdefault("project", {})
+        mem["project"]["status"] = "in_progress"
+        mem["project"]["updated_at"] = utc_now()
+        save_memory(mem)
+        update_orchestrator_state(
+            "paused",
+            phase="review",
+            detail="Revisión detenida: existen tareas pendientes o con error",
+            dry_run=dry_run,
+        )
+        log_event(
+            "La revisión final detectó tareas pendientes o con error; no se marcará como entregado",
+            "system",
+            level="warning",
+        )
+        return
 
     project_output_dir = resolve_path(mem.get("project", {}).get("output_dir"), OUTPUT_DIR)
     project_output_dir.mkdir(parents=True, exist_ok=True)
