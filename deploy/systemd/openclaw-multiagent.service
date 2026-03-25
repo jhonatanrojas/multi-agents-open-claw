@@ -5,24 +5,25 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=root
+Group=root
 WorkingDirectory=/var/www/openclaw-multi-agents
-Environment=PYTHONUNBUFFERED=1
-Environment=OPENCLAW_HEALTH_URL=http://127.0.0.1:8080/health
-EnvironmentFile=-/etc/default/openclaw-multiagent
-ExecStart=/usr/bin/python3 /var/www/openclaw-multi-agents/orchestrator.py --task-timeout-sec 1800 --phase-timeout-sec 7200 --retry-attempts 3 --retry-delay-sec 2
-Restart=always
-RestartSec=5
-StartLimitIntervalSec=0
+EnvironmentFile=/etc/default/openclaw-multiagent
+ExecStart=/usr/bin/python3 /var/www/openclaw-multi-agents/orchestrator.py \
+    --task-timeout-sec 1800 \
+    --phase-timeout-sec 7200 \
+    --retry-attempts 3 \
+    --retry-delay-sec 2
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
 TimeoutStartSec=60
 TimeoutStopSec=30
 KillMode=process
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-ReadWritePaths=/var/www/openclaw-multi-agents
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-multiagent
 
 [Install]
 WantedBy=multi-user.target

@@ -31,6 +31,8 @@ import re
 import sys
 import subprocess
 import os
+import signal
+from copy import deepcopy
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -50,7 +52,7 @@ from openclaw_sdk import (
     set_agent_model as sdk_set_agent_model,
     set_default_model as sdk_set_default_model,
 )
-from shared_state import BASE_DIR, load_memory, _pid_is_alive
+from shared_state import BASE_DIR, load_memory, save_memory, DEFAULT_MEMORY, _pid_is_alive
 
 MINIVERSE_URL = os.getenv("MINIVERSE_URL", "https://miniverse-public-production.up.railway.app")
 LOCK_FILE = BASE_DIR / "logs" / "orchestrator.lock"
@@ -170,6 +172,34 @@ def _load_models_config() -> dict[str, Any]:
     }
 
 
+def _stop_orchestrator(reason: str | None = None) -> dict[str, Any]:
+    mem = load_memory()
+    lock_payload: dict[str, Any] = {}
+    if LOCK_FILE.exists():
+        try:
+            lock_payload = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            lock_payload = {}
+    pid = lock_payload.get("pid") or mem.get("project", {}).get("orchestrator", {}).get("pid")
+    alive = _pid_is_alive(pid)
+    if alive:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception as exc:
+            return {"ok": False, "error": f"No se pudo detener el orquestador: {exc}"}
+    mem.setdefault("project", {})
+    mem["project"].setdefault("orchestrator", {})
+    mem["project"]["orchestrator"].update(
+        {
+            "status": "paused",
+            "phase": "paused",
+            "detail": reason or "Pausado desde el dashboard",
+            "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        }
+    )
+    mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    save_memory(mem)
+    return {"ok": True, "pid": pid, "alive": alive}
 def build_health_snapshot() -> dict[str, Any]:
     mem = load_memory()
     orchestrator_state = mem.get("project", {}).get("orchestrator", {}) or {}
@@ -198,6 +228,36 @@ def build_health_snapshot() -> dict[str, Any]:
         "memory_updated_at": mem.get("project", {}).get("updated_at"),
         "auth_enabled": bool(_API_KEY),
     }
+
+
+def _stop_orchestrator(reason: str | None = None) -> dict[str, Any]:
+    mem = load_memory()
+    lock_payload: dict[str, Any] = {}
+    if LOCK_FILE.exists():
+        try:
+            lock_payload = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            lock_payload = {}
+    pid = lock_payload.get("pid") or mem.get("project", {}).get("orchestrator", {}).get("pid")
+    alive = _pid_is_alive(pid)
+    if alive:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception as exc:
+            return {"ok": False, "error": f"No se pudo detener el orquestador: {exc}"}
+    mem.setdefault("project", {})
+    mem["project"].setdefault("orchestrator", {})
+    mem["project"]["orchestrator"].update(
+        {
+            "status": "paused",
+            "phase": "paused",
+            "detail": reason or "Pausado desde el dashboard",
+            "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        }
+    )
+    mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    save_memory(mem)
+    return {"ok": True, "pid": pid, "alive": alive}
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -369,6 +429,7 @@ class ProjectRequest(BaseModel):
     repo_url: str | None = None
     repo_name: str | None = None
     branch: str | None = None
+    agent_models: dict[str, str] | None = None
     allow_init_repo: bool = False
     dry_run: bool = False
     task_timeout_sec: int = 1800
@@ -380,6 +441,31 @@ class ProjectRequest(BaseModel):
     webhook_url: str | None = None  # P9
 
 
+class ProjectResumeRequest(BaseModel):
+    task_id: str | None = None
+    resume_all_failed: bool = True
+    dry_run: bool = False
+    task_timeout_sec: int = 1800
+    phase_timeout_sec: int = 7200
+    retry_attempts: int = 3
+    retry_delay_sec: float = 2.0
+    max_parallel_byte: int = 1
+    max_parallel_pixel: int = 1
+    webhook_url: str | None = None
+
+
+def _spawn_orchestrator(args: list[str]) -> None:
+    log_path = BASE_DIR / "logs" / "orchestrator.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log_file:
+        subprocess.Popen(
+            args,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            cwd=BASE_DIR,
+        )
+
+
 @app.post("/api/project/start")
 async def start_project(req: ProjectRequest):
     """Spawn orchestrator in background."""
@@ -388,6 +474,17 @@ async def start_project(req: ProjectRequest):
         safe_brief = _validate_brief(req.brief)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=422)
+
+    if req.agent_models:
+        try:
+            for agent_id, model in req.agent_models.items():
+                if agent_id not in {"arch", "byte", "pixel"}:
+                    continue
+                if not model:
+                    continue
+                sdk_set_agent_model(agent_id, model)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=422)
 
     args = [sys.executable, str(BASE_DIR / "orchestrator.py")]
     if req.repo_url:
@@ -410,21 +507,132 @@ async def start_project(req: ProjectRequest):
         args.extend(["--webhook-url", req.webhook_url])
     args.append(safe_brief)
 
-    log_path = BASE_DIR / "logs" / "orchestrator.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as log_file:
-        subprocess.Popen(
-            args,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            cwd=BASE_DIR,
-        )
+    _spawn_orchestrator(args)
     return {
         "status": "started",
         "message": "Orquestador iniciado correctamente",
         "brief": safe_brief,
         "ts": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     }
+
+
+@app.post("/api/project/resume")
+async def resume_project(req: ProjectResumeRequest):
+    """Resume failed or pending tasks for the current project."""
+    mem = load_memory()
+    project = mem.get("project", {}) or {}
+    tasks = mem.get("tasks", []) if isinstance(mem.get("tasks", []), list) else []
+
+    if not project.get("id"):
+        return JSONResponse({"error": "No hay proyecto activo para reanudar"}, status_code=422)
+
+    task_ids: list[str] = []
+    resumed: list[str] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("id") or "")
+        if not task_id:
+            continue
+        should_resume = False
+        if req.task_id:
+            should_resume = task_id == req.task_id
+        elif req.resume_all_failed:
+            should_resume = task.get("status") in {"error", "pending"}
+
+        if should_resume:
+            task["status"] = "pending"
+            task.pop("error", None)
+            task.pop("retryable", None)
+            task.pop("next_action", None)
+            task.pop("raw_response", None)
+            resumed.append(task_id)
+        task_ids.append(task_id)
+
+    if req.task_id and not resumed:
+        return JSONResponse({"error": f"No se encontró la tarea {req.task_id} para reanudar"}, status_code=404)
+
+    if not resumed:
+        return JSONResponse({"error": "No hay tareas pendientes o fallidas para reanudar"}, status_code=422)
+
+    mem.setdefault("project", {})
+    mem["project"]["status"] = "in_progress"
+    mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    mem["project"].setdefault("orchestrator", {})
+    mem["project"]["orchestrator"].update(
+        {
+            "status": "starting",
+            "phase": "execution",
+            "detail": f"Reanudando {len(resumed)} tarea(s)",
+            "task_id": resumed[0] if len(resumed) == 1 else None,
+            "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        }
+    )
+    save_memory(mem)
+
+    args = [sys.executable, str(BASE_DIR / "orchestrator.py"), "--resume"]
+    if req.dry_run:
+        args.append("--dry-run")
+    args.extend(["--task-timeout-sec", str(req.task_timeout_sec)])
+    args.extend(["--phase-timeout-sec", str(req.phase_timeout_sec)])
+    args.extend(["--retry-attempts", str(req.retry_attempts)])
+    args.extend(["--retry-delay-sec", str(req.retry_delay_sec)])
+    args.extend(["--max-parallel-byte", str(req.max_parallel_byte)])
+    args.extend(["--max-parallel-pixel", str(req.max_parallel_pixel)])
+    if req.webhook_url:
+        args.extend(["--webhook-url", req.webhook_url])
+    args.append(project.get("description") or project.get("name") or "Resume project")
+
+    _spawn_orchestrator(args)
+    return {
+        "status": "resumed",
+        "message": "Reanudación iniciada correctamente",
+        "resumed_tasks": resumed,
+        "task_ids": task_ids,
+        "ts": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+    }
+
+
+@app.post("/api/project/pause")
+async def pause_project(payload: dict[str, Any] | None = None):
+    reason = None
+    if isinstance(payload, dict):
+        reason = payload.get("reason")
+    result = _stop_orchestrator(reason=reason)
+    status = 200 if result.get("ok") else 500
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/api/project/delete")
+async def delete_project(payload: dict[str, Any] | None = None):
+    reason = None
+    if isinstance(payload, dict):
+        reason = payload.get("reason")
+    stop_result = _stop_orchestrator(reason=reason or "Eliminado desde el dashboard")
+    mem = load_memory()
+    project_id = mem.get("project", {}).get("id")
+    if project_id:
+        mem.setdefault("projects", [])
+        for existing in mem["projects"]:
+            if existing.get("id") == project_id:
+                existing["status"] = "deleted"
+                existing["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                break
+
+    defaults = deepcopy(DEFAULT_MEMORY)
+    mem["project"] = defaults["project"]
+    mem["plan"] = defaults["plan"]
+    mem["tasks"] = []
+    mem["log"] = []
+    mem["blockers"] = []
+    mem["files_produced"] = []
+    mem["progress_files"] = []
+    mem["messages"] = []
+    mem["milestones"] = []
+    mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    save_memory(mem)
+    result = {"ok": True, "stopped": stop_result.get("ok", False)}
+    return JSONResponse(result, status_code=200)
 
 
 @app.get("/api/logs")

@@ -57,6 +57,7 @@ DEFAULT_MEMORY: dict[str, Any] = {
     },
     "blockers": [],
     "milestones": [],
+    "projects": [],
     "files_produced": [],
     "progress_files": [],
     "messages": [],

@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -63,21 +64,58 @@ def classify_progress(line: str) -> str:
     return "working"
 
 
+def _find_json_document(text: str) -> Any:
+    """Return the first decodable JSON object found inside mixed CLI output."""
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch not in "[{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(text[idx:])
+            return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _extract_cli_payload(stdout: str, stderr: str = "") -> dict[str, Any]:
     """Parse the top-level JSON envelope from ``openclaw agent --json``.
 
     Returns the parsed dict (with ``meta`` and ``payloads`` keys) or an
     empty dict on failure.
     """
-    text = (stdout or "").strip()
-    if not text:
-        log.warning("openclaw CLI returned empty stdout; stderr=%s", stderr[:300])
+    candidates = []
+    for chunk in (stdout, stderr):
+        text = (chunk or "").strip()
+        if not text:
+            continue
+        parsed = _find_json_document(text)
+        if isinstance(parsed, dict):
+            candidates.append(parsed)
+
+    if not candidates:
+        log.warning(
+            "openclaw CLI returned no parseable JSON envelope; stdout=%d bytes stderr=%d bytes",
+            len(stdout or ""),
+            len(stderr or ""),
+        )
         return {}
-    try:
-        return json.loads(text)  # type: ignore[no-any-return]
-    except json.JSONDecodeError as exc:
-        log.warning("Failed to parse CLI JSON envelope: %s — raw[:200]=%s", exc, text[:200])
-        return {}
+
+    def score(payload: dict[str, Any]) -> tuple[int, int]:
+        has_payloads = 1 if isinstance(payload.get("payloads"), list) and payload.get("payloads") else 0
+        has_direct = 1 if any(isinstance(payload.get(key), str) and payload.get(key).strip() for key in ("response", "content", "message", "text")) else 0
+        return (has_payloads, has_direct)
+
+    return max(candidates, key=score)
 
 
 def _extract_content(envelope: dict[str, Any]) -> str:
@@ -166,6 +204,8 @@ class Agent:
             "--json",
             "--agent",
             self.agent_id,
+            "--session-id",
+            f"{self.agent_id}-{uuid.uuid4().hex}",
             "--message",
             prompt,
         ]
@@ -218,10 +258,13 @@ class Agent:
                         except Exception as cb_exc:
                             log.warning("Progress callback error: %s", cb_exc)
 
-        # Run stderr drain concurrently with stdout read.
+        # Drain stderr concurrently, but read stdout directly to avoid
+        # competing consumers on the same stream.
         stderr_task = asyncio.ensure_future(_drain_stderr())
 
-        stdout_bytes, _ = await proc.communicate()
+        assert proc.stdout is not None
+        stdout_bytes = await proc.stdout.read()
+        await proc.wait()
         await stderr_task  # ensure all stderr lines are captured
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -236,7 +279,7 @@ class Agent:
                 stderr_lines[-1][:200] if stderr_lines else "N/A",
             )
 
-        envelope = _extract_cli_payload(stdout, "\n".join(stderr_lines[-5:]))
+        envelope = _extract_cli_payload(stdout, "\n".join(stderr_lines))
         content = _extract_content(envelope)
         timing = _extract_timing(envelope)
 

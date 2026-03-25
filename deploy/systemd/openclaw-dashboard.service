@@ -1,28 +1,27 @@
 [Unit]
 Description=OpenClaw Multi-Agent Dashboard API
-After=network-online.target openclaw-multiagent.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=root
+Group=root
 WorkingDirectory=/var/www/openclaw-multi-agents
-Environment=PYTHONUNBUFFERED=1
-Environment=OPENCLAW_HEALTH_URL=http://127.0.0.1:8001/health
-EnvironmentFile=-/etc/default/openclaw-multiagent
-ExecStart=/usr/bin/python3 -m uvicorn dashboard_api:app --host 127.0.0.1 --port 8001
+EnvironmentFile=/etc/default/openclaw-multiagent
+ExecStart=/usr/bin/python3 -m uvicorn dashboard_api:app \
+    --host 127.0.0.1 \
+    --port 8001 \
+    --workers 1
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=0
 TimeoutStartSec=60
 TimeoutStopSec=30
 KillMode=process
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-ReadWritePaths=/var/www/openclaw-multi-agents
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-dashboard
 
 [Install]
 WantedBy=multi-user.target

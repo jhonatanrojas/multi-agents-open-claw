@@ -72,6 +72,9 @@ def _stack_from_project(project: dict[str, Any], task: dict[str, Any]) -> str:
     tech_stack = project.get("tech_stack", {}) or {}
     tech_blob = " ".join(str(v).lower() for v in tech_stack.values())
 
+    if any(token in text for token in ("html", "css", "javascript", "localstorage", "vanilla js", "dom manipulation")):
+        if not any(token in text for token in ("react", "typescript", "next.js", "nextjs", "vite")):
+            return "vanilla-frontend"
     if any(token in text for token in ("laravel", "php", "artisan", "eloquent")):
         return "laravel"
     if any(token in text for token in ("express", "node", "fastify", "nestjs", "npm")):
@@ -125,6 +128,17 @@ def _base_skills_for_stack(stack: str, agent_id: str) -> tuple[list[str], list[s
                 "Si el proyecto ya usa un sistema de diseño, extiéndelo en vez de reemplazarlo.",
             ],
             "Especialista en frontend",
+        )
+
+    if stack == "vanilla-frontend":
+        return (
+            ["HTML5", "CSS3", "JavaScript ES6+", "LocalStorage", "Accessibility", "Responsive UI"],
+            [
+                "Usa HTML semántico y divide la estructura en secciones claras.",
+                "Mantén el CSS simple, responsive y consistente con el contenido del proyecto.",
+                "Si el proyecto usa JavaScript puro, evita introducir frameworks o dependencias innecesarias.",
+            ],
+            "Especialista en HTML/CSS/JavaScript",
         )
 
     if stack == "devops":
