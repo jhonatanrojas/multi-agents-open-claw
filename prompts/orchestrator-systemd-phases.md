@@ -1,406 +1,140 @@
-# Guía de despliegue — Dev Squad en VPS con systemd
-
-Agente senior de integración para OpenClaw `2026.3.23-2`.
-
-**Objetivo:** dejar `orchestrator.py` y `dashboard_api.py` corriendo de forma persistente en el VPS mediante `systemd`, con Apache como reverse proxy, autenticación por API key, WebSocket habilitado y estado verificable por CLI sin depender de ninguna interfaz gráfica.
-
----
-
-## Configuración del entorno
-
-| Parámetro                    | Valor                                            |
-|------------------------------|--------------------------------------------------|
-| Ruta del proyecto en el VPS  | `/var/www/openclaw-multi-agents`                 |
-| Servicio del orquestador     | `openclaw-multiagent.service`                    |
-| Servicio del dashboard       | `openclaw-dashboard.service`                     |
-| Puerto local del dashboard   | `127.0.0.1:8001`                                 |
-| URL pública objetivo         | `https://openclaw.deploymatrix.com/`             |
-| Health check                 | `http://127.0.0.1:8001/health`                   |
-| Archivo de entorno compartido| `/etc/default/openclaw-multiagent`               |
-| Usuario del servicio         | `www-data`                                       |
-| Puerto 8080                  | **Ocupado — no usar**                            |
-| Proxy público                | Apache reverse proxy (no exponer uvicorn directo)|
-| Repositorio base             | `https://github.com/jhonatanrojas/multi-agents-open-claw` |
-
----
-
-## Reglas obligatorias
-
-- No romper la configuración actual de OpenClaw.
-- No usar comandos destructivos (`rm -rf`, `git reset --hard`, `DROP TABLE`…).
-- Validar todo por CLI antes de asumir que la interfaz gráfica funciona.
-- Si un archivo no existe, crearlo solo si aporta valor real a la operación persistente.
-- Reportar cualquier bloqueo con precisión antes de continuar.
-
----
-
-## Variables de entorno — `/etc/default/openclaw-multiagent`
-
-Todas las variables sensibles van aquí. El archivo lo leen ambos servicios systemd.
-
-```ini
-# ── Auth dashboard (todos los endpoints excepto /health) ──────────────────────
-DASHBOARD_API_KEY=dev-squad-api-key-2026
-
-# ── Telegram (opcional) ───────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-
-# ── Miniverse ─────────────────────────────────────────────────────────────────
-MINIVERSE_URL=https://miniverse-public-production.up.railway.app
-
-# ── Git identity ──────────────────────────────────────────────────────────────
-GIT_AUTHOR_NAME=OpenClaw
-GIT_AUTHOR_EMAIL=openclaw@example.com
-
-# ── Modelos (override sobre gateway.yml) ──────────────────────────────────────
-ARCH_MODEL=nvidia/z-ai/glm5
-BYTE_MODEL=nvidia/moonshotai/kimi-k2.5
-BYTE_MODEL_FALLBACK=deepseek/deepseek-chat
-PIXEL_MODEL=deepseek/deepseek-chat
-
-# ── Python ────────────────────────────────────────────────────────────────────
-PYTHONUNBUFFERED=1
-```
-
-Crear o actualizar el archivo:
-```bash
-sudo cp /var/www/openclaw-multi-agents/.env.example /etc/default/openclaw-multiagent
-sudo chmod 640 /etc/default/openclaw-multiagent
-sudo chown root:www-data /etc/default/openclaw-multiagent
-# Editar con valores reales:
-sudo nano /etc/default/openclaw-multiagent
-```
-
----
-
-## Fase 1 — Auditoría y preparación
-
-```bash
-cd /var/www/openclaw-multi-agents
-
-# 1. Verificar Python y dependencias
-python3 --version                    # >= 3.11
-python3 -m pip show openclaw-sdk fastapi uvicorn requests
-
-# 2. Verificar que OpenClaw esté instalado y configurado
-openclaw --version
-cat ~/.openclaw/gateway.yml          # confirmar modelos y rutas
-
-# 3. Verificar que los paths relativos en gateway.yml resuelvan desde el proyecto
-ls workspaces/coordinator/SOUL.md
-ls skills/miniverse-bridge/SKILL.md
-ls shared/MEMORY.json 2>/dev/null || echo "Se creará en el primer arranque"
-
-# 4. Probar importaciones
-python3 -c "from orchestrator import *; print('OK')"
-python3 -c "from dashboard_api import app; print('OK')"
-
-# 5. Dry-run para validar flujo completo sin consumir tokens
-python3 orchestrator.py --dry-run "Proyecto de prueba para auditoría"
-```
-
-Puntos a verificar en la auditoría:
-
-- [ ] `gateway.yml` apunta a los modelos correctos (`nvidia/z-ai/glm5`, `kimi-k2.5`, `deepseek`)
-- [ ] `shared/MEMORY.json` existe o se creará correctamente
-- [ ] `logs/` existe con permisos de escritura para `www-data`
-- [ ] `output/` existe con permisos de escritura para `www-data`
-- [ ] El lockfile `logs/orchestrator.lock` no está de una corrida anterior colgada
-
----
-
-## Fase 2 — Persistencia con systemd
-
-### 2.1 Instalar los servicios
-
-```bash
-sudo bash /var/www/openclaw-multi-agents/scripts/install_systemd.sh \
-  /var/www/openclaw-multi-agents
-
-sudo systemctl daemon-reload
-```
-
-El script copia los archivos de `deploy/systemd/` a `/etc/systemd/system/` y crea el archivo de entorno en `/etc/default/openclaw-multiagent`.
-
-### 2.2 Verificar los archivos de servicio
-
-**`/etc/systemd/system/openclaw-multiagent.service`** (orquestador):
-```ini
-[Unit]
-Description=Dev Squad Multi-Agent Orchestrator
-After=network.target openclaw-gateway.service
-Wants=openclaw-gateway.service
-
-[Service]
-Type=simple
-User=www-data
-WorkingDirectory=/var/www/openclaw-multi-agents
-EnvironmentFile=/etc/default/openclaw-multiagent
-ExecStart=/var/www/openclaw-multi-agents/.venv/bin/python orchestrator.py \
-  --task-timeout-sec 1800 \
-  --phase-timeout-sec 7200 \
-  --retry-attempts 3 \
-  --max-parallel-byte 1 \
-  --max-parallel-pixel 1
-Restart=always
-RestartSec=5
-StandardOutput=append:/var/www/openclaw-multi-agents/logs/orchestrator.log
-StandardError=append:/var/www/openclaw-multi-agents/logs/orchestrator.log
-ProtectSystem=full
-ProtectHome=true
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**`/etc/systemd/system/openclaw-dashboard.service`** (dashboard API):
-```ini
-[Unit]
-Description=Dev Squad Dashboard API
-After=network.target
-
-[Service]
-Type=simple
-User=www-data
-WorkingDirectory=/var/www/openclaw-multi-agents
-EnvironmentFile=/etc/default/openclaw-multiagent
-ExecStart=/var/www/openclaw-multi-agents/.venv/bin/uvicorn \
-  dashboard_api:app \
-  --host 127.0.0.1 \
-  --port 8001 \
-  --workers 1
-Restart=always
-RestartSec=5
-ProtectSystem=full
-ProtectHome=true
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 2.3 Habilitar y arrancar
-
-```bash
-sudo systemctl enable openclaw-dashboard
-sudo systemctl enable openclaw-multiagent
-
-sudo systemctl start openclaw-dashboard
-sudo systemctl start openclaw-multiagent
-
-# Verificar estado
-sudo systemctl status openclaw-dashboard --no-pager
-sudo systemctl status openclaw-multiagent --no-pager
-```
-
----
-
-## Fase 3 — Apache Reverse Proxy
-
-Archivo: `deploy/apache/openclaw-dashboard.conf`
-
-```apache
-<VirtualHost *:80>
-    ServerName openclaw.deploymatrix.com
-    Redirect permanent / https://openclaw.deploymatrix.com/
-</VirtualHost>
-
-<VirtualHost *:443>
-    ServerName openclaw.deploymatrix.com
-
-    SSLEngine on
-    SSLCertificateFile    /etc/letsencrypt/live/openclaw.deploymatrix.com/fullchain.pem
-    SSLCertificateKeyFile /etc/letsencrypt/live/openclaw.deploymatrix.com/privkey.pem
-
-    # REST + SSE
-    ProxyPreserveHost On
-    ProxyPass        /api/  http://127.0.0.1:8001/api/
-    ProxyPassReverse /api/  http://127.0.0.1:8001/api/
-    ProxyPass        /health http://127.0.0.1:8001/health
-    ProxyPassReverse /health http://127.0.0.1:8001/health
-
-    # WebSocket (/ws/state) — GAP-9
-    RewriteEngine On
-    RewriteCond %{HTTP:Upgrade} websocket [NC]
-    RewriteCond %{HTTP:Connection} upgrade [NC]
-    RewriteRule ^/ws/(.*)$ ws://127.0.0.1:8001/ws/$1 [P,L]
-    ProxyPass        /ws/  ws://127.0.0.1:8001/ws/
-    ProxyPassReverse /ws/  ws://127.0.0.1:8001/ws/
-
-    # SSE — desactivar buffering para que los eventos fluyan inmediatamente
-    ProxyPass        /api/stream http://127.0.0.1:8001/api/stream flushpackets=on
-    SetEnv proxy-sendchunked 1
-
-    ErrorLog  /var/log/apache2/openclaw-dashboard-error.log
-    CustomLog /var/log/apache2/openclaw-dashboard-access.log combined
-</VirtualHost>
-```
-
-Instalar y habilitar:
-```bash
-sudo cp deploy/apache/openclaw-dashboard.conf \
-  /etc/apache2/sites-available/openclaw-dashboard.conf
-sudo a2ensite openclaw-dashboard
-sudo a2enmod proxy proxy_http proxy_wstunnel rewrite ssl
-sudo apache2ctl configtest
-sudo systemctl reload apache2
-```
-
----
-
-## Fase 4 — Pruebas sin interfaz gráfica
-
-### 4.1 Health check
-```bash
-# Sin auth (endpoint público)
-curl -s http://127.0.0.1:8001/health | python3 -m json.tool
-
-# Desde script
-python3 scripts/check_health.py --url http://127.0.0.1:8001/health
-```
-
-Respuesta esperada (sistema en reposo):
-```json
-{
-  "ok": true,
-  "service": "dashboard_api",
-  "lockfile": { "exists": false },
-  "orchestrator": { "status": "idle" },
-  "issues": [],
-  "auth_enabled": true
-}
-```
-
-### 4.2 Estado de memoria
-```bash
-curl -s http://127.0.0.1:8001/api/state \
-  -H "X-API-Key: dev-squad-api-key-2026" | python3 -m json.tool
-```
-
-### 4.3 Modelos actuales
-```bash
-curl -s http://127.0.0.1:8001/api/models \
-  -H "X-API-Key: dev-squad-api-key-2026" | python3 -m json.tool
-```
-
-### 4.4 Lanzar proyecto vía API
-```bash
-curl -X POST http://127.0.0.1:8001/api/project/start \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-squad-api-key-2026" \
-  -d '{
-    "brief": "Construye una API REST de tareas con FastAPI y SQLite",
-    "allow_init_repo": true,
-    "dry_run": true
-  }'
-```
-
-### 4.5 Seguimiento de logs en tiempo real
-```bash
-# Logs del orquestador
-journalctl -u openclaw-multiagent -f
-
-# Log estructurado JSONL
-tail -f /var/www/openclaw-multi-agents/logs/orchestrator.jsonl | \
-  python3 -c "import sys,json; [print(json.dumps(json.loads(l), ensure_ascii=False)) for l in sys.stdin]"
-
-# Log plano
-tail -f /var/www/openclaw-multi-agents/logs/orchestrator.log
-```
-
-### 4.6 Prueba de SSE desde CLI
-```bash
-curl -N -H "X-API-Key: dev-squad-api-key-2026" \
-  http://127.0.0.1:8001/api/stream
-# Deben aparecer líneas "data: {...}" cada 2 s o ": keepalive" si no hay cambios
-```
-
-### 4.7 Prueba de WebSocket
-```bash
-# Requiere wscat: npm install -g wscat
-wscat -c "ws://127.0.0.1:8001/ws/state" \
-  -H "X-API-Key: dev-squad-api-key-2026"
-```
-
----
-
-## Fase 5 — Verificación final y operación
-
-### Comandos de operación diaria
-
-```bash
-# Estado de ambos servicios
-sudo systemctl status openclaw-multiagent openclaw-dashboard --no-pager
-
-# Reiniciar orquestador (sin tocar el dashboard)
-sudo systemctl restart openclaw-multiagent
-
-# Reiniciar dashboard
-sudo systemctl restart openclaw-dashboard
-
-# Ver logs del servicio (últimas 50 líneas)
-journalctl -u openclaw-multiagent -n 50 --no-pager
-journalctl -u openclaw-dashboard  -n 50 --no-pager
-
-# Detener ambos
-sudo systemctl stop openclaw-multiagent openclaw-dashboard
-
-# Forzar un health check completo
-python3 /var/www/openclaw-multi-agents/scripts/check_health.py \
-  --url http://127.0.0.1:8001/health
-```
-
-### Cambiar modelo de un agente en caliente
-
-```bash
-# Cambiar BYTE a deepseek como primario
-curl -X PUT http://127.0.0.1:8001/api/models \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-squad-api-key-2026" \
-  -d '{"byte": "deepseek/deepseek-chat"}'
-
-# Actualizar también gateway.yml y reiniciar openclaw-gateway para que el
-# gateway tome el nuevo modelo en la próxima sesión
-sudo nano ~/.openclaw/gateway.yml
-openclaw restart   # o el comando equivalente de tu instalación
-```
-
-### Actualizar el proyecto desde git
-
-```bash
-cd /var/www/openclaw-multi-agents
-sudo -u www-data git pull origin main
-sudo -u www-data .venv/bin/pip install -r requirements.txt --quiet
-sudo systemctl restart openclaw-multiagent openclaw-dashboard
-```
-
----
-
-## Checklist de éxito
-
-- [ ] `sudo systemctl is-active openclaw-multiagent` devuelve `active`
-- [ ] `sudo systemctl is-active openclaw-dashboard` devuelve `active`
-- [ ] `curl http://127.0.0.1:8001/health` devuelve `{"ok": true, ...}`
-- [ ] `curl https://openclaw.deploymatrix.com/health` devuelve 200 vía Apache
-- [ ] SSE stream devuelve eventos o keepalives sin cortes
-- [ ] WebSocket en `/ws/state` conecta y recibe estado inicial
-- [ ] Un dry-run lanza, ejecuta tareas y genera `DELIVERY.md`
-- [ ] Los logs aparecen en `journalctl` y en `logs/orchestrator.jsonl`
-- [ ] La autenticación rechaza requests sin `X-API-Key` (HTTP 401)
-- [ ] OpenClaw gateway sigue activo e intacto después del despliegue
-
----
-
-## Riesgos y pendientes
-
-| Riesgo                                      | Mitigación                                                   |
-|---------------------------------------------|--------------------------------------------------------------|
-| `openclaw-gateway` no arranca como servicio | Verificar con `openclaw status`; agregar `After=` en el unit |
-| Puerto 8001 ocupado                         | `ss -tlnp | grep 8001`; ajustar en el unit y en Apache       |
-| Permisos de `www-data` sobre el proyecto    | `sudo chown -R www-data:www-data /var/www/openclaw-multi-agents` |
-| Certificado SSL de Apache vencido           | `sudo certbot renew --dry-run`                               |
-| MEMORY.json corrompido en crash             | Borrar el archivo; se regenera vacío en el próximo arranque  |
-| Lockfile obsoleto tras crash                | `rm logs/orchestrator.lock` y reiniciar el servicio          |
-| Modelo no disponible en OpenClaw            | Verificar con `openclaw models list`; ajustar `models_config.json` |
+# Guia de despliegue y frontend integrado para OpenClaw
+
+Eres un agente senior de codigo e integracion para OpenClaw.
+
+Objetivo general:
+Configurar y dejar persistentes `orchestrator.py` y `dashboard_api.py` con `systemd`, probar la funcionalidad sin interfaz grafica, verificar que todo funcione correctamente y actualizar los scripts o archivos auxiliares que sean necesarios para estabilizar el flujo multiagent.
+
+Adicionalmente, debes integrar el frontend del dashboard dentro de `/var/www/openclaw-portal`, que es un proyecto Laravel 8 ya existente en el VPS, reutilizando los estilos y funcionalidades de `DevSquadDashboard.jsx` y consumiendo el API del orquestador sin romper el portal actual.
+
+Configuracion inicial actualizada para el despliegue:
+- Ruta del backend y scripts Python: `/var/www/openclaw-multi-agents`
+- Ruta del frontend Laravel 8: `/var/www/openclaw-portal`
+- Servicio del orquestador: `openclaw-multiagent.service`
+- Servicio del dashboard API: `openclaw-dashboard.service`
+- Puerto local del dashboard API: `127.0.0.1:8001`
+- Healthcheck del dashboard API: `http://127.0.0.1:8001/health`
+- URL publica objetivo: `https://openclaw.deploymatrix.com/`
+- Apache ya esta en uso en el VPS y debe actuar como punto de entrada publico
+- El puerto `8080` debe considerarse ocupado y no debe usarse
+- Archivo de entorno compartido: `/etc/default/openclaw-multiagent`
+- Usuario del servicio: `www-data`
+- Fuente visual y funcional del dashboard: `DevSquadDashboard.jsx`
+- Si el frontend necesita publicar el dashboard, debe hacerlo via Apache reverse proxy o una ruta compatible del portal Laravel
+- Scripts disponibles para despliegue y salud: `scripts/install_systemd.sh` y `scripts/check_health.py`
+
+Contexto del proyecto:
+- Repositorio base: https://github.com/jhonatanrojas/multi-agents-open-claw
+- OpenClaw ya esta instalado en el VPS.
+- La configuracion vigente de OpenClaw debe respetarse.
+- Usa solo los modelos configurados en OpenClaw, no Anthropic.
+
+Archivos prioritarios:
+- `orchestrator.py`
+- `dashboard_api.py`
+- `coordination.py`
+- `shared_state.py`
+- `DevSquadDashboard.jsx`
+- `deploy/systemd/openclaw-multiagent.service`
+- `deploy/systemd/openclaw-dashboard.service`
+- `deploy/apache/openclaw-dashboard.conf`
+- `scripts/install_systemd.sh`
+- `scripts/check_health.py`
+- `~/.openclaw/gateway.yml`
+- rutas, vistas, controladores y assets del proyecto Laravel 8 en `/var/www/openclaw-portal`
+
+Reglas obligatorias:
+- No rompas la configuracion actual de OpenClaw.
+- No uses comandos destructivos.
+- No asumas que la interfaz grafica esta disponible; primero valida todo por CLI y procesos.
+- Si un archivo o script no existe, crealo solo si aporta valor real a la operacion persistente.
+- Si detectas que falta una pieza para `systemd`, corrigela en el codigo o en los scripts.
+- Si algo requiere aprobacion o datos del VPS, informa el bloqueo con precision.
+- El backend operativo puede permanecer en `/var/www/openclaw-multi-agents`, pero el frontend final debe integrarse en `/var/www/openclaw-portal`.
+- Extrae estilos, layout y comportamiento visual desde `DevSquadDashboard.jsx` para llevarlos a Laravel 8.
+- El frontend Laravel debe consumir el API del orquestador por una ruta o proxy compatible, sin exponer el puerto `8001` directamente al navegador.
+
+Fase 1. Auditoria y preparacion
+1. Inspecciona `orchestrator.py`, `dashboard_api.py`, `coordination.py`, `shared_state.py` y `~/.openclaw/gateway.yml`.
+2. Identifica como se inicia hoy el orquestador, como se persiste el estado y como se supervisan tareas.
+3. Detecta dependencias fragiles, rutas rotas, suposiciones sobre la interfaz y cualquier punto que impida ejecutar sin UI.
+4. Define que archivos deben quedar listos para correr como servicio persistente.
+5. Inspecciona el proyecto Laravel 8 en `/var/www/openclaw-portal` para determinar donde integrar el dashboard.
+6. Identifica la ruta, el controlador, la vista y los assets que conviene usar o crear para el dashboard.
+
+Fase 2. Persistencia con systemd
+1. Crea o actualiza un servicio `systemd` para ejecutar el orquestador de forma persistente.
+2. Asegura reinicio automatico, logs utiles y arranque al boot.
+3. Verifica que el servicio use el directorio correcto y que no dependa de la interfaz.
+4. Crea o actualiza el segundo servicio `systemd` para el dashboard, escuchando solo en `127.0.0.1:8001`.
+5. Si hace falta, crea o ajusta scripts auxiliares para:
+   - iniciar el sistema
+   - detenerlo
+   - reiniciarlo
+   - consultar estado
+   - revisar logs
+6. Si Apache debe publicar el panel, prepara el reverse proxy correspondiente sin chocar con otras apps del VPS.
+
+Fase 3. Integracion del frontend Laravel 8
+1. Analiza la estructura del proyecto Laravel 8 en `/var/www/openclaw-portal`.
+2. Identifica o crea una ruta real, un controlador y una vista Blade para el dashboard.
+3. Extrae y adapta los estilos, componentes y layout de `DevSquadDashboard.jsx`.
+4. Reproduce en Laravel 8 la misma experiencia del dashboard original, conservando sus funcionalidades.
+5. Conecta el frontend Laravel con el API del orquestador mediante una ruta o proxy seguro.
+6. Si el dashboard original dependia de React, extrae el estilo y la logica de presentacion para llevarla a Blade, CSS y assets de Laravel 8.
+7. No rompas las rutas existentes del portal ni sustituyas su layout principal sin justificarlo.
+8. Asegura que el frontend integrado consuma:
+   - estado
+   - logs
+   - health
+   - inicio de proyectos
+   - revision de tareas y progreso
+   - mensajes de bloqueo o errores
+
+Fase 4. Pruebas sin interfaz
+1. Ejecuta una prueba completa desde CLI.
+2. Verifica que el orquestador:
+   - levanta correctamente
+   - detecta o crea repositorio cuando corresponde
+   - asigna skills dinamicos por stack
+   - escribe progreso por agente
+   - notifica avances o bloqueos
+3. Valida que `dashboard_api.py` pueda responder aunque no se use la UI.
+4. Comprueba que no haya errores silenciosos, loops rotos o tareas estancadas.
+5. Verifica que el frontend Laravel 8 puede consumir el API del orquestador correctamente.
+
+Fase 5. Ajustes y correcciones
+1. Si encuentras bugs, gaps o inconsistencias, corrige el codigo.
+2. Actualiza scripts, rutas, variables de entorno o mensajes de estado si es necesario.
+3. Mejora la robustez del arranque, la reconexion, el manejo de errores y la persistencia.
+4. Asegura que los archivos de progreso y memoria queden en un estado coherente.
+5. Si el frontend Laravel requiere proxy, middleware, config o assets adicionales, integralos sin romper el portal.
+
+Fase 6. Verificacion final
+1. Confirma que el servicio queda persistente con `systemd`.
+2. Confirma que el orquestador funciona sin interfaz grafica.
+3. Confirma que el flujo multiagent responde y actualiza estado correctamente.
+4. Confirma que el dashboard queda accesible localmente por healthcheck y que Apache puede publicarlo sin usar el puerto `8080`.
+5. Confirma que el frontend Laravel 8 en `/var/www/openclaw-portal` renderiza la vista correcta y consume el API del orquestador.
+6. Entrega instrucciones exactas para:
+   - habilitar el servicio
+   - revisar logs
+   - reiniciar el orquestador
+   - integrar el cambio en el OpenClaw actual del VPS
+   - desplegar el frontend en Laravel 8
+   - validar la ruta y vista integradas
+
+Entregables obligatorios:
+- Resumen de auditoria.
+- Lista de bugs corregidos.
+- Lista de scripts creados o actualizados.
+- Archivo(s) `systemd` creados o modificados.
+- Configuracion de Apache creada o actualizada, si aplica.
+- Ruta, controlador, vista o componente Laravel creados o modificados para el frontend.
+- Evidencia de que el frontend Laravel consume el API del orquestador.
+- Comandos exactos para instalar, habilitar y verificar el servicio.
+- Resultado de las pruebas sin interfaz.
+- Riesgos o pendientes, si quedo alguno.
+
+Criterio de exito:
+El multiagent queda corriendo como servicio persistente, con backend operativo en `/var/www/openclaw-multi-agents`, frontend integrado en Laravel 8 dentro de `/var/www/openclaw-portal`, estado verificable por CLI y OpenClaw actual intacto.
