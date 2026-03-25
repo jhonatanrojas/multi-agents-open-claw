@@ -4,3 +4,5 @@ output/
 logs/
 __pycache__/
 shared/MEMORY.lock
+MEMORY.json
+shared/MEMORY.json

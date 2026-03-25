@@ -10,8 +10,12 @@ from pathlib import Path
 from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
-PRIMARY_MEMORY = BASE_DIR / "shared" / "MEMORY.json"
-LEGACY_MEMORY = BASE_DIR / "MEMORY.json"
+RUNTIME_DIR = Path(os.getenv("OPENCLAW_RUNTIME_DIR", str(Path.home() / ".openclaw" / "multi-agents")))
+PRIMARY_MEMORY = RUNTIME_DIR / "MEMORY.json"
+LEGACY_MEMORY = [
+    BASE_DIR / "shared" / "MEMORY.json",
+    BASE_DIR / "MEMORY.json",
+]
 _FLOCK_PATH = PRIMARY_MEMORY.with_suffix(".lock")
 
 # Limits for unbounded-growth arrays (GAP-4 / P2)
@@ -139,7 +143,7 @@ def load_memory() -> dict[str, Any]:
         source: dict[str, Any] | None = None
         source_path: Path | None = None
 
-        for path in (PRIMARY_MEMORY, LEGACY_MEMORY):
+        for path in (PRIMARY_MEMORY, *LEGACY_MEMORY):
             if path.exists():
                 try:
                     source = _read_json(path)
@@ -172,8 +176,7 @@ def save_memory(data: dict[str, Any]) -> dict[str, Any]:
             payload["messages"] = payload["messages"][-MAX_MESSAGES:]
         if len(payload.get("blockers", [])) > MAX_BLOCKERS:
             payload["blockers"] = payload["blockers"][-MAX_BLOCKERS:]
-        for path in (PRIMARY_MEMORY, LEGACY_MEMORY):
-            _write_atomic(path, payload)
+        _write_atomic(PRIMARY_MEMORY, payload)
         return payload
 
 
