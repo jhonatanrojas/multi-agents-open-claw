@@ -33,7 +33,14 @@ from coordination import (
     send_telegram_message,
     write_agent_workspace_files,
 )
-from shared_state import BASE_DIR, ensure_memory_file, load_memory, save_memory, _pid_is_alive
+from shared_state import (
+    BASE_DIR,
+    ensure_memory_file,
+    load_memory,
+    refresh_project_runtime_state,
+    save_memory,
+    _pid_is_alive,
+)
 from skills.shared.miniverse_bridge import get_bridge
 
 OUTPUT_DIR = BASE_DIR / "output"
@@ -163,6 +170,185 @@ def normalize_output_path(path: Path) -> str:
         return str(resolved)
 
 
+def _safe_workspace_path(base_dir: Path, raw_path: str) -> Path:
+    """Resolve a task-provided path and keep it inside *base_dir*."""
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        raise ValueError(f"Ruta absoluta no permitida: {raw_path}")
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError(f"Ruta insegura no permitida: {raw_path}")
+
+    resolved_base = base_dir.resolve()
+    resolved_target = (base_dir / candidate).resolve()
+    try:
+        resolved_target.relative_to(resolved_base)
+    except ValueError as exc:
+        raise ValueError(f"Ruta fuera del workspace: {raw_path}") from exc
+    return resolved_target
+
+
+def _normalize_task_output(data: dict[str, Any], *, agent_id: str, task_id: str) -> tuple[list[dict[str, str]], str]:
+    """Validate the JSON returned by a task agent before writing files."""
+    files = data.get("files")
+    if not isinstance(files, list):
+        raise ValueError("La respuesta JSON no incluye una lista válida de archivos")
+
+    normalized_files: list[dict[str, str]] = []
+    for index, item in enumerate(files):
+        if not isinstance(item, dict):
+            raise ValueError(f"El archivo #{index + 1} no es un objeto JSON válido")
+        path = item.get("path")
+        content = item.get("content")
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(f"El archivo #{index + 1} no tiene una ruta válida")
+        if not isinstance(content, str):
+            raise ValueError(f"El archivo #{index + 1} no tiene contenido de texto válido")
+        normalized_files.append({"path": Path(path).as_posix(), "content": content})
+
+    if not normalized_files:
+        raise ValueError(
+            f"{agent_id.upper()} devolvió JSON válido sin archivos para {task_id}; "
+            "la tarea no puede marcarse como completada"
+        )
+
+    notes = data.get("notes", "")
+    if notes is None:
+        notes = ""
+    elif not isinstance(notes, str):
+        notes = str(notes)
+
+    return normalized_files, notes
+
+
+def _sync_project_status(mem: dict[str, Any]) -> None:
+    """Keep the project status aligned with the task graph."""
+    project = mem.setdefault("project", {})
+    if project.get("status") == "delivered":
+        return
+
+    tasks = [task for task in mem.get("tasks", []) if isinstance(task, dict)]
+    if not tasks:
+        return
+
+    if any(task.get("status") == "error" for task in tasks):
+        project["status"] = "blocked"
+    elif any(task.get("status") in {"pending", "in_progress"} for task in tasks):
+        project["status"] = "in_progress"
+    else:
+        project["status"] = "in_progress"
+    project["updated_at"] = utc_now()
+
+
+def _task_files_for_manifest(task: dict[str, Any]) -> list[str]:
+    files: list[str] = []
+    for raw_path in task.get("files", []) or []:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        files.append(normalize_output_path(resolve_path(raw_path, OUTPUT_DIR)))
+    return files
+
+
+def _synchronize_project_artifacts(mem: dict[str, Any]) -> None:
+    """Write a consolidated project manifest and index for the dashboard."""
+    project = mem.setdefault("project", {})
+    output_dir = resolve_path(project.get("output_dir"), OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tasks = [task for task in mem.get("tasks", []) if isinstance(task, dict)]
+    task_entries: list[dict[str, Any]] = []
+    file_entries: list[dict[str, Any]] = []
+
+    for task in tasks:
+        task_files = _task_files_for_manifest(task)
+        task_entries.append(
+            {
+                "id": task.get("id"),
+                "title": task.get("title"),
+                "agent": task.get("agent"),
+                "status": task.get("status"),
+                "skill_family": task.get("skill_family"),
+                "failure_count": task.get("failure_count", 0),
+                "next_action": task.get("next_action"),
+                "files": task_files,
+                "notes": task.get("notes"),
+            }
+        )
+        for path in task_files:
+            file_entries.append(
+                {
+                    "task_id": task.get("id"),
+                    "agent": task.get("agent"),
+                    "path": path,
+                }
+            )
+
+    manifest = {
+        "project": {
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "status": project.get("status"),
+            "runtime_status": project.get("runtime_status"),
+            "repo_path": project.get("repo_path"),
+            "output_dir": project.get("output_dir"),
+            "branch": project.get("branch"),
+            "updated_at": project.get("updated_at"),
+        },
+        "generated_at": utc_now(),
+        "task_count": len(task_entries),
+        "file_count": len(file_entries),
+        "tasks": task_entries,
+        "files": file_entries,
+    }
+
+    manifest_path = output_dir / "PROJECT_MANIFEST.json"
+    index_path = output_dir / "PROJECT_INDEX.md"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    lines = [
+        f"# {project.get('name') or project.get('id') or 'Project'}",
+        "",
+        f"- Project ID: {project.get('id') or 'N/A'}",
+        f"- Runtime status: {project.get('runtime_status') or project.get('status') or 'idle'}",
+        f"- Tasks: {len(task_entries)}",
+        f"- Files: {len(file_entries)}",
+        "",
+        "## Task Map",
+        "",
+    ]
+    for entry in task_entries:
+        lines.append(f"### {entry['id']} - {entry['title'] or 'Sin título'}")
+        lines.append(f"- Agent: {entry.get('agent') or 'N/A'}")
+        lines.append(f"- Status: {entry.get('status') or 'N/A'}")
+        if entry.get("skill_family"):
+            lines.append(f"- Skill family: {entry.get('skill_family')}")
+        if entry.get("next_action"):
+            lines.append(f"- Next action: {entry.get('next_action')}")
+        if entry.get("files"):
+            lines.append("- Files:")
+            for path in entry["files"]:
+                lines.append(f"  - {path}")
+        else:
+            lines.append("- Files: none")
+        lines.append("")
+
+    if file_entries:
+        lines.extend(["## Unified Files", ""])
+        for item in file_entries:
+            lines.append(f"- {item['path']}  ({item.get('task_id')})")
+    else:
+        lines.extend(["## Unified Files", "", "- No files produced yet."])
+
+    index_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+    project["artifact_manifest"] = str(manifest_path)
+    project["artifact_index"] = str(index_path)
+    project["artifacts_updated_at"] = utc_now()
+    project["artifact_file_count"] = len(file_entries)
+    project["artifact_task_count"] = len(task_entries)
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+
+
 def load_progress(progress_path: Path) -> dict[str, Any]:
     """Load a task progress JSON file."""
     if not progress_path.exists():
@@ -237,6 +423,7 @@ def update_agent_status(agent_id: str, status: str, task: str | None = None) -> 
     mem["agents"][agent_id]["current_task"] = task
     mem.setdefault("project", {})
     mem["project"]["updated_at"] = utc_now()
+    refresh_project_runtime_state(mem)
     save_memory(mem)
 
 
@@ -267,6 +454,7 @@ def update_orchestrator_state(
         orchestrator_state["dry_run"] = dry_run
     mem["project"]["updated_at"] = utc_now()
     _update_project_history(mem)
+    refresh_project_runtime_state(mem)
     save_memory(mem)
 
 
@@ -312,22 +500,23 @@ def record_blocker(
     task_id: str | None = None,
     agent_id: str | None = None,
     retryable: bool | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Store a blocker in shared memory."""
+    entry = {
+        "id": f"blk-{abs(hash((source, task_id, agent_id, message, utc_now()))) % 1_000_000}",
+        "ts": utc_now(),
+        "source": source,
+        "msg": message,
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "retryable": retryable,
+    }
     mem = load_memory()
     mem.setdefault("blockers", [])
-    mem["blockers"].append(
-        {
-            "id": f"blk-{abs(hash((source, task_id, agent_id, message, utc_now()))) % 1_000_000}",
-            "ts": utc_now(),
-            "source": source,
-            "msg": message,
-            "task_id": task_id,
-            "agent_id": agent_id,
-            "retryable": retryable,
-        }
-    )
+    mem["blockers"].append(entry)
+    refresh_project_runtime_state(mem)
     save_memory(mem)
+    return entry
 
 
 def _has_open_tasks(tasks: list[dict[str, Any]]) -> bool:
@@ -679,15 +868,33 @@ async def relay_team_messages(client: OpenClawClient) -> None:
             )
 
             message_upper = normalized["message"].upper()
-            if "BLOCKER:" in message_upper:
-                record_blocker(
+            if "BLOCKER:" in message_upper or "QUESTION:" in message_upper:
+                is_question = "QUESTION:" in message_upper
+                issue_type = "QUESTION" if is_question else "BLOCKER"
+                blocker_entry = record_blocker(
                     normalized["message"],
                     normalized["from"],
                     task_id=normalized.get("task_id"),
                     agent_id=normalized.get("from"),
+                    retryable=True,
+                )
+                mem.setdefault("blockers", [])
+                if blocker_entry not in mem["blockers"]:
+                    mem["blockers"].append(blocker_entry)
+                arch_messages.append(
+                    {
+                        "id": f"{issue_type.lower()}-{blocker_entry['id']}",
+                        "from": normalized["from"],
+                        "to": "arch",
+                        "message": f"{issue_type}:{normalized.get('task_id') or 'unknown'} {normalized['message']}",
+                        "received_at": normalized.get("received_at") or utc_now(),
+                        "raw": normalized,
+                    }
                 )
                 try:
-                    send_telegram_message(f"BLOQUEO de {normalized['from']}: {normalized['message']}")
+                    send_telegram_message(
+                        f"{issue_type} de {normalized['from']}: {normalized['message']}"
+                    )
                 except Exception as exc:
                     log_event(f"Falló la notificación por Telegram: {exc}", "system")
 
@@ -1045,6 +1252,7 @@ async def plan_project(
 
     mem["tasks"] = all_tasks
     mem["project"]["task_skill_summary"] = task_skill_summary
+    refresh_project_runtime_state(mem)
     save_memory(mem)
 
     arch_bridge.speak(
@@ -1174,6 +1382,8 @@ async def execute_task(
                     t["next_action"] = f"reassigned_to_{fallback_agent}"
                     t["suggested_agent"] = fallback_agent
                     t["reassigned_at"] = utc_now()
+        _sync_project_status(mem)
+        refresh_project_runtime_state(mem)
         save_memory(mem)
         record_blocker(
             f"Tarea {task_id} ({agent_id}) falló: {detail}",
@@ -1190,7 +1400,7 @@ async def execute_task(
             )
         bridge.heartbeat("error", f"Error en {task_id}")
         update_agent_status(agent_id, "error", task_id)
-        update_orchestrator_state("error", phase="execution", task_id=task_id, detail=detail, dry_run=dry_run)
+        update_orchestrator_state("blocked", phase="execution", task_id=task_id, detail=detail, dry_run=dry_run)
         log_event(f"La tarea {task_id} FALLÓ: {detail}", agent_id, level="error")
 
     if dry_run:
@@ -1251,10 +1461,14 @@ async def execute_task(
     try:
         if not dry_run:
             data = _parse_task_json_payload(result.content)
-    except Exception:
+            files_payload, task_notes = _normalize_task_output(data, agent_id=agent_id, task_id=task_id)
+        else:
+            files_payload = data.get("files", [])
+            task_notes = data.get("notes", "")
+    except Exception as exc:
         mark_task_failure(
-            "Invalid JSON response",
-            progress_message="Respuesta JSON inválida del agente",
+            f"Invalid JSON response: {exc}",
+            progress_message="Respuesta JSON inválida o incompleta del agente",
             retryable=True,
             raw_response=result.content,
         )
@@ -1262,8 +1476,8 @@ async def execute_task(
 
     try:
         files_written: list[str] = []
-        for f in data.get("files", []):
-            fpath = output_dir / f["path"]
+        for f in files_payload:
+            fpath = _safe_workspace_path(output_dir, f["path"])
             fpath.parent.mkdir(parents=True, exist_ok=True)
             fpath.write_text(f["content"], encoding="utf-8")
             files_written.append(normalize_output_path(fpath))
@@ -1273,13 +1487,15 @@ async def execute_task(
             if t.get("id") == task_id:
                 t["status"] = "done"
                 t["files"] = files_written
-                t["notes"] = data.get("notes", "")
+                t["notes"] = task_notes
                 t["progress_file"] = str(progress_path)
                 t["skill_family"] = skill_profile["family"]
                 t["skills"] = skill_profile["skills"]
         mem.setdefault("files_produced", [])
         mem["files_produced"].extend([f for f in files_written if f not in mem["files_produced"]])
-        save_memory(mem)
+        _sync_project_status(mem)
+        refresh_project_runtime_state(mem)
+        _synchronize_project_artifacts(mem)
 
         append_progress_event(
             progress_path,
@@ -1287,7 +1503,7 @@ async def execute_task(
             "Tarea completada correctamente",
             status="done",
             files=files_written,
-            notes=data.get("notes", ""),
+            notes=task_notes,
             dry_run=dry_run,
         )
 
@@ -1378,6 +1594,8 @@ async def final_review(
         mem.setdefault("project", {})
         mem["project"]["status"] = "in_progress"
         mem["project"]["updated_at"] = utc_now()
+        refresh_project_runtime_state(mem)
+        _synchronize_project_artifacts(mem)
         save_memory(mem)
         update_orchestrator_state(
             "paused",
@@ -1407,6 +1625,8 @@ async def final_review(
     mem["project"]["updated_at"] = utc_now()
     mem.setdefault("milestones", [])
     mem["milestones"].append(f"Proyecto entregado en {utc_now()}")
+    refresh_project_runtime_state(mem)
+    _synchronize_project_artifacts(mem)
     save_memory(mem)
 
     arch_bridge.speak("Proyecto entregado. Revisa DELIVERY.md")
@@ -1517,6 +1737,7 @@ async def main(args: argparse.Namespace) -> None:
             for task in mem["tasks"]:
                 if task.get("status") == "in_progress":
                     task["status"] = "pending"
+            refresh_project_runtime_state(mem)
             save_memory(mem)
             log_event(
                 f"Recuperadas {len(stale)} tarea(s) bloqueadas en in_progress → pending",
@@ -1547,6 +1768,7 @@ async def main(args: argparse.Namespace) -> None:
             mem.setdefault("project", {})
             mem["project"]["output_dir"] = str(OUTPUT_DIR / "dry-run")
             mem["project"]["updated_at"] = utc_now()
+            refresh_project_runtime_state(mem)
             save_memory(mem)
             repo_state = {
                 "repo_url": args.repo_url,
@@ -1603,6 +1825,7 @@ async def main(args: argparse.Namespace) -> None:
                     mem.setdefault("project", {})
                     mem["project"]["status"] = "in_progress"
                     mem["project"]["updated_at"] = utc_now()
+                    refresh_project_runtime_state(mem)
                     save_memory(mem)
                 else:
                     print("Fase 1: Planificación...")
@@ -1641,6 +1864,7 @@ async def main(args: argparse.Namespace) -> None:
                         mem["project"]["branch"] = repo_state.get("branch")
                         mem["project"]["output_dir"] = repo_state.get("repo_path")
                         mem["project"]["updated_at"] = utc_now()
+                        refresh_project_runtime_state(mem)
                         save_memory(mem)
                         log_event(
                             f"Repositorio listo: {repo_state.get('action')} -> {repo_state.get('repo_path')} @ {repo_state.get('branch')}",
@@ -1665,6 +1889,7 @@ async def main(args: argparse.Namespace) -> None:
                                 "msg": str(exc),
                             }
                         )
+                        refresh_project_runtime_state(mem)
                         save_memory(mem)
                         log_event(f"Se requiere aprobación del repositorio: {exc}", "arch", level="warning")
                         try:
@@ -1753,6 +1978,7 @@ async def main(args: argparse.Namespace) -> None:
                     mem.setdefault("project", {})
                     mem["project"]["status"] = "in_progress"
                     mem["project"]["updated_at"] = utc_now()
+                    refresh_project_runtime_state(mem)
                     save_memory(mem)
                     update_orchestrator_state(
                         "paused",

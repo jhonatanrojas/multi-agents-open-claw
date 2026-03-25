@@ -69,6 +69,8 @@ DEFAULT_MEMORY: dict[str, Any] = {
 }
 
 _MEMORY_LOCK = threading.RLock()
+ACTIVE_ORCHESTRATOR_STATES = {"starting", "planning", "executing", "review", "working"}
+RESUMABLE_ORCHESTRATOR_STATES = {"idle", "paused", "error"}
 
 
 @contextmanager
@@ -131,6 +133,58 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
 def default_memory() -> dict[str, Any]:
     """Return a fresh copy of the default memory layout."""
     return deepcopy(DEFAULT_MEMORY)
+
+
+def refresh_project_runtime_state(mem: dict[str, Any]) -> dict[str, Any]:
+    """Derive explicit runtime status fields from the current task graph."""
+    project = mem.setdefault("project", {})
+    orchestrator = project.setdefault("orchestrator", {})
+    tasks = [task for task in mem.get("tasks", []) if isinstance(task, dict)]
+
+    counts = {
+        "total": len(tasks),
+        "done": sum(1 for task in tasks if task.get("status") == "done"),
+        "pending": sum(1 for task in tasks if task.get("status") == "pending"),
+        "in_progress": sum(1 for task in tasks if task.get("status") == "in_progress"),
+        "paused": sum(1 for task in tasks if task.get("status") == "paused"),
+        "error": sum(1 for task in tasks if task.get("status") == "error"),
+    }
+    counts["open"] = counts["pending"] + counts["in_progress"] + counts["paused"] + counts["error"]
+
+    pid_alive = _pid_is_alive(orchestrator.get("pid"))
+    orchestrator_status = str(orchestrator.get("status") or "").lower()
+    project_status = str(project.get("status") or "").lower()
+
+    if project_status == "delivered" and counts["open"] == 0:
+        runtime_status = "delivered"
+    elif orchestrator_status == "paused":
+        runtime_status = "paused" if counts["open"] == 0 else "resumable"
+    elif counts["error"] > 0:
+        runtime_status = "blocked" if pid_alive or orchestrator_status in ACTIVE_ORCHESTRATOR_STATES else "resumable"
+    elif counts["pending"] > 0 or counts["in_progress"] > 0:
+        runtime_status = "running" if pid_alive or orchestrator_status in ACTIVE_ORCHESTRATOR_STATES else "resumable"
+    elif pid_alive or orchestrator_status in ACTIVE_ORCHESTRATOR_STATES:
+        runtime_status = "running"
+    elif project_status in {"planned", "planning", "in_progress"}:
+        runtime_status = "resumable"
+    else:
+        runtime_status = "idle"
+
+    if counts["error"] > 0:
+        blocked_reason = f"{counts['error']} tarea(s) con error"
+    elif counts["paused"] > 0:
+        blocked_reason = f"{counts['paused']} tarea(s) pausadas"
+    elif counts["pending"] > 0 or counts["in_progress"] > 0:
+        blocked_reason = f"{counts['pending'] + counts['in_progress']} tarea(s) pendientes o en progreso"
+    else:
+        blocked_reason = None
+
+    project["task_counts"] = counts
+    project["runtime_status"] = runtime_status
+    project["can_resume"] = bool(counts["open"])
+    project["blocked_reason"] = blocked_reason
+    project["has_blockers"] = bool(mem.get("blockers"))
+    return mem
 
 
 def load_memory() -> dict[str, Any]:

@@ -8,6 +8,8 @@ Endpoints:
   GET  /api/state          -> current shared memory snapshot
   GET  /api/stream         -> SSE stream of state changes
   WS   /ws/state           -> WebSocket push of state changes (GAP-9)
+  GET  /api/gateway/events -> live OpenClaw Gateway agent events
+  WS   /ws/gateway-events  -> WebSocket push of Gateway agent events
   GET  /api/agents/world   -> proxies Miniverse /api/agents
   GET  /api/logs           -> last log entries
   POST /api/project/start  -> triggers orchestrator
@@ -40,6 +42,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import requests
+import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -52,7 +55,16 @@ from openclaw_sdk import (
     set_agent_model as sdk_set_agent_model,
     set_default_model as sdk_set_default_model,
 )
-from shared_state import BASE_DIR, load_memory, save_memory, DEFAULT_MEMORY, _pid_is_alive
+from shared_state import (
+    BASE_DIR,
+    DEFAULT_MEMORY,
+    _pid_is_alive,
+    load_memory,
+    refresh_project_runtime_state,
+    save_memory,
+)
+
+from websockets.exceptions import ConnectionClosed
 
 MINIVERSE_URL = os.getenv("MINIVERSE_URL", "https://miniverse-public-production.up.railway.app")
 LOCK_FILE = BASE_DIR / "logs" / "orchestrator.lock"
@@ -63,6 +75,8 @@ _API_KEY: str = os.getenv("DASHBOARD_API_KEY", "")
 
 # Endpoints exempt from auth (public monitoring + streaming)
 _AUTH_EXEMPT = {"/health", "/api/health"}
+GATEWAY_EVENT_LIMIT = 300
+GATEWAY_AGENT_RE = re.compile(r"^agent:(arch|byte|pixel):", re.IGNORECASE)
 
 
 # ── WebSocket broadcaster (GAP-9) ─────────────────────────────────────────────
@@ -99,9 +113,378 @@ class _StateBroadcaster:
 _broadcaster = _StateBroadcaster()
 
 
+def _gateway_connection_details() -> dict[str, Any]:
+    cfg = load_openclaw_config()
+    gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+    gateway_auth = gateway_cfg.get("auth", {}) if isinstance(gateway_cfg, dict) else {}
+    token = (
+        os.getenv("OPENCLAW_GATEWAY_TOKEN")
+        or gateway_auth.get("token")
+        or ""
+    )
+    host = os.getenv("OPENCLAW_GATEWAY_HOST") or gateway_cfg.get("host") or "127.0.0.1"
+    port = int(os.getenv("OPENCLAW_GATEWAY_PORT") or gateway_cfg.get("port") or 18789)
+    return {
+        "url": f"ws://{host}:{port}",
+        "host": host,
+        "port": port,
+        "token": token,
+    }
+
+
+def _parse_gateway_frame(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            if raw.lower() == "hello-ok":
+                return {"type": "hello-ok"}
+            return {"type": "text", "raw": raw}
+    return raw if isinstance(raw, dict) else None
+
+
+def _gateway_frame_type(frame: dict[str, Any]) -> str:
+    frame_type = str(frame.get("type") or "").strip().lower()
+    if frame_type:
+        return frame_type
+    event = str(frame.get("event") or "").strip().lower()
+    return event
+
+
+def _gateway_is_challenge(frame: dict[str, Any]) -> bool:
+    frame_type = _gateway_frame_type(frame)
+    if "challenge" in frame_type:
+        return True
+    payload = frame.get("payload")
+    if isinstance(payload, dict):
+        payload_type = str(payload.get("type") or "").strip().lower()
+        if "challenge" in payload_type:
+            return True
+        if payload.get("nonce"):
+            return True
+    return False
+
+
+def _gateway_extract_nonce(frame: dict[str, Any]) -> str | None:
+    for source in (frame, frame.get("payload") if isinstance(frame.get("payload"), dict) else None):
+        if not isinstance(source, dict):
+            continue
+        for key in ("nonce", "challenge", "challengeNonce"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _gateway_is_hello_ok(frame: dict[str, Any]) -> bool:
+    frame_type = _gateway_frame_type(frame)
+    if frame_type in {"hello-ok", "hello.ok"}:
+        return True
+    if frame_type != "res" or frame.get("ok") is not True:
+        return False
+    payload = frame.get("payload")
+    if isinstance(payload, dict):
+        payload_type = str(payload.get("type") or "").strip().lower()
+        if payload_type == "hello-ok":
+            return True
+    return False
+
+
+def _gateway_connect_frame(token: str, nonce: str | None = None) -> dict[str, Any]:
+    cfg = load_openclaw_config()
+    version = "openclaw-dashboard"
+    if isinstance(cfg, dict):
+        meta = cfg.get("meta", {})
+        if isinstance(meta, dict):
+            touched_version = meta.get("lastTouchedVersion")
+            if isinstance(touched_version, str) and touched_version.strip():
+                version = touched_version.strip()
+    params: dict[str, Any] = {
+        "minProtocol": 3,
+        "maxProtocol": 3,
+        "client": {
+            "id": "gateway-client",
+            "displayName": "openclaw-dashboard",
+            "version": version,
+            "platform": sys.platform,
+            "mode": "backend",
+        },
+        "caps": ["tool-events"],
+        "auth": {"token": token},
+        "role": "operator",
+        "scopes": ["operator.read"],
+    }
+    return {
+        "type": "req",
+        "id": f"connect-{int(datetime.now(timezone.utc).timestamp() * 1000)}",
+        "method": "connect",
+        "params": params,
+    }
+
+
+def _gateway_session_agent(session_key: str | None) -> str | None:
+    if not session_key:
+        return None
+    match = GATEWAY_AGENT_RE.match(session_key)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def _gateway_payload_summary(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    message = payload.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type == "thinking":
+                    thinking = str(item.get("thinking") or "").strip()
+                    if thinking:
+                        parts.append(f"thinking: {thinking[:120]}")
+                elif item_type == "toolcall":
+                    tool_name = str(item.get("name") or item.get("tool") or "tool").strip()
+                    tool_args = item.get("arguments")
+                    if isinstance(tool_args, dict) and tool_args:
+                        try:
+                            parts.append(f"toolCall: {tool_name} {json.dumps(tool_args, ensure_ascii=False)[:120]}")
+                        except Exception:
+                            parts.append(f"toolCall: {tool_name}")
+                    else:
+                        parts.append(f"toolCall: {tool_name}")
+                elif item_type == "text":
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        parts.append(text[:120])
+                if len(parts) >= 2:
+                    break
+            if parts:
+                return " · ".join(parts)[:240]
+    for key in ("text", "message", "content", "detail", "delta"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:240]
+    try:
+        compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return compact[:240]
+    except Exception:
+        return ""
+
+
+def _gateway_event_kind(frame: dict[str, Any], payload: dict[str, Any] | None) -> str:
+    event_name = str(frame.get("event") or "").strip().lower()
+    if "thinking" in event_name:
+        return "thinking"
+    if "tool" in event_name:
+        return "tool"
+    if "message" in event_name or "reply" in event_name or "delta" in event_name:
+        return "message"
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("type") or "").strip().lower()
+                    if item_type == "thinking":
+                        return "thinking"
+                    if item_type in {"toolcall", "tool_call", "tooluse", "tool_use"}:
+                        return "tool"
+                    if item_type == "text":
+                        return "message"
+    return "event"
+
+
+def _normalize_gateway_event(frame: dict[str, Any]) -> dict[str, Any] | None:
+    if frame.get("type") != "event":
+        return None
+    payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
+    session_key = payload.get("sessionKey") if isinstance(payload, dict) else None
+    agent_id = _gateway_session_agent(session_key if isinstance(session_key, str) else None)
+    if not agent_id:
+        return None
+
+    event_name = str(frame.get("event") or "").strip()
+    normalized = {
+        "type": "event",
+        "event": event_name,
+        "agent_id": agent_id,
+        "session_key": session_key,
+        "payload": payload,
+        "kind": _gateway_event_kind(frame, payload),
+        "seq": frame.get("seq"),
+        "stateVersion": frame.get("stateVersion"),
+        "received_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "summary": _gateway_payload_summary(payload),
+    }
+    return normalized
+
+
+class _GatewayEventBroadcaster:
+    """Maintain a live mirror of OpenClaw Gateway agent events."""
+
+    def __init__(self) -> None:
+        self._clients: set[WebSocket] = set()
+        self._events: deque[dict[str, Any]] = deque(maxlen=GATEWAY_EVENT_LIMIT)
+        self._status: dict[str, Any] = {
+            "connected": False,
+            "url": None,
+            "last_error": None,
+            "last_event_at": None,
+        }
+
+    def add(self, ws: WebSocket) -> None:
+        self._clients.add(ws)
+
+    def remove(self, ws: WebSocket) -> None:
+        self._clients.discard(ws)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "status": dict(self._status),
+            "events": list(self._events),
+        }
+
+    async def _broadcast_status(self) -> None:
+        payload = json.dumps(
+            {"type": "status", "status": dict(self._status)},
+            ensure_ascii=False,
+        )
+        dead: set[WebSocket] = set()
+        for ws in list(self._clients):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead.add(ws)
+        self._clients -= dead
+
+    async def publish(self, event: dict[str, Any]) -> None:
+        self._events.append(event)
+        self._status.update(
+            connected=True,
+            last_error=None,
+            last_event_at=event.get("received_at") or datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        )
+        dead: set[WebSocket] = set()
+        payload = json.dumps(event, ensure_ascii=False)
+        for ws in list(self._clients):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead.add(ws)
+        self._clients -= dead
+
+    async def _authenticate(self, ws: websockets.WebSocketClientProtocol, token: str) -> None:
+        connect_sent = False
+        deadline = asyncio.get_running_loop().time() + 15
+
+        while True:
+            timeout = max(0.1, deadline - asyncio.get_running_loop().time())
+            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            frame = _parse_gateway_frame(raw)
+            if not frame:
+                continue
+            frame_type = _gateway_frame_type(frame)
+            if _gateway_is_hello_ok(frame):
+                return
+            if _gateway_is_challenge(frame):
+                await ws.send(json.dumps(_gateway_connect_frame(token), ensure_ascii=False))
+                connect_sent = True
+                continue
+            if frame_type == "event":
+                # Some gateways may stream an event after auth; keep it and wait for ack.
+                normalized = _normalize_gateway_event(frame)
+                if normalized:
+                    await self.publish(normalized)
+                if not connect_sent:
+                    await ws.send(json.dumps(_gateway_connect_frame(token), ensure_ascii=False))
+                    connect_sent = True
+                continue
+            if frame_type == "res" and frame.get("ok") is False:
+                raise RuntimeError(f"Gateway rechazó la conexión: {json.dumps(frame, ensure_ascii=False)[:240]}")
+            if not connect_sent:
+                await ws.send(json.dumps(_gateway_connect_frame(token), ensure_ascii=False))
+                connect_sent = True
+                continue
+            if frame_type in {"error", "connect.error", "auth.error"}:
+                raise RuntimeError(f"Gateway rechazó la conexión: {json.dumps(frame, ensure_ascii=False)[:240]}")
+
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError("Gateway handshake inválido: no llegó un connect.challenge válido")
+
+    async def _listen_once(self) -> None:
+        details = _gateway_connection_details()
+        token = details["token"]
+        if not token:
+            raise RuntimeError("No se encontró token de Gateway en OPENCLAW_GATEWAY_TOKEN ni en ~/.openclaw/openclaw.json")
+
+        self._status.update(url=details["url"], connected=False, last_error=None)
+        await self._broadcast_status()
+        async with websockets.connect(
+            details["url"],
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            open_timeout=15,
+            max_size=2**22,
+        ) as ws:
+            await self._authenticate(ws, token)
+            self._status.update(connected=True, last_error=None)
+            await self._broadcast_status()
+            while True:
+                raw = await ws.recv()
+                frame = _parse_gateway_frame(raw)
+                if not frame or frame.get("type") != "event":
+                    continue
+                normalized = _normalize_gateway_event(frame)
+                if normalized:
+                    await self.publish(normalized)
+
+    async def run(self) -> None:
+        delay = 1.0
+        while True:
+            try:
+                await self._listen_once()
+                delay = 1.0
+            except asyncio.CancelledError:
+                self._status.update(connected=False)
+                raise
+            except ConnectionClosed as exc:
+                self._status.update(connected=False, last_error=str(exc))
+                await self._broadcast_status()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+            except Exception as exc:
+                self._status.update(connected=False, last_error=str(exc))
+                await self._broadcast_status()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+
+
+_gateway_events = _GatewayEventBroadcaster()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     asyncio.create_task(_broadcaster.run())
+    asyncio.create_task(_gateway_events.run())
     yield
 
 
@@ -198,6 +581,7 @@ def _stop_orchestrator(reason: str | None = None) -> dict[str, Any]:
         }
     )
     mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    refresh_project_runtime_state(mem)
     save_memory(mem)
     return {"ok": True, "pid": pid, "alive": alive}
 def build_health_snapshot() -> dict[str, Any]:
@@ -260,6 +644,248 @@ def _stop_orchestrator(reason: str | None = None) -> dict[str, Any]:
     return {"ok": True, "pid": pid, "alive": alive}
 
 
+def _runtime_process_snapshot() -> dict[str, Any]:
+    """Return lock + process information for orchestrator runs."""
+    mem = load_memory()
+    orchestrator_state = mem.get("project", {}).get("orchestrator", {}) or {}
+    lock_payload: dict[str, Any] = {}
+    if LOCK_FILE.exists():
+        try:
+            lock_payload = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            lock_payload = {}
+
+    lock_pid = lock_payload.get("pid")
+    lock_alive = _pid_is_alive(lock_pid)
+    processes: list[dict[str, Any]] = []
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,etimes=,args="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        result = None
+
+    if result and result.stdout:
+        repo_marker = str(BASE_DIR / "orchestrator.py")
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line or "orchestrator.py" not in line:
+                continue
+            try:
+                pid_s, ppid_s, elapsed_s, args = line.split(None, 3)
+                pid = int(pid_s)
+                ppid = int(ppid_s)
+                elapsed = int(float(elapsed_s))
+            except Exception:
+                continue
+            if repo_marker not in args and "orchestrator.py" not in args:
+                continue
+            processes.append(
+                {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "elapsed_sec": elapsed,
+                    "cmdline": args,
+                    "alive": _pid_is_alive(pid),
+                }
+            )
+
+    processes.sort(key=lambda item: (item.get("elapsed_sec", 0), item.get("pid", 0)))
+    primary_pid: int | None = None
+    if lock_alive and isinstance(lock_pid, int):
+        primary_pid = lock_pid
+    else:
+        mem_pid = orchestrator_state.get("pid")
+        if _pid_is_alive(mem_pid):
+            primary_pid = int(mem_pid)
+        elif processes:
+            primary_pid = int(processes[0]["pid"])
+
+    for proc in processes:
+        proc["role"] = "primary" if primary_pid and proc["pid"] == primary_pid else "duplicate"
+        proc["is_lock_pid"] = bool(lock_pid and proc["pid"] == lock_pid)
+        proc["is_mem_pid"] = bool(orchestrator_state.get("pid") and proc["pid"] == orchestrator_state.get("pid"))
+
+    duplicates = [proc for proc in processes if primary_pid is None or proc["pid"] != primary_pid]
+    issues: list[str] = []
+    if lock_payload and not lock_alive:
+        issues.append("lockfile obsoleto")
+    mem_pid = orchestrator_state.get("pid")
+    if mem_pid and not _pid_is_alive(mem_pid):
+        issues.append("PID de memoria obsoleto")
+    if len(processes) > 1:
+        issues.append(f"{len(processes) - 1} ejecución(es) duplicada(s)")
+    if orchestrator_state.get("status") == "error":
+        issues.append("error del orquestador")
+
+    return {
+        "lockfile": {
+            "exists": LOCK_FILE.exists(),
+            "pid": lock_pid,
+            "alive": lock_alive,
+            "started_at": lock_payload.get("started_at"),
+            "argv": lock_payload.get("argv"),
+        },
+        "project_orchestrator": {
+            "pid": orchestrator_state.get("pid"),
+            "status": orchestrator_state.get("status"),
+            "phase": orchestrator_state.get("phase"),
+            "detail": orchestrator_state.get("detail"),
+            "updated_at": orchestrator_state.get("updated_at"),
+        },
+        "primary_pid": primary_pid,
+        "processes": processes,
+        "duplicates": duplicates,
+        "issues": issues,
+        "cleanup_available": bool(duplicates or (lock_payload and not lock_alive)),
+    }
+
+
+def _rewrite_lockfile_for_pid(pid: int, argv: list[str] | None = None) -> None:
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_FILE.write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "started_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                "argv": argv or [sys.executable, str(BASE_DIR / "orchestrator.py")],
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+async def _cleanup_orchestrator_pids(pids: list[int], *, force: bool = True) -> dict[str, Any]:
+    killed: list[int] = []
+    skipped: list[int] = []
+    errors: list[dict[str, Any]] = []
+    for pid in pids:
+        if not _pid_is_alive(pid):
+            skipped.append(pid)
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except ProcessLookupError:
+            skipped.append(pid)
+        except PermissionError as exc:
+            errors.append({"pid": pid, "error": f"permission denied: {exc}"})
+        except Exception as exc:
+            errors.append({"pid": pid, "error": str(exc)})
+    if killed:
+        await asyncio.sleep(0.7)
+        still_alive = [pid for pid in killed if _pid_is_alive(pid)]
+        if still_alive and force:
+            for pid in still_alive:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                except Exception as exc:
+                    errors.append({"pid": pid, "error": str(exc)})
+            await asyncio.sleep(0.4)
+    return {"killed": killed, "skipped": skipped, "errors": errors}
+
+
+def _sync_orchestrator_pid(pid: int | None) -> None:
+    mem = load_memory()
+    mem.setdefault("project", {})
+    mem["project"].setdefault("orchestrator", {})
+    if pid:
+        mem["project"]["orchestrator"]["pid"] = pid
+    else:
+        mem["project"]["orchestrator"].pop("pid", None)
+    mem["project"]["orchestrator"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+
+
+@app.get("/api/runtime/orchestrators")
+def get_runtime_orchestrators():
+    return {
+        "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        **_runtime_process_snapshot(),
+    }
+
+
+@app.post("/api/runtime/orchestrators/cleanup")
+async def cleanup_runtime_orchestrators(payload: dict[str, Any] | None = None):
+    mode = "duplicates"
+    force = True
+    if isinstance(payload, dict):
+        mode = str(payload.get("mode") or mode).lower()
+        force = bool(payload.get("force", True))
+
+    snapshot = _runtime_process_snapshot()
+    primary_pid = snapshot.get("primary_pid")
+    processes = snapshot.get("processes", [])
+    if mode == "all":
+        target_pids = [int(proc["pid"]) for proc in processes if proc.get("pid")]
+    else:
+        target_pids = [int(proc["pid"]) for proc in snapshot.get("duplicates", []) if proc.get("pid")]
+
+    result = await _cleanup_orchestrator_pids(target_pids, force=force)
+
+    if mode == "all":
+        if LOCK_FILE.exists():
+            try:
+                LOCK_FILE.unlink()
+            except FileNotFoundError:
+                pass
+        mem = load_memory()
+        mem.setdefault("project", {})
+        mem["project"].setdefault("orchestrator", {})
+        mem["project"]["orchestrator"].update(
+            {
+                "status": "paused",
+                "phase": "paused",
+                "detail": "Ejecuciones detenidas desde el dashboard",
+                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            }
+        )
+        mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        refresh_project_runtime_state(mem)
+        save_memory(mem)
+    elif isinstance(primary_pid, int) and _pid_is_alive(primary_pid):
+        _rewrite_lockfile_for_pid(primary_pid, argv=snapshot.get("lockfile", {}).get("argv") or None)
+        _sync_orchestrator_pid(primary_pid)
+    else:
+        _sync_orchestrator_pid(None)
+        if LOCK_FILE.exists() and not _pid_is_alive(snapshot.get("lockfile", {}).get("pid")):
+            try:
+                LOCK_FILE.unlink()
+            except FileNotFoundError:
+                pass
+        mem = load_memory()
+        mem.setdefault("project", {})
+        mem["project"].setdefault("orchestrator", {})
+        mem["project"]["orchestrator"].update(
+            {
+                "status": "paused",
+                "phase": "paused",
+                "detail": "Estado huérfano limpiado desde el dashboard",
+                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            }
+        )
+        mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        refresh_project_runtime_state(mem)
+        save_memory(mem)
+
+    return {
+        "ok": True,
+        "mode": mode,
+        "force": force,
+        "terminated": result,
+        "runtime": _runtime_process_snapshot(),
+        "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+    }
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -272,6 +898,18 @@ def health():
 @app.get("/api/state")
 def get_state():
     return load_memory()
+
+
+@app.get("/api/gateway/events")
+def get_gateway_events(limit: int = 100):
+    limit = max(1, min(int(limit or 100), GATEWAY_EVENT_LIMIT))
+    snapshot = _gateway_events.snapshot()
+    events = snapshot.get("events", [])[-limit:]
+    return {
+        "status": snapshot.get("status", {}),
+        "events": events,
+        "limit": limit,
+    }
 
 
 @app.get("/api/stream")
@@ -304,6 +942,22 @@ async def ws_state(websocket: WebSocket):
             await asyncio.wait_for(websocket.receive_text(), timeout=30)
     except (WebSocketDisconnect, asyncio.TimeoutError, Exception):
         _broadcaster.remove(websocket)
+
+
+@app.websocket("/ws/gateway-events")
+async def ws_gateway_events(websocket: WebSocket):
+    """WebSocket endpoint for live OpenClaw Gateway agent events."""
+    await websocket.accept()
+    _gateway_events.add(websocket)
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "snapshot",
+            "snapshot": _gateway_events.snapshot(),
+        }, ensure_ascii=False))
+        while True:
+            await websocket.receive_text()
+    except (WebSocketDisconnect, Exception):
+        _gateway_events.remove(websocket)
 
 
 @app.get("/api/agents/world")
@@ -454,6 +1108,12 @@ class ProjectResumeRequest(BaseModel):
     webhook_url: str | None = None
 
 
+class ProjectPauseRequest(BaseModel):
+    task_id: str | None = None
+    pause_running: bool = True
+    reason: str | None = None
+
+
 def _spawn_orchestrator(args: list[str]) -> None:
     log_path = BASE_DIR / "logs" / "orchestrator.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -538,7 +1198,7 @@ async def resume_project(req: ProjectResumeRequest):
         if req.task_id:
             should_resume = task_id == req.task_id
         elif req.resume_all_failed:
-            should_resume = task.get("status") in {"error", "pending"}
+            should_resume = task.get("status") in {"error", "pending", "paused", "in_progress"}
 
         if should_resume:
             task["status"] = "pending"
@@ -568,6 +1228,7 @@ async def resume_project(req: ProjectResumeRequest):
             "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         }
     )
+    refresh_project_runtime_state(mem)
     save_memory(mem)
 
     args = [sys.executable, str(BASE_DIR / "orchestrator.py"), "--resume"]
@@ -596,10 +1257,50 @@ async def resume_project(req: ProjectResumeRequest):
 @app.post("/api/project/pause")
 async def pause_project(payload: dict[str, Any] | None = None):
     reason = None
+    task_id = None
+    pause_running = True
     if isinstance(payload, dict):
         reason = payload.get("reason")
+        task_id = payload.get("task_id")
+        pause_running = bool(payload.get("pause_running", True))
+
+    mem = load_memory()
+    tasks = mem.get("tasks", []) if isinstance(mem.get("tasks", []), list) else []
+    paused_ids: list[str] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        current_status = str(task.get("status") or "").lower()
+        if current_status != "in_progress":
+            continue
+        if task_id and str(task.get("id") or "") != task_id and pause_running:
+            continue
+        task["status"] = "paused"
+        task["paused_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        task["pause_reason"] = reason or "Pausado desde el dashboard"
+        paused_ids.append(str(task.get("id") or ""))
+        if task_id:
+            break
+
+    if paused_ids:
+        mem.setdefault("project", {})
+        mem["project"]["status"] = "paused"
+        mem["project"].setdefault("orchestrator", {})
+        mem["project"]["orchestrator"].update(
+            {
+                "status": "paused",
+                "phase": "paused",
+                "detail": reason or f"Pausadas {len(paused_ids)} tarea(s)",
+                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            }
+        )
+        refresh_project_runtime_state(mem)
+        save_memory(mem)
+
     result = _stop_orchestrator(reason=reason)
     status = 200 if result.get("ok") else 500
+    if paused_ids:
+        result["paused_tasks"] = paused_ids
     return JSONResponse(result, status_code=status)
 
 
@@ -630,6 +1331,7 @@ async def delete_project(payload: dict[str, Any] | None = None):
     mem["messages"] = []
     mem["milestones"] = []
     mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    refresh_project_runtime_state(mem)
     save_memory(mem)
     result = {"ok": True, "stopped": stop_result.get("ok", False)}
     return JSONResponse(result, status_code=200)
