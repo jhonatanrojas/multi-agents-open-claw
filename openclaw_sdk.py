@@ -29,7 +29,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable, Awaitable, Literal
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +67,114 @@ def classify_progress(line: str) -> str:
     if _READING_RE.search(line):
         return "reading"
     return "working"
+
+
+# ── Fase 2: Clasificación nativa de fallos y eventos estructurados ───────────
+
+FailureKind = Literal["infra", "format", "content", "blocked"]
+
+_INFRA_SIGNALS = (
+    "timeout",
+    "connection reset",
+    "connection refused",
+    "gateway",
+    "503",
+    "502",
+    "econnreset",
+    "econnrefused",
+    "network",
+    "tls",
+    "ssl",
+)
+_FORMAT_SIGNALS = (
+    "json",
+    "parse",
+    "decode",
+    "syntax",
+    "unexpected token",
+    "unterminated",
+    "invalid json",
+    "markdown fence",
+)
+_CONTENT_SIGNALS = (
+    "no files",
+    "empty content",
+    "no content",
+    "acceptance",
+    "missing",
+)
+_BLOCKED_SIGNALS = (
+    "blocker:",
+    "question:",
+    "awaiting",
+    "waiting for",
+    "blocked by",
+)
+
+
+def _infer_failure_kind(
+    *,
+    content: str,
+    stderr_lines: list[str],
+    returncode: int,
+    exc: BaseException | None = None,
+) -> FailureKind | None:
+    """Classify the root cause of an agent run without relying on caller logic.
+
+    Returns one of ``infra | format | content | blocked`` or ``None`` when the
+    run succeeded (non-empty content and exit code 0).
+
+    Rules (in priority order):
+    1. Non-empty content + exit 0  → None (success, no failure)
+    2. BLOCKED/QUESTION keywords in last stderr lines  → ``blocked``
+    3. Infrastructure keywords (timeout, gateway…)  → ``infra``
+    4. JSON/parse errors  → ``format``
+    5. Empty content after successful exit  → ``content``
+    6. Any other non-zero exit  → ``infra``
+    """
+    if content and returncode == 0:
+        return None  # success
+
+    needle = (" ".join(stderr_lines[-10:]) + " " + str(exc or "")).lower()
+
+    if any(s in needle for s in _BLOCKED_SIGNALS):
+        return "blocked"
+    if any(s in needle for s in _INFRA_SIGNALS):
+        return "infra"
+    if any(s in needle for s in _FORMAT_SIGNALS):
+        return "format"
+    if not content:
+        return "content"
+    if returncode != 0:
+        return "infra"
+    return None
+
+
+def _parse_stderr_events(stderr_lines: list[str], agent_id: str, t0: float) -> list[dict[str, Any]]:
+    """Extract structured events from raw stderr lines.
+
+    Each event has at minimum ``{ts, agent, kind, label}``.
+    Tool-use events also include ``tool_name`` when detectable.
+    This replaces the pattern of the orchestrator scanning ``stderr_lines`` as text.
+    """
+    events: list[dict[str, Any]] = []
+    # Pattern to optionally detect tool name after tool_use label.
+    _tool_name_re = re.compile(r"(?:tool[:\s_-]*(?:use|call|invoke|exec)[:\s_-]*)([\w_]+)", re.IGNORECASE)
+
+    for i, line in enumerate(stderr_lines):
+        kind = classify_progress(line)
+        event: dict[str, Any] = {
+            "seq": i,
+            "agent": agent_id,
+            "kind": kind,
+            "label": line[:200],
+        }
+        if kind == "tool_use":
+            m = _tool_name_re.search(line)
+            if m:
+                event["tool_name"] = m.group(1)
+        events.append(event)
+    return events
 
 
 def _find_json_document(text: str) -> Any:
@@ -338,13 +446,24 @@ ProgressCallback = Callable[[str, str, str, float], Awaitable[None] | None]
 
 @dataclass
 class AgentResult:
-    """Thin wrapper so callers can do ``result.content``."""
+    """Thin wrapper so callers can do ``result.content``.
+
+    Fase 2 additions:
+    - ``failure_kind``: native classification (infra/format/content/blocked/None)
+    - ``session_id``:   the session used (echoed back for traceability)
+    - ``events``:       structured list of tool-use, thinking and writing events
+                        extracted from stderr — no scraping needed by the orchestrator.
+    """
 
     content: str
     raw_envelope: dict[str, Any]
     stderr_lines: list[str] = field(default_factory=list)
     elapsed_sec: float = 0.0
     timing: dict[str, Any] = field(default_factory=dict)
+    # Fase 2 — contrato de interface ampliado
+    failure_kind: FailureKind | None = None
+    session_id: str | None = None
+    events: list[dict[str, Any]] = field(default_factory=list)
 
 
 class Agent:
@@ -521,6 +640,14 @@ class Agent:
             stderr_lines=stderr_lines,
             elapsed_sec=elapsed,
             timing=timing,
+            # Fase 2: campos nativos de contrato
+            failure_kind=_infer_failure_kind(
+                content=content,
+                stderr_lines=stderr_lines,
+                returncode=proc.returncode or 0,
+            ),
+            session_id=session_id,
+            events=_parse_stderr_events(stderr_lines, self.agent_id, t0),
         )
 
 

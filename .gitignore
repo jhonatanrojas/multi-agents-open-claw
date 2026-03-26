@@ -7,3 +7,5 @@ shared/MEMORY.lock
 MEMORY.json
 shared/MEMORY.json
 .openclaw-runtime/
+.claude
+openclaw-portal/

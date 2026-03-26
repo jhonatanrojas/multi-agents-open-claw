@@ -24,7 +24,7 @@ Configuracion inicial actualizada para el despliegue:
 - Scripts disponibles para despliegue y salud: `scripts/install_systemd.sh` y `scripts/check_health.py`
 
 Contexto del proyecto:
-- Repositorio base: https://github.com/jhonatanrojas/multi-agents-open-claw
+- clona Repositorio base: https://github.com/jhonatanrojas/multi-agents-open-claw
 - OpenClaw ya esta instalado en el VPS.
 - La configuracion vigente de OpenClaw debe respetarse.
 - Usa solo los modelos configurados en OpenClaw, no Anthropic.

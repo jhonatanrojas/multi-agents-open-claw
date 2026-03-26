@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 import requests
 
@@ -18,11 +18,42 @@ from shared_state import BASE_DIR
 PROJECTS_ROOT = BASE_DIR / "projects"
 WORKSPACES_ROOT = BASE_DIR / "workspaces"
 OPENCLAW_AGENTS_ROOT = Path("/root/.openclaw/agents")
+LOG_DIR = BASE_DIR / "logs"
+OUTPUT_DIR = BASE_DIR / "output"
 WORKSPACE_NAMES = {
     "arch": "coordinator",
     "byte": "programmer",
     "pixel": "designer",
 }
+
+# ---------------------------------------------------------------------------
+# Fase 0 — Contrato formal de estructura de proyecto
+# ---------------------------------------------------------------------------
+
+ProjectKind = Literal[
+    "vanilla-static",      # index.html en raiz, css/, js/, assets/
+    "framework-frontend",  # src/, components/, features/, pages/, public/
+    "backend-service",     # backend/, app/, services/, routes/, tests/
+    "laravel-app",         # respetar estructura existente de Laravel
+    "documentation",       # docs/, README.md como entregable principal
+    "general",             # proyecto sin estructura predecible
+]
+
+
+class ProjectStructure(TypedDict, total=False):
+    """Schema formal de estructura de proyecto (Fase 0)."""
+
+    kind: str                   # uno de ProjectKind
+    root: str                   # directorio raiz relativo al repo
+    entrypoint: str             # archivo o carpeta de entrada
+    directories: dict           # nombre -> ruta relativa declarada
+    canonical_paths: list       # prefijos de ruta permitidos para archivos de entrega
+    forbidden_paths: list       # prefijos prohibidos (p. ej. output/frontend)
+    notes: list                 # restricciones o advertencias
+    is_new_project: bool        # True si el brief describe un proyecto nuevo (no feature)
+
+
+FORBIDDEN_PATHS_DEFAULT = ["output/frontend", "output/", "dist/"]
 
 
 class RepositoryBootstrapError(RuntimeError):
@@ -226,11 +257,17 @@ def needs_planning_clarification(brief: str) -> list[str]:
 
 
 def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Infer a canonical project structure from the brief and stack."""
+    """Infer a canonical project structure from the brief and stack.
+
+    Returns a dict conforming to ProjectStructure. Always includes
+    `canonical_paths` and `forbidden_paths` so execute_task() can validate
+    that agents do not write to invented directories.
+    """
     task = task or {}
     text = _project_text(project, task)
     stack = _stack_from_project(project, task)
     repo_root = str(Path(project.get("repo_path") or project.get("output_dir") or "./output").resolve())
+    new_project = not _brief_mentions_feature_scope(text)
 
     if stack == "vanilla-frontend":
         return {
@@ -243,11 +280,14 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
                 "assets": "assets/",
                 "fonts": "fonts/",
             },
+            "canonical_paths": ["", "css/", "js/", "assets/", "fonts/", "vendor/"],
+            "forbidden_paths": ["output/frontend", "output/", "dist/", "src/"],
             "notes": [
                 "Mantén index.html en la raíz del proyecto.",
                 "Usa css/ para estilos, js/ para lógica y assets/ para recursos estáticos.",
                 "No uses output/frontend salvo que el brief lo pida explícitamente.",
             ],
+            "is_new_project": new_project,
         }
 
     if stack == "frontend":
@@ -264,10 +304,13 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
                 "pages": "src/pages/",
                 "public": "public/",
             },
+            "canonical_paths": ["src/", "public/"],
+            "forbidden_paths": ["output/frontend", "output/", "dist/frontend"],
             "notes": [
                 "Estructura basada en funcionalidades y componentes reutilizables.",
                 "Coloca el código fuente en src/ y los estáticos en public/.",
             ],
+            "is_new_project": new_project,
         }
 
     if stack in {"fastapi", "node-express"}:
@@ -282,10 +325,14 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
                 "tests": "backend/tests/",
                 "config": "backend/config/",
             },
+            "canonical_paths": ["backend/", "tests/", "config/"],
+            "forbidden_paths": ["output/frontend", "output/", "frontend/"],
             "notes": [
                 "Separa la lógica de dominio, rutas y tests.",
                 "No mezcles la salida del backend con estructuras de frontend.",
+                "Los tests son obligatorios antes de cerrar cualquier tarea backend.",
             ],
+            "is_new_project": new_project,
         }
 
     if stack == "laravel":
@@ -300,10 +347,13 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
                 "public": "public/",
                 "tests": "tests/",
             },
+            "canonical_paths": ["app/", "resources/", "public/", "tests/", "database/", "routes/"],
+            "forbidden_paths": ["output/frontend", "output/"],
             "notes": [
                 "Respeta la convención estándar de Laravel.",
                 "Si el brief describe una feature sobre una app Laravel existente, trabaja dentro de su estructura actual.",
             ],
+            "is_new_project": new_project,
         }
 
     if "documentation" in text or "docs" in text or "markdown" in text:
@@ -314,9 +364,12 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
             "directories": {
                 "docs": "docs/",
             },
+            "canonical_paths": ["docs/", ""],
+            "forbidden_paths": ["output/"],
             "notes": [
                 "Organiza la documentación en Markdown con encabezados claros.",
             ],
+            "is_new_project": new_project,
         }
 
     return {
@@ -324,10 +377,127 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
         "root": repo_root,
         "entrypoint": "root",
         "directories": {},
+        "canonical_paths": [],
+        "forbidden_paths": ["output/frontend"],
         "notes": [
             "Usa la estructura que ya exista en el repositorio.",
         ],
+        "is_new_project": new_project,
     }
+
+
+def is_new_project(project: dict[str, Any]) -> bool:
+    """Return True when the project brief describes a new project (not a feature)."""
+    description = (project.get("description") or "").lower()
+    name = (project.get("name") or "").lower()
+    return not _brief_mentions_feature_scope(description + " " + name)
+
+
+def validate_project_structure(
+    execution_dir: str,
+    project: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    files_written: list[str] | None = None,
+) -> list[str]:
+    """Validate that execution_dir and written files do not conflict with the canonical structure.
+
+    - Pre-execution: called with files_written=None to check the declared execution_dir.
+    - Post-execution: called with files_written=[...] to detect files that landed outside
+      the canonical boundaries.
+
+    Returns a list of violation messages. An empty list means valid.
+    """
+    violations: list[str] = []
+    structure = project.get("project_structure") or infer_project_structure(project, task)
+    kind = str(structure.get("kind") or "general")
+    forbidden: list[str] = list(structure.get("forbidden_paths") or FORBIDDEN_PATHS_DEFAULT)
+    canonical: list[str] = list(structure.get("canonical_paths") or [])
+
+    exec_norm = execution_dir.replace("\\", "/").lower()
+
+    # Pre-execution: check that the declared execution_dir is not forbidden
+    for bad in forbidden:
+        if bad.lower() in exec_norm:
+            violations.append(
+                f"[Fase 0] El directorio de ejecucion '{execution_dir}' "
+                f"contiene la ruta prohibida '{bad}' para proyectos de tipo '{kind}'. "
+                f"Usa la estructura canonica: {structure.get('directories') or '{}'}"
+            )
+
+    # Post-execution: check that each file landed inside execution_dir or a canonical path
+    if files_written:
+        exec_dir_path = Path(execution_dir).resolve() if execution_dir else None
+        canonical_paths = [Path(p).resolve() for p in canonical if p]
+        for fpath_str in files_written:
+            fpath = Path(fpath_str).resolve()
+            inside_exec = exec_dir_path and (
+                fpath == exec_dir_path or exec_dir_path in fpath.parents
+            )
+            inside_canonical = any(
+                fpath == cp or cp in fpath.parents for cp in canonical_paths
+            )
+            for bad in forbidden:
+                bad_norm = bad.lower().replace("\\", "/")
+                if bad_norm in fpath_str.replace("\\", "/").lower():
+                    violations.append(
+                        f"[Fase 3] Archivo '{fpath_str}' escrito en ruta prohibida '{bad}'. "
+                        f"Debería estar en: {execution_dir}"
+                    )
+            if canonical_paths and not inside_exec and not inside_canonical:
+                violations.append(
+                    f"[Fase 3] Archivo '{fpath_str}' está fuera del directorio de ejecución "
+                    f"'{execution_dir}' y de las rutas canónicas declaradas."
+                )
+
+    return violations
+
+
+def collect_task_expected_files(task: dict[str, Any], project: dict[str, Any], execution_dir: str) -> list[str]:
+    """Infer files that a task is realistically expected to touch/create based on acceptance criteria."""
+    expected: set[str] = set()
+    acceptance = [str(x) for x in task.get("acceptance", []) if isinstance(x, str)]
+    
+    for acc in acceptance:
+        words = acc.split()
+        for w in words:
+            clean_w = w.strip("`'\".,;:()[]{}*").replace("\\", "/")
+            if "/" in clean_w and "." in clean_w:
+                expected.add(clean_w)
+            elif clean_w.endswith(".py") or clean_w.endswith(".ts") or clean_w.endswith(".tsx") or clean_w.endswith(".js") or clean_w.endswith(".html") or clean_w.endswith(".css") or clean_w.endswith(".json") or clean_w.endswith(".md"):
+                expected.add(clean_w)
+                
+    return sorted(list(expected))
+
+
+def check_existing_task_artifacts(task: dict[str, Any], project: dict[str, Any], repo_state: dict[str, Any] | None = None) -> list[str]:
+    """Check if the files that the task promises to create already exist and have content.
+    Returns the absolute paths of the found files.
+    """
+    execution_dir = task.get("execution_dir") or infer_task_execution_dir(project, task, repo_state)
+    expected = collect_task_expected_files(task, project, execution_dir)
+    
+    if not expected:
+        return []
+        
+    found: list[str] = []
+    repo_path = Path((repo_state or {}).get("repo_path") or project.get("repo_path") or project.get("output_dir") or "./output").resolve()
+    exec_path = Path(execution_dir).resolve()
+    
+    for rel_path in expected:
+        # Check against execution_dir
+        p = (exec_path / rel_path).resolve()
+        if p.exists() and p.is_file() and p.stat().st_size > 10:
+            found.append(str(p))
+            continue
+            
+        # Check against project root
+        p2 = (repo_path / rel_path).resolve()
+        if p2.exists() and p2.is_file() and p2.stat().st_size > 10:
+            found.append(str(p2))
+            continue
+            
+    return found
 
 
 def _stack_from_project(project: dict[str, Any], task: dict[str, Any]) -> str:
@@ -567,6 +737,13 @@ def render_task_context_md(
     ]
     if isinstance(directories, dict) and directories:
         lines.extend(f"- {name}: {path}" for name, path in directories.items())
+        
+    expected_files = collect_task_expected_files(task, project, execution_dir)
+    if expected_files:
+        lines.append("")
+        lines.append("## Archivos esperados (Fase 3)")
+        lines.extend(f"- {f}" for f in expected_files)
+        
     project_structure_notes = project_structure.get("notes", []) or []
     if project_structure_notes:
         lines.append("")
@@ -862,11 +1039,14 @@ def write_agent_workspace_files(
     task_id = task.get("id", "task")
     timestamp = datetime.utcnow().isoformat()
     execution_dir = task.get("execution_dir") or infer_task_execution_dir(project, task, repo_state)
+    expected_files = collect_task_expected_files(task, project, execution_dir)
+    
     context_md = render_task_context_md(agent_id, task, project, skill_profile, repo_state)
     context_json = {
         "agent": agent_id,
         "task": task,
         "execution_dir": execution_dir,
+        "expected_files": expected_files,
         "project": {
             "name": project.get("name"),
             "description": project.get("description"),
@@ -1219,3 +1399,243 @@ def fetch_telegram_updates(
         "updates": updates,
         "payload": payload,
     }
+
+# ---------------------------------------------------------------------------
+# Inspección y validación de contenido (Fase 2)
+# ---------------------------------------------------------------------------
+
+OUTPUT_DIR = BASE_DIR / "output"
+
+
+def resolve_path(raw: str | None, fallback: Path) -> Path:
+    """Resolve a stored path, keeping relative values rooted at the repo."""
+    if not raw:
+        return fallback
+    path = Path(raw)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def normalize_output_path(path: Path) -> str:
+    """Store file paths relative to the repository when possible."""
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(BASE_DIR.resolve()))
+    except ValueError:
+        return str(resolved)
+
+
+def _safe_workspace_path(base_dir: Path, raw_path: str) -> Path:
+    """Resolve a task-provided path and keep it inside *base_dir*."""
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        raise ValueError(f"Ruta absoluta no permitida: {raw_path}")
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError(f"Ruta insegura no permitida: {raw_path}")
+
+    resolved_base = base_dir.resolve()
+    resolved_target = (base_dir / candidate).resolve()
+    try:
+        resolved_target.relative_to(resolved_base)
+    except ValueError as exc:
+        raise ValueError(f"Ruta fuera del workspace: {raw_path}") from exc
+    return resolved_target
+
+
+def _resolve_task_artifact_path(raw_path: str, project: dict[str, Any]) -> Path | None:
+    """Resolve a stored task artifact path against the known project roots."""
+    candidate = Path(raw_path)
+    if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+        return None
+
+    output_dir = resolve_path(project.get("output_dir"), OUTPUT_DIR).resolve()
+    base_dir = BASE_DIR.resolve()
+    cleaned = candidate.as_posix()
+
+    roots: list[Path] = []
+    try:
+        project_root_rel = output_dir.relative_to(base_dir).as_posix()
+    except ValueError:
+        project_root_rel = ""
+
+    if project_root_rel and cleaned.startswith(f"{project_root_rel}/"):
+        suffix = cleaned[len(project_root_rel) + 1 :]
+        roots.append((base_dir / cleaned).resolve())
+        if suffix:
+            roots.append((output_dir / suffix).resolve())
+    else:
+        roots.append((output_dir / cleaned).resolve())
+        roots.append((base_dir / cleaned).resolve())
+
+    for root in roots:
+        if root.exists():
+            return root
+    return None
+
+
+def _read_text_if_exists(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _task_file_map(task: dict[str, Any], project: dict[str, Any]) -> dict[str, str]:
+    file_map: dict[str, str] = {}
+    for rel_path in task.get("files", []) or []:
+        if not isinstance(rel_path, str) or not rel_path.strip():
+            continue
+        abs_path = _resolve_task_artifact_path(rel_path, project)
+        if abs_path is not None:
+            file_map[normalize_output_path(abs_path)] = _read_text_if_exists(abs_path)
+    return file_map
+
+
+def _check_fastapi_task_content(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
+    """Inspect FastAPI task outputs for real content, not just filenames."""
+    file_map = _task_file_map(task, project)
+    files = set(file_map.keys())
+    issues: list[str] = []
+
+    requirements = next((content for path, content in file_map.items() if path.endswith("requirements.txt")), "")
+    main_py = next((content for path, content in file_map.items() if path.endswith("main.py")), "")
+    database_py = next((content for path, content in file_map.items() if path.endswith("database.py")), "")
+    env_file = next((content for path, content in file_map.items() if path.endswith(".env")), "")
+
+    if not any(path.endswith("backend/requirements.txt") or path.endswith("requirements.txt") for path in files):
+        issues.append("falta requirements.txt")
+    else:
+        expected_pkgs = ["fastapi", "uvicorn", "sqlalchemy", "pydantic"]
+        missing = [pkg for pkg in expected_pkgs if pkg not in requirements.lower()]
+        if missing:
+            issues.append(f"requirements.txt incompleto: faltan {', '.join(missing)}")
+
+    if not any(path.endswith("backend/main.py") or path.endswith("main.py") for path in files):
+        issues.append("falta main.py")
+    else:
+        if "fastapi(" not in main_py.lower() and "fastapi()" not in main_py.lower():
+            issues.append("main.py no declara app FastAPI")
+        if "cors" not in main_py.lower() and "corsmiddleware" not in main_py.lower():
+            issues.append("main.py no configura CORS")
+
+    if not any(path.endswith("backend/database.py") or path.endswith("database.py") for path in files):
+        issues.append("falta database.py")
+    else:
+        if "sqlalchemy" not in database_py.lower() and "create_engine" not in database_py.lower():
+            issues.append("database.py no configura SQLAlchemy")
+        if "sqlite" not in database_py.lower():
+            issues.append("database.py no referencia SQLite")
+
+    if not env_file.strip():
+        issues.append(".env vacío o ausente")
+
+    for folder in ("models", "schemas", "routes"):
+        if not any(f"/{folder}/" in path or path.startswith(f"{folder}/") for path in files):
+            issues.append(f"falta estructura {folder}/")
+
+    test_files = [
+        path for path in files
+        if path.startswith("tests/")
+        or "/tests/" in path
+        or Path(path).name.startswith("test_")
+        or Path(path).name.endswith("_test.py")
+    ]
+    if not test_files:
+        issues.append("faltan tests unitarios o de integración para backend")
+    else:
+        test_content = "\n".join(file_map[path] for path in test_files)
+        if "pytest" not in test_content.lower() and "testclient" not in test_content.lower() and "assert " not in test_content.lower():
+            issues.append("los tests backend no parecen ejecutar aserciones reales")
+
+    return issues
+
+
+def _check_vanilla_frontend_task_content(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
+    """Inspect vanilla frontend task outputs for semantic HTML/CSS/JS content."""
+    file_map = _task_file_map(task, project)
+    files = set(file_map.keys())
+    issues: list[str] = []
+    html = next((content for path, content in file_map.items() if path.endswith("index.html")), "")
+    css = next((content for path, content in file_map.items() if path.endswith("styles.css")), "")
+    js = next((content for path, content in file_map.items() if path.endswith(".js")), "")
+
+    if any(path.endswith("index.html") for path in files):
+        if "<!doctype html>" not in html.lower():
+            issues.append("index.html no declara HTML5")
+        if "<meta charset" not in html.lower():
+            issues.append("index.html sin meta charset")
+        if "viewport" not in html.lower():
+            issues.append("index.html sin meta viewport")
+    if any(path.endswith("styles.css") for path in files):
+        if "body" not in css.lower():
+            issues.append("styles.css parece incompleto")
+    if any(path.endswith(".js") for path in files):
+        if "localstorage" not in js.lower() and "queryselector" not in js.lower():
+            issues.append("JavaScript sin lógica funcional aparente")
+    return issues
+
+
+def _check_documentation_task_content(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
+    file_map = _task_file_map(task, project)
+    issues: list[str] = []
+    readme = next((content for path, content in file_map.items() if path.lower().endswith("readme.md")), "")
+    if not readme.strip():
+        issues.append("README.md ausente o vacío")
+    else:
+        expected_sections = ["instal", "uso", "soluci", "proble", "ejempl"]
+        if not any(token in readme.lower() for token in expected_sections):
+            issues.append("README.md carece de secciones operativas")
+    return issues
+
+
+def check_task_content(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
+    """Consolidated entry point for task content validation (Fase 2)."""
+    family = str(task.get("skill_family") or task.get("skill_profile", {}).get("family") or "").lower()
+
+    if family == "fastapi":
+        return _check_fastapi_task_content(task, project)
+    elif family in {"vanilla-frontend", "frontend"}:
+        return _check_vanilla_frontend_task_content(task, project)
+    elif family == "documentation":
+        return _check_documentation_task_content(task, project)
+
+    return []
+
+def _task_files_existing(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
+    files = []
+    for raw_path in task.get("files", []) or []:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        candidate = _resolve_task_artifact_path(raw_path, project)
+        if candidate is not None:
+            files.append(str(candidate))
+    return files
+
+
+def _task_files_from_manifest(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
+    """Fallback file list sourced from PROJECT_MANIFEST.json."""
+    output_dir = resolve_path(project.get("output_dir"), OUTPUT_DIR)
+    manifest_path = output_dir / "PROJECT_MANIFEST.json"
+    if not manifest_path.exists():
+        return []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    task_id = task.get("id")
+    if not task_id:
+        return []
+
+    results = []
+    for f_entry in manifest.get("files", []):
+        if f_entry.get("task_id") == task_id:
+            results.append(str(output_dir / f_entry["path"]))
+    return results
+
+
+def _task_files_for_review(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
+    """Return the best available file list for review checks."""
+    files = _task_files_existing(task, project)
+    if files:
+        return files
+    return _task_files_from_manifest(task, project)

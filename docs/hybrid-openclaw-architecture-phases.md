@@ -356,6 +356,141 @@ No debe ser una segunda fuente de verdad.
 ### `README.md`
 Debe servir como entrada rapida y como indice hacia los documentos de arquitectura y operacion.
 
+## Contratos Faltantes
+
+Esta seccion define los contratos que hoy no existen formalmente y que son necesarios para que la arquitectura hibrida funcione sin ambigüedad.
+
+### Contrato 1. Interface del SDK (`openclaw_sdk.py`)
+
+Hoy el SDK expone un solo metodo de ejecucion. La arquitectura hibrida requiere cuatro metodos formales:
+
+```python
+class Agent:
+    async def execute(
+        self,
+        prompt: str,
+        *,
+        session_id: str | None = None,
+        thinking: str | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> AgentResult:
+        """Lanzar un agente con un prompt. Devuelve resultado completo."""
+        ...
+
+    async def steer(
+        self,
+        session_id: str,
+        message: str,
+    ) -> AgentResult:
+        """Inyectar un mensaje correctivo en una sesion activa sin reiniciarla.
+        Equivale a sessions_steer del runtime nativo."""
+        ...
+
+    async def resume(
+        self,
+        session_id: str,
+        context_update: str | None = None,
+    ) -> AgentResult:
+        """Reanudar una sesion existente con contexto adicional opcional."""
+        ...
+
+    async def get_session_status(
+        self,
+        session_id: str,
+    ) -> SessionStatus:
+        """Consultar si una sesion esta activa, terminada o en error.
+        No debe requerir parsear logs del filesystem."""
+        ...
+```
+
+`AgentResult` debe extenderse con:
+
+```python
+@dataclass
+class AgentResult:
+    content: str
+    raw_envelope: dict
+    stderr_lines: list[str]
+    elapsed_sec: float
+    timing: dict
+    # NUEVO: clasificacion nativa del resultado
+    failure_kind: Literal["infra", "format", "content", "blocked"] | None = None
+    session_id: str | None = None
+    events: list[dict] = field(default_factory=list)  # eventos estructurados del agente
+```
+
+Regla: el SDK nunca debe devolver `failure_kind=None` cuando `content` esta vacio.
+Regla: `events` debe contener los eventos de tool-call y pensamiento como objetos JSON, no como texto libre de stderr.
+
+### Contrato 2. Schema de `project_structure` en MEMORY
+
+El campo `project_structure` debe existir en `MEMORY.json` antes de que se ejecute cualquier tarea. Su schema formal es:
+
+```python
+from typing import Literal, TypedDict
+
+class ProjectStructure(TypedDict):
+    kind: Literal[
+        "vanilla-static",       # index.html en raiz, css/, js/, assets/
+        "framework-frontend",   # src/, components/, features/, pages/, public/
+        "backend-service",      # backend/, app/, services/, routes/, tests/
+        "laravel-app",          # respetar estructura existente de Laravel
+        "documentation",        # docs/, README.md como entregable principal
+        "general",              # proyecto sin estructura predecible
+    ]
+    root: str             # directorio raiz relativo al repo (ejemplo: "." o "src")
+    entrypoint: str       # archivo de entrada principal (ejemplo: "index.html" o "main.py")
+    directories: dict     # mapa nombre -> proposito declarado
+    canonical_paths: list[str]   # rutas permitidas para archivos de entrega
+    forbidden_paths: list[str]   # rutas prohibidas (ejemplo: ["output/frontend"])
+    notes: list[str]      # restricciones o advertencias especificas del proyecto
+```
+
+Regla de validacion en `execute_task()`:
+- Si `kind == "vanilla-static"` y `execution_dir` contiene `output/frontend`, rechazar con `BLOCKER`.
+- Si `kind == "backend-service"` y el agente entrega archivos sin `tests/`, marcar revision como `needs_correction`.
+
+### Contrato 3. Clasificacion de Fallos en `AgentResult`
+
+Hoy `_classify_task_failure()` existe en el orquestador pero no es accesible desde el SDK. En la arquitectura hibrida, el SDK infiere y expone el tipo de fallo directamente en `AgentResult.failure_kind`.
+
+Tabla de clasificacion:
+
+| Condicion | `failure_kind` | Accion del orquestador |
+|---|---|---|
+| timeout, gateway down, connection reset | `"infra"` | No reintentar con el mismo prompt. Esperar y reintentar una vez. |
+| JSON invalido, fences de markdown, payload vacio | `"format"` | Reintentar con instruccion de formato reforzada |
+| Archivos vacios, criterios no cumplidos | `"content"` | Re-ejecutar con issues de revision como contexto |
+| BLOCKER o QUESTION explicito del agente | `"blocked"` | Escalar a ARCH. No reintentar automaticamente. |
+
+Regla: el orquestador no debe inferir el tipo de fallo desde el texto de la excepcion. Debe leer `result.failure_kind`.
+
+### Contrato 4. Estado de Fase en MEMORY
+
+Hoy el estado de cada fase se infiere desde el grafo de tareas. No existe un campo formal de `phase_status`. Esto hace que el dashboard tenga que recalcular el estado en cada lectura.
+
+Extension requerida en `MEMORY.json`:
+
+```json
+{
+  "plan": {
+    "phases": [
+      {
+        "id": "phase-1",
+        "name": "...",
+        "status": "pending | in_progress | done | blocked",
+        "started_at": "...",
+        "completed_at": "...",
+        "tasks": [...]
+      }
+    ]
+  }
+}
+```
+
+Regla: `phase_status` se actualiza al final de cada `execute_task()` exitoso.
+Criterio de completado de fase: todas las tareas de la fase tienen `status == "done"` y ninguna tiene `review_status == "needs_correction"`.
+
 ## Secuencia Recomendada De Migracion
 1. Alinear tipos de proyecto y estructura canonica.
 2. Hacer que ARCH pregunte por Telegram cuando falte stack o tipo.
@@ -370,6 +505,22 @@ Debe servir como entrada rapida y como indice hacia los documentos de arquitectu
 - Si se deja la capa custom demasiado grande, OpenClaw seguira infrautilizado.
 - Si no se actualiza el dashboard y el manifest al mismo tiempo, la vista del usuario seguira desalineada.
 
+## Metricas De Exito
+
+Criterios cuantificables para validar que la migracion fue exitosa:
+
+| Metrica | Estado Actual | Target |
+|---|---|---|
+| Tamano de `orchestrator.py` | 3 253 lineas | ≤ 1 800 lineas |
+| Funciones de parseo JSON duplicadas en orchestrator | 3 (`_load_json_loose`, `_parse_agent_json_payload`, `_parse_task_json_payload`) | 0 (movidas al SDK) |
+| Metodos publicos en `OpenClawClient` / `Agent` | 1 (`execute`) | 4 (`execute`, `steer`, `resume`, `get_session_status`) |
+| Funciones de revision de contenido en orchestrator | 4 | 0 (movidas a `coordination.py`) |
+| Prompts hardcoded en orchestrator | 5 bloques de string | 0 (en `prompts/`) |
+| `project_structure` validado antes de ejecutar tareas | No | Si (TypedDict + assertion en `execute_task()`) |
+| `failure_kind` clasificado por el SDK | No | Si (en `AgentResult`) |
+| `phase_status` persistido en MEMORY | No | Si (campo formal en `plan.phases[]`) |
+| Reintentos por fallo de formato sobre fallos de infra | Frecuente | 0 (clasificacion correcta evita reintentos ciegos) |
+
 ## Definicion De Exito
 
 La arquitectura hibrida queda bien resuelta cuando:
@@ -379,3 +530,4 @@ La arquitectura hibrida queda bien resuelta cuando:
 - El dashboard muestra estados reales, no residuos de runs anteriores.
 - El flujo de trabajo puede empezar desde cero, preguntar lo necesario y entregar artefactos coherentes.
 - El sistema deja de depender de parches para que los agentes parezcan agentes.
+- `orchestrator.py` tiene menos de 1 800 lineas y no contiene logica de parseo de envelopes del CLI.
