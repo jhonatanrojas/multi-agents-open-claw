@@ -515,20 +515,30 @@ class Agent:
             "--json",
             "--agent",
             self.agent_id,
+        ])
+        
+        if session_id:
+            cmd.extend(["--session-id", session_id])
+        else:
+            fallback = f"auto-{int(time.monotonic())}"
+            cmd.extend(["--session-id", fallback])
+            log.warning("No session_id passed. Used fallback: %s", fallback)
+            
+        if thinking:
+            cmd.extend(["--thinking", thinking])
+            
+        cmd.extend([
             "--message",
             prompt,
         ])
-        if session_id:
-            cmd.extend(["--session-id", session_id])
-        if thinking:
-            cmd.extend(["--thinking", thinking])
+        
         log.info(
             "Executing: openclaw%s%s agent --json --agent %s (prompt len=%d, session_id=%s, profile=%s)",
             " --local" if use_local else "",
             f" --profile {runtime_profile}" if runtime_profile else "",
             self.agent_id,
             len(prompt),
-            session_id or "auto",
+            session_id or fallback,
             runtime_profile or "default",
         )
 

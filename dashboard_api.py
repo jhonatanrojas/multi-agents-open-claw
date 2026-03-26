@@ -1594,22 +1594,31 @@ def _load_miniverse_snapshot(force_refresh: bool = False) -> dict[str, Any]:
     payload["meta"]["error"] = "; ".join(error_messages) if error_messages else None
     payload["meta"]["cached"] = False
 
+    # ── Partial-failure: fill gaps with mock data instead of replacing everything ──
     if error_messages:
         mock = deepcopy(_load_miniverse_mock())
-        mock.setdefault("meta", {})
-        mock["meta"]["error"] = payload["meta"]["error"]
-        mock["meta"]["fallback"] = "local-mock"
-        mock["meta"]["stale"] = True
-        mock["meta"]["cached_from"] = "remote" if cached_payload else "fresh"
-        mock["ui"]["checked_at"] = utc_now()
-        _MINIVERSE_CACHE.update(
-            {
-                "signature": (MINIVERSE_GITHUB_API_URL, MINIVERSE_URL, MINIVERSE_UI_URL),
-                "expires_at": now + MINIVERSE_CACHE_TTL_SEC,
-                "payload": deepcopy(mock),
-            }
-        )
-        return mock
+        # Only fill in parts that are empty/missing in the live payload
+        if not payload["world"].get("info"):
+            payload["world"]["info"] = mock.get("world", {}).get("info", {})
+        if not payload["world"].get("agents"):
+            payload["world"]["agents"] = mock.get("world", {}).get("agents", [])
+        if not payload["world"].get("events"):
+            payload["world"]["events"] = mock.get("world", {}).get("events", [])
+        if not payload["world"].get("floor"):
+            payload["world"]["floor"] = mock.get("world", {}).get("floor", [])
+        if not payload["world"].get("citizens"):
+            payload["world"]["citizens"] = mock.get("world", {}).get("citizens", [])
+        if not payload["world"].get("props"):
+            payload["world"]["props"] = mock.get("world", {}).get("props", [])
+        # Keep track that we had partial failures
+        payload["meta"]["partial_fallback"] = True
+        payload["meta"]["fallback_parts"] = [msg.split(":")[0] for msg in error_messages]
+        # Do NOT set meta.fallback = "local-mock" — that tells the frontend to go full mock
+        # Only set it if ALL critical sources failed
+        critical_failures = [m for m in error_messages if any(k in m for k in ("observe", "agents", "world_info"))]
+        if len(critical_failures) >= 3:
+            payload["meta"]["fallback"] = "local-mock"
+            payload["meta"]["stale"] = True
 
     _MINIVERSE_CACHE.update(
         {

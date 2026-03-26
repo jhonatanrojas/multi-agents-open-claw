@@ -848,8 +848,35 @@ def infer_tech_stack_from_brief(brief: str) -> dict[str, str]:
     if any(token in text for token in ("react", "typescript", "vite", "next.js", "nextjs")):
         return {"frontend": "React/TypeScript", "backend": "API", "database": "SQLite"}
     if any(token in text for token in ("devops", "apache", "nginx", "backup", "cron")):
+        return {"frontend": "Terminal", "backend": "Shell", "database": "None"}
+    if any(token in text for token in ("admin", "operations", "dashboard")):
         return {"frontend": "Admin UI", "backend": "Operations", "database": "N/A"}
-    return {"frontend": "Frontend", "backend": "Backend", "database": "SQLite"}
+    return {"frontend": "Modern UI", "backend": "Generic API", "database": "Auto"}
+
+
+def _truncate_prompt(text: str | None, max_chars: int = 400000, context: str = "prompt") -> str:
+    """Evita que el prompt desborde el contexto de los agentes truncando el medio.
+    
+    Un límite de 400k caracteres equivale a ~100k tokens, dejando espacio
+    suficiente para el resto del prompt del sistema y overhead del modelo.
+    """
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    
+    half = (max_chars // 2) - 150
+    log_event(
+        f"Contenido de {context} ({len(text)} chars) excede el límite de seguridad ({max_chars}). "
+        f"Se ha truncado el centro para evitar error de tokens.",
+        "system",
+        level="warning"
+    )
+    return (
+        f"{text[:half]}\n\n"
+        f"--- [CONTENIDO INTERMEDIO TRUNCADO POR SEGURIDAD DE CONTEXTO ({len(text)} CHARS → {max_chars}) ---]\n\n"
+        f"{text[-half:]}"
+    )
 
 
 def build_dry_run_plan(brief: str) -> dict[str, Any]:
@@ -1505,11 +1532,19 @@ async def relay_team_messages(client: OpenClawClient) -> None:
     ).hexdigest()[:12]
 
     arch = client.get_agent("arch")
+    arch = client.get_agent("arch")
     coord_cb = make_progress_callback(notify_telegram=False)
-    result = await arch.execute(
+    
+    # Truncamiento de coordinación para evitar saturar ARCH con mensajes históricos
+    coord_payload = _truncate_prompt(
         COORDINATION_PROMPT.format(
             messages=json.dumps(coordination_messages, indent=2, ensure_ascii=False),
         ),
+        context="coordination"
+    )
+    
+    result = await arch.execute(
+        coord_payload,
         on_progress=coord_cb,
         session_id=_stable_session_id(project_identity, "arch", "coordination", coordination_digest),
     )
@@ -1717,8 +1752,11 @@ async def plan_project(
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
         arch = client.get_agent("arch")
         progress_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
-        planner_prompt = PLANNER_PROMPT.format(project_brief=brief)
-        planner_session_id = _stable_session_id("arch", "planning", brief)
+        
+        # Truncamiento preventivo para evitar el error de 166k+ tokens detectado en P2
+        secure_brief = _truncate_prompt(brief, context="brief")
+        planner_prompt = PLANNER_PROMPT.format(project_brief=secure_brief)
+        planner_session_id = _stable_session_id("arch", "planning", secure_brief)
         result = await retry_async(
             "Planner execution",
             lambda: arch.execute(
@@ -1914,7 +1952,9 @@ async def _run_agent_task(
     """Fire the agent and return AgentResult, letting exceptions propagate."""
     async def _call() -> Any:
         try:
-            res = await agent.execute(prompt, on_progress=task_progress_cb, session_id=session_id)
+            # Truncamiento de seguridad para prompts de tareas (Pixel/Byte)
+            secure_prompt = _truncate_prompt(prompt, context=f"task:{agent_id}")
+            res = await agent.execute(secure_prompt, on_progress=task_progress_cb, session_id=session_id)
             if getattr(res, "failure_kind", None) == "infra":
                 raise NonRetryableError(f"Fallo de infraestructura (Gateway/Timeout): {getattr(res, 'content', '')[:100]}")
             return res
@@ -2464,7 +2504,10 @@ async def final_review(
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
         arch = client.get_agent("arch")
         review_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
-        review_prompt = REVIEW_PROMPT.format(memory=json.dumps(_compact_review_memory(mem), indent=2, ensure_ascii=False))
+        review_prompt = _truncate_prompt(
+            REVIEW_PROMPT.format(memory=json.dumps(_compact_review_memory(mem), indent=2, ensure_ascii=False)),
+            context="final-review"
+        )
         review_session_id = _stable_session_id(
             str(mem.get("project", {}).get("id") or mem.get("project", {}).get("name") or "project"),
             "arch",
