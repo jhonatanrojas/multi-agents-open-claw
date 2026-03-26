@@ -37,6 +37,7 @@ import subprocess
 import os
 import signal
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from copy import deepcopy
 import shutil
 from collections import deque
@@ -72,12 +73,13 @@ from shared_state import (
 from websockets.exceptions import ConnectionClosed
 
 MINIVERSE_URL = os.getenv("MINIVERSE_URL", "https://miniverse-public-production.up.railway.app")
-MINIVERSE_UI_URL = os.getenv("MINIVERSE_UI_URL", "https://www.minivrs.com")
+MINIVERSE_UI_URL = os.getenv("MINIVERSE_UI_URL", MINIVERSE_URL).strip() or MINIVERSE_URL
 MINIVERSE_GITHUB_OWNER = "ianscott313"
 MINIVERSE_GITHUB_REPO = "miniverse"
 MINIVERSE_GITHUB_API_URL = f"https://api.github.com/repos/{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}"
 MINIVERSE_REQUEST_TIMEOUT_SEC = float(os.getenv("MINIVERSE_REQUEST_TIMEOUT_SEC", "6"))
 MINIVERSE_CACHE_TTL_SEC = float(os.getenv("MINIVERSE_CACHE_TTL_SEC", "300"))
+MINIVERSE_MOCK_FILE = BASE_DIR / "data" / "miniverse-mock.json"
 LOCK_FILE = BASE_DIR / "logs" / "orchestrator.lock"
 JSONL_LOG_FILE = BASE_DIR / "logs" / "orchestrator.jsonl"
 _MINIVERSE_CACHE: dict[str, Any] = {
@@ -1083,12 +1085,12 @@ async def ws_gateway_events(websocket: WebSocket):
 
 @app.get("/api/agents/world")
 def agents_in_world():
-    """Proxy Miniverse agent list."""
+    """Proxy Miniverse live observe snapshot."""
     try:
-        r = requests.get(f"{MINIVERSE_URL}/api/agents", timeout=5)
+        r = requests.get(f"{MINIVERSE_URL}/api/observe", timeout=5)
         return r.json()
     except Exception as e:
-        return {"error": str(e), "agents": []}
+        return {"error": str(e), "agents": [], "events": [], "lastEventId": None}
 
 
 def _miniverse_repo_headers() -> dict[str, str]:
@@ -1199,6 +1201,241 @@ def _inspect_miniverse_ui() -> dict[str, Any]:
     return preview
 
 
+def _fetch_miniverse_json(url: str, *, headers: dict[str, str] | None = None, timeout: float | None = None) -> dict[str, Any]:
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    return data if isinstance(data, dict) else {"data": data}
+
+
+def _default_miniverse_mock() -> dict[str, Any]:
+    now = utc_now()
+    return {
+        "repo": {
+            "html_url": f"https://github.com/{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}",
+            "name": MINIVERSE_GITHUB_REPO,
+            "full_name": f"{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}",
+            "description": "A tiny pixel world for your agents.",
+            "language": "TypeScript",
+            "updated_at": now,
+        },
+        "world": {
+            "base_url": "local-mock://miniverse",
+            "api_url": "local-mock://miniverse/api",
+            "ui_url": "local-mock://miniverse/ui",
+            "gridCols": 12,
+            "gridRows": 8,
+            "floor": [
+                ["grass", "grass", "grass", "grass", "path", "path", "path", "path", "grass", "grass", "grass", "grass"],
+                ["grass", "grass", "grass", "path", "path", "path", "path", "path", "path", "grass", "grass", "grass"],
+                ["grass", "grass", "path", "path", "path", "path", "path", "path", "path", "path", "grass", "grass"],
+                ["grass", "grass", "path", "path", "path", "desk", "desk", "path", "path", "path", "grass", "grass"],
+                ["grass", "path", "path", "path", "path", "desk", "desk", "path", "path", "path", "path", "grass"],
+                ["grass", "path", "path", "path", "path", "path", "path", "path", "path", "path", "path", "grass"],
+                ["grass", "grass", "path", "path", "path", "path", "path", "path", "path", "grass", "grass", "grass"],
+                ["grass", "grass", "grass", "grass", "path", "path", "path", "path", "grass", "grass", "grass", "grass"],
+            ],
+            "propImages": {
+                "wooden_desk_single": "world_assets/props/prop_0_wooden_desk_single.png",
+                "ergonomic_chair": "world_assets/props/prop_1_ergonomic_chair.png",
+                "tall_potted_plant": "world_assets/props/prop_2_tall_potted_plant.png",
+                "coffee_machine": "world_assets/props/prop_3_coffee_machine.png",
+                "whiteboard": "world_assets/props/prop_4_whiteboard.png",
+            },
+            "props": [
+                {
+                    "id": "wooden_desk_single",
+                    "x": 5.0,
+                    "y": 3.0,
+                    "w": 2,
+                    "h": 2,
+                    "layer": "below",
+                    "anchors": [
+                        {"name": "desk_0_0", "ox": 0.5, "oy": 1.1, "type": "work"},
+                        {"name": "desk_0_1", "ox": 1.4, "oy": 1.1, "type": "work"},
+                    ],
+                },
+                {
+                    "id": "ergonomic_chair",
+                    "x": 5.2,
+                    "y": 4.3,
+                    "w": 1,
+                    "h": 1,
+                    "layer": "below",
+                    "anchors": [
+                        {"name": "chair_0_0", "ox": 0.5, "oy": 0.7, "type": "rest"},
+                    ],
+                },
+                {
+                    "id": "tall_potted_plant",
+                    "x": 1.0,
+                    "y": 1.0,
+                    "w": 1,
+                    "h": 1.5,
+                    "layer": "above",
+                    "anchors": [
+                        {"name": "social_0_0", "ox": 0.5, "oy": 1.2, "type": "social"},
+                    ],
+                },
+                {
+                    "id": "coffee_machine",
+                    "x": 9.0,
+                    "y": 1.0,
+                    "w": 1,
+                    "h": 1.5,
+                    "layer": "above",
+                    "anchors": [
+                        {"name": "coffee_0_0", "ox": 0.5, "oy": 1.0, "type": "social"},
+                    ],
+                },
+                {
+                    "id": "whiteboard",
+                    "x": 8.2,
+                    "y": 4.1,
+                    "w": 1.4,
+                    "h": 1.5,
+                    "layer": "above",
+                    "anchors": [
+                        {"name": "board_0_0", "ox": 0.5, "oy": 1.0, "type": "utility"},
+                    ],
+                },
+            ],
+            "citizens": [
+                {
+                    "agentId": "pixel",
+                    "name": "PIXEL",
+                    "sprite": "nova",
+                    "position": "desk_0_0",
+                    "type": "agent",
+                },
+                {
+                    "agentId": "byte",
+                    "name": "BYTE",
+                    "sprite": "dexter",
+                    "position": "board_0_0",
+                    "type": "agent",
+                },
+                {
+                    "agentId": "arch",
+                    "name": "ARCH",
+                    "sprite": "rio",
+                    "position": "coffee_0_0",
+                    "type": "agent",
+                },
+            ],
+            "wanderPoints": [
+                {"x": 1, "y": 1},
+                {"x": 10, "y": 2},
+                {"x": 9, "y": 6},
+                {"x": 3, "y": 6},
+            ],
+            "info": {
+                "world": "Miniverse local mock",
+                "version": "mock",
+                "grid": {"cols": 12, "rows": 8},
+                "agents": {"online": 3, "total": 3},
+                "theme": "cozy-startup",
+            },
+            "agents": [
+                {
+                    "agent": "pixel",
+                    "state": "working",
+                    "role": "UI",
+                    "task": "Observing and rendering the world",
+                    "last_seen": now,
+                    "x": 4,
+                    "y": 3,
+                },
+                {
+                    "agent": "byte",
+                    "state": "working",
+                    "role": "Code",
+                    "task": "Implementing task flow",
+                    "last_seen": now,
+                    "x": 7,
+                    "y": 5,
+                },
+                {
+                    "agent": "arch",
+                    "state": "thinking",
+                    "role": "Coordinator",
+                    "task": "Planning and reviewing",
+                    "last_seen": now,
+                    "x": 2,
+                    "y": 1,
+                },
+            ],
+            "events": [
+                {
+                    "id": "mock-1",
+                    "type": "thinking",
+                    "agent": "arch",
+                    "message": "Plan de prueba cargado en el mock local.",
+                    "timestamp": now,
+                },
+                {
+                    "id": "mock-2",
+                    "type": "tool",
+                    "agent": "pixel",
+                    "message": "Render local disponible mientras el mundo real responde.",
+                    "timestamp": now,
+                },
+            ],
+            "observe": {},
+            "lastEventId": "mock-2",
+        },
+        "links": {
+            "repo": f"https://github.com/{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}",
+            "api": "local-mock://miniverse/api",
+            "world": "local-mock://miniverse/ui",
+            "ui": "local-mock://miniverse/ui",
+            "docs": "https://minivrs.com/docs/",
+        },
+        "ui": {
+            "url": "local-mock://miniverse/ui",
+            "final_url": "local-mock://miniverse/ui",
+            "embeddable": True,
+            "blocked_by": [],
+            "checked_at": now,
+            "status_code": 200,
+        },
+        "meta": {
+            "source": "local-mock",
+            "cached": False,
+            "error": None,
+        },
+    }
+
+
+def _merge_miniverse_mock(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = deepcopy(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _merge_miniverse_mock(merged[key], value)
+            else:
+                merged[key] = deepcopy(value)
+        return merged
+    if override is None:
+        return deepcopy(base)
+    return deepcopy(override)
+
+
+def _load_miniverse_mock() -> dict[str, Any]:
+    default_mock = _default_miniverse_mock()
+    if MINIVERSE_MOCK_FILE.exists():
+        try:
+            data = json.loads(MINIVERSE_MOCK_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return _merge_miniverse_mock(default_mock, data)
+        except Exception:
+            pass
+    mock = default_mock
+    MINIVERSE_MOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MINIVERSE_MOCK_FILE.write_text(json.dumps(mock, ensure_ascii=False, indent=2), encoding="utf-8")
+    return mock
+
+
 def _load_miniverse_snapshot(force_refresh: bool = False) -> dict[str, Any]:
     now = time.monotonic()
     cached_payload = _MINIVERSE_CACHE.get("payload")
@@ -1222,6 +1459,8 @@ def _load_miniverse_snapshot(force_refresh: bool = False) -> dict[str, Any]:
             "ui_url": MINIVERSE_UI_URL,
             "info": {},
             "agents": {},
+            "events": [],
+            "observe": {},
         },
         "links": {
             "repo": f"https://github.com/{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}",
@@ -1238,61 +1477,139 @@ def _load_miniverse_snapshot(force_refresh: bool = False) -> dict[str, Any]:
             "checked_at": utc_now(),
         },
         "meta": {
-            "source": "world+github+ui",
+            "source": "observe+github+ui",
             "cached": False,
             "error": None,
         },
     }
 
-    repo_data: dict[str, Any] = {}
     error_messages: list[str] = []
 
-    try:
-        repo_response = requests.get(
+    fetch_timeout = min(MINIVERSE_REQUEST_TIMEOUT_SEC, 4.0)
+    overall_deadline = time.monotonic() + max(MINIVERSE_REQUEST_TIMEOUT_SEC + 1.0, 7.0)
+    futures: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures["repo"] = executor.submit(
+            _fetch_miniverse_json,
             MINIVERSE_GITHUB_API_URL,
             headers=_miniverse_repo_headers(),
-            timeout=MINIVERSE_REQUEST_TIMEOUT_SEC,
+            timeout=fetch_timeout,
         )
-        repo_response.raise_for_status()
-        repo_data = repo_response.json() if isinstance(repo_response.json(), dict) else {}
-        if repo_data:
-            payload["repo"].update(_normalize_miniverse_repo(repo_data))
-    except Exception as exc:
-        error_messages.append(f"repo: {exc}")
+        futures["observe"] = executor.submit(
+            _fetch_miniverse_json,
+            f"{MINIVERSE_URL}/api/observe",
+            timeout=fetch_timeout,
+        )
+        futures["world_info"] = executor.submit(
+            _fetch_miniverse_json,
+            f"{MINIVERSE_URL}/api/info",
+            timeout=fetch_timeout,
+        )
+        futures["agents"] = executor.submit(
+            _fetch_miniverse_json,
+            f"{MINIVERSE_URL}/api/agents",
+            timeout=fetch_timeout,
+        )
+        futures["ui"] = executor.submit(_inspect_miniverse_ui)
 
-    try:
-        world_response = requests.get(f"{MINIVERSE_URL}/api/info", timeout=5)
-        world_response.raise_for_status()
-        payload["world"]["info"] = world_response.json()
-    except Exception as exc:
-        payload["world"]["info"] = {"error": str(exc)}
-        error_messages.append(f"world_info: {exc}")
+        wait_timeout = max(overall_deadline - time.monotonic(), 0.1)
+        done, pending = wait(list(futures.values()), timeout=wait_timeout)
 
-    try:
-        agents_response = requests.get(f"{MINIVERSE_URL}/api/agents", timeout=5)
-        agents_response.raise_for_status()
-        payload["world"]["agents"] = agents_response.json()
-    except Exception as exc:
-        payload["world"]["agents"] = {"error": str(exc), "agents": []}
-        error_messages.append(f"world_agents: {exc}")
+        for name in ("repo", "observe", "world_info", "agents", "ui"):
+            future = futures[name]
+            if future in pending:
+                future.cancel()
+                error_messages.append(f"{name}: timeout")
+                continue
+            try:
+                result = future.result()
+            except Exception as exc:
+                error_messages.append(f"{name}: {exc}")
+                continue
 
-    try:
-        payload["ui"].update(_inspect_miniverse_ui())
-        payload["links"]["ui"] = payload["ui"].get("final_url") or MINIVERSE_UI_URL
-        payload["links"]["world"] = payload["links"]["ui"]
-        payload["world"]["ui_url"] = payload["links"]["ui"]
-    except Exception as exc:
-        error_messages.append(f"ui: {exc}")
+            if name == "repo":
+                repo_data = result if isinstance(result, dict) else {}
+                if repo_data:
+                    payload["repo"].update(_normalize_miniverse_repo(repo_data))
+            elif name == "observe":
+                observe_data = result if isinstance(result, dict) else {}
+                if observe_data:
+                    payload["world"]["observe"] = observe_data
+                    info_payload = observe_data.get("info")
+                    if not isinstance(info_payload, dict):
+                        info_candidate = observe_data.get("world")
+                        info_payload = info_candidate if isinstance(info_candidate, dict) else {}
+                    if info_payload:
+                        payload["world"]["info"] = info_payload
+
+                    agents_payload = observe_data.get("agents")
+                    if agents_payload is None and isinstance(info_payload, dict):
+                        agents_payload = info_payload.get("agents")
+                    if agents_payload is not None:
+                        payload["world"]["agents"] = agents_payload
+
+                    events_payload = observe_data.get("events")
+                    if events_payload is None and isinstance(info_payload, dict):
+                        events_payload = info_payload.get("events")
+                    if events_payload is not None:
+                        payload["world"]["events"] = events_payload
+
+                    last_event_id = observe_data.get("lastEventId")
+                    if last_event_id is None:
+                        last_event_id = observe_data.get("last_event_id")
+                    if last_event_id is not None:
+                        payload["world"]["lastEventId"] = last_event_id
+
+                    for maybe_url in (
+                        info_payload.get("ui_url") if isinstance(info_payload, dict) else None,
+                        info_payload.get("url") if isinstance(info_payload, dict) else None,
+                        observe_data.get("ui_url"),
+                        observe_data.get("world_url"),
+                        observe_data.get("base_url"),
+                    ):
+                        if isinstance(maybe_url, str) and maybe_url.strip():
+                            normalized_url = maybe_url.strip()
+                            payload["world"]["ui_url"] = normalized_url
+                            payload["links"]["world"] = normalized_url
+                            payload["links"]["ui"] = normalized_url
+                            payload["ui"]["url"] = normalized_url
+                            payload["ui"]["final_url"] = normalized_url
+                            break
+            elif name == "world_info":
+                if not payload["world"]["info"]:
+                    world_json = result if isinstance(result, dict) else {}
+                    if world_json:
+                        payload["world"]["info"] = world_json
+            elif name == "agents":
+                if not payload["world"]["agents"]:
+                    agents_json = result if isinstance(result, dict) else {}
+                    payload["world"]["agents"] = agents_json if isinstance(agents_json, dict) else {"agents": agents_json}
+            elif name == "ui":
+                if isinstance(result, dict):
+                    payload["ui"].update(result)
+                    payload["links"]["ui"] = payload["ui"].get("final_url") or MINIVERSE_UI_URL
+                    payload["links"]["world"] = payload["links"]["ui"]
+                    payload["world"]["ui_url"] = payload["links"]["ui"]
 
     payload["meta"]["error"] = "; ".join(error_messages) if error_messages else None
     payload["meta"]["cached"] = False
 
-    if error_messages and cached_payload:
-        stale = deepcopy(cached_payload)
-        stale.setdefault("meta", {})
-        stale["meta"]["stale"] = True
-        stale["meta"]["error"] = payload["meta"]["error"]
-        return stale
+    if error_messages:
+        mock = deepcopy(_load_miniverse_mock())
+        mock.setdefault("meta", {})
+        mock["meta"]["error"] = payload["meta"]["error"]
+        mock["meta"]["fallback"] = "local-mock"
+        mock["meta"]["stale"] = True
+        mock["meta"]["cached_from"] = "remote" if cached_payload else "fresh"
+        mock["ui"]["checked_at"] = utc_now()
+        _MINIVERSE_CACHE.update(
+            {
+                "signature": (MINIVERSE_GITHUB_API_URL, MINIVERSE_URL, MINIVERSE_UI_URL),
+                "expires_at": now + MINIVERSE_CACHE_TTL_SEC,
+                "payload": deepcopy(mock),
+            }
+        )
+        return mock
 
     _MINIVERSE_CACHE.update(
         {
@@ -1737,7 +2054,8 @@ async def delete_project(payload: dict[str, Any] | None = None):
         project_name = project_to_delete.get("name")
         project_repo_path = project_to_delete.get("repo_path") or project_to_delete.get("output_dir")
 
-    project_key = slugify(str(project_id or project_name or "project"))
+    raw_project_key = str(project_id or project_name or "project").strip().lower()
+    project_key = re.sub(r"[^a-z0-9]+", "-", raw_project_key).strip("-") or "project"
 
     def _safe_remove(path_value: str | None) -> bool:
         if not path_value:

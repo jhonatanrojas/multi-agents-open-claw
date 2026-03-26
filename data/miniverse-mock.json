@@ -1,0 +1,354 @@
+{
+  "repo": {
+    "html_url": "https://github.com/ianscott313/miniverse",
+    "name": "miniverse",
+    "full_name": "ianscott313/miniverse",
+    "description": "A tiny pixel world for your agents.",
+    "language": "TypeScript",
+    "updated_at": "2026-03-26T12:04:07.484366Z"
+  },
+  "world": {
+    "base_url": "local-mock://miniverse",
+    "api_url": "local-mock://miniverse/api",
+    "ui_url": "local-mock://miniverse/ui",
+    "gridCols": 12,
+    "gridRows": 8,
+    "floor": [
+      [
+        "grass",
+        "grass",
+        "grass",
+        "grass",
+        "path",
+        "path",
+        "path",
+        "path",
+        "grass",
+        "grass",
+        "grass",
+        "grass"
+      ],
+      [
+        "grass",
+        "grass",
+        "grass",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "grass",
+        "grass",
+        "grass"
+      ],
+      [
+        "grass",
+        "grass",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "grass",
+        "grass"
+      ],
+      [
+        "grass",
+        "grass",
+        "path",
+        "path",
+        "path",
+        "desk",
+        "desk",
+        "path",
+        "path",
+        "path",
+        "grass",
+        "grass"
+      ],
+      [
+        "grass",
+        "path",
+        "path",
+        "path",
+        "path",
+        "desk",
+        "desk",
+        "path",
+        "path",
+        "path",
+        "path",
+        "grass"
+      ],
+      [
+        "grass",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "grass"
+      ],
+      [
+        "grass",
+        "grass",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "path",
+        "grass",
+        "grass",
+        "grass"
+      ],
+      [
+        "grass",
+        "grass",
+        "grass",
+        "grass",
+        "path",
+        "path",
+        "path",
+        "path",
+        "grass",
+        "grass",
+        "grass",
+        "grass"
+      ]
+    ],
+    "propImages": {
+      "wooden_desk_single": "world_assets/props/prop_0_wooden_desk_single.png",
+      "ergonomic_chair": "world_assets/props/prop_1_ergonomic_chair.png",
+      "tall_potted_plant": "world_assets/props/prop_2_tall_potted_plant.png",
+      "coffee_machine": "world_assets/props/prop_3_coffee_machine.png",
+      "whiteboard": "world_assets/props/prop_4_whiteboard.png"
+    },
+    "props": [
+      {
+        "id": "wooden_desk_single",
+        "x": 5.0,
+        "y": 3.0,
+        "w": 2,
+        "h": 2,
+        "layer": "below",
+        "anchors": [
+          {
+            "name": "desk_0_0",
+            "ox": 0.5,
+            "oy": 1.1,
+            "type": "work"
+          },
+          {
+            "name": "desk_0_1",
+            "ox": 1.4,
+            "oy": 1.1,
+            "type": "work"
+          }
+        ]
+      },
+      {
+        "id": "ergonomic_chair",
+        "x": 5.2,
+        "y": 4.3,
+        "w": 1,
+        "h": 1,
+        "layer": "below",
+        "anchors": [
+          {
+            "name": "chair_0_0",
+            "ox": 0.5,
+            "oy": 0.7,
+            "type": "rest"
+          }
+        ]
+      },
+      {
+        "id": "tall_potted_plant",
+        "x": 1.0,
+        "y": 1.0,
+        "w": 1,
+        "h": 1.5,
+        "layer": "above",
+        "anchors": [
+          {
+            "name": "social_0_0",
+            "ox": 0.5,
+            "oy": 1.2,
+            "type": "social"
+          }
+        ]
+      },
+      {
+        "id": "coffee_machine",
+        "x": 9.0,
+        "y": 1.0,
+        "w": 1,
+        "h": 1.5,
+        "layer": "above",
+        "anchors": [
+          {
+            "name": "coffee_0_0",
+            "ox": 0.5,
+            "oy": 1.0,
+            "type": "social"
+          }
+        ]
+      },
+      {
+        "id": "whiteboard",
+        "x": 8.2,
+        "y": 4.1,
+        "w": 1.4,
+        "h": 1.5,
+        "layer": "above",
+        "anchors": [
+          {
+            "name": "board_0_0",
+            "ox": 0.5,
+            "oy": 1.0,
+            "type": "utility"
+          }
+        ]
+      }
+    ],
+    "citizens": [
+      {
+        "agentId": "pixel",
+        "name": "PIXEL",
+        "sprite": "nova",
+        "position": "desk_0_0",
+        "type": "agent"
+      },
+      {
+        "agentId": "byte",
+        "name": "BYTE",
+        "sprite": "dexter",
+        "position": "board_0_0",
+        "type": "agent"
+      },
+      {
+        "agentId": "arch",
+        "name": "ARCH",
+        "sprite": "rio",
+        "position": "coffee_0_0",
+        "type": "agent"
+      }
+    ],
+    "wanderPoints": [
+      {
+        "x": 1,
+        "y": 1
+      },
+      {
+        "x": 10,
+        "y": 2
+      },
+      {
+        "x": 9,
+        "y": 6
+      },
+      {
+        "x": 3,
+        "y": 6
+      }
+    ],
+    "info": {
+      "world": "Miniverse local mock",
+      "version": "mock",
+      "grid": {
+        "cols": 12,
+        "rows": 8
+      },
+      "agents": {
+        "online": 3,
+        "total": 3
+      },
+      "theme": "cozy-startup"
+    },
+    "agents": [
+      {
+        "agent": "pixel",
+        "state": "working",
+        "role": "UI",
+        "task": "Observing and rendering the world",
+        "last_seen": "2026-03-26T12:04:07.484366Z",
+        "x": 4,
+        "y": 3
+      },
+      {
+        "agent": "byte",
+        "state": "working",
+        "role": "Code",
+        "task": "Implementing task flow",
+        "last_seen": "2026-03-26T12:04:07.484366Z",
+        "x": 7,
+        "y": 5
+      },
+      {
+        "agent": "arch",
+        "state": "thinking",
+        "role": "Coordinator",
+        "task": "Planning and reviewing",
+        "last_seen": "2026-03-26T12:04:07.484366Z",
+        "x": 2,
+        "y": 1
+      }
+    ],
+    "events": [
+      {
+        "id": "mock-1",
+        "type": "thinking",
+        "agent": "arch",
+        "message": "Plan de prueba cargado en el mock local.",
+        "timestamp": "2026-03-26T12:04:07.484366Z"
+      },
+      {
+        "id": "mock-2",
+        "type": "tool",
+        "agent": "pixel",
+        "message": "Render local disponible mientras el mundo real responde.",
+        "timestamp": "2026-03-26T12:04:07.484366Z"
+      },
+      {
+        "id": "mock-3",
+        "type": "message",
+        "agent": "byte",
+        "message": "Citizens y anchors resueltos desde world.json.",
+        "timestamp": "2026-03-26T12:04:07.484366Z"
+      }
+    ],
+    "observe": {},
+    "lastEventId": "mock-3"
+  },
+  "links": {
+    "repo": "https://github.com/ianscott313/miniverse",
+    "api": "local-mock://miniverse/api",
+    "world": "local-mock://miniverse/ui",
+    "ui": "local-mock://miniverse/ui",
+    "docs": "https://minivrs.com/docs/"
+  },
+  "ui": {
+    "url": "local-mock://miniverse/ui",
+    "final_url": "local-mock://miniverse/ui",
+    "embeddable": true,
+    "blocked_by": [],
+    "checked_at": "2026-03-26T12:04:07.484366Z",
+    "status_code": 200
+  },
+  "meta": {
+    "source": "local-mock",
+    "cached": false,
+    "error": null
+  }
+}
