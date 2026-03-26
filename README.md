@@ -47,6 +47,11 @@
 
 Cambia los modelos sin reiniciar el código con `PUT /api/models` o editando `models_config.json`.
 
+## Design Notes
+
+- [Arquitectura híbrida objetivo y fases de implementación](docs/hybrid-openclaw-architecture-phases.md)
+- Este documento explica los problemas del esquema custom actual, cómo se corrigen con la arquitectura híbrida y en qué fases conviene migrar.
+
 ---
 
 ## Quick Start
