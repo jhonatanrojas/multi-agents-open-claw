@@ -60,6 +60,7 @@ DEFAULT_MEMORY: dict[str, Any] = {
         "pixel": {"status": "idle", "current_task": None, "last_seen": None},
     },
     "blockers": [],
+    "proposals": [],
     "milestones": [],
     "projects": [],
     "files_produced": [],

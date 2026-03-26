@@ -27,15 +27,19 @@ import os
 import re
 import shutil
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 log = logging.getLogger(__name__)
 
-# Default path to the OpenClaw config file.
+BASE_DIR = Path(__file__).resolve().parent
+
+# Default path to the base OpenClaw config file.
 OPENCLAW_CONFIG_PATH = Path(os.getenv("OPENCLAW_CONFIG", Path.home() / ".openclaw" / "openclaw.json"))
+OPENCLAW_RUNTIME_PROFILE = os.getenv("OPENCLAW_PROFILE", "multi-agents-runtime-v2").strip()
+OPENCLAW_RUNTIME_HOME = Path(os.getenv("OPENCLAW_RUNTIME_HOME", str(BASE_DIR / ".openclaw-runtime")))
+_BASE_OPENCLAW_ROOT = OPENCLAW_CONFIG_PATH.parent
 
 # Minimum seconds between Telegram-bound progress updates (avoid spam).
 _PROGRESS_THROTTLE_SEC = 15.0
@@ -49,6 +53,7 @@ _TOOL_USE_RE = re.compile(r"tool[:\s_-]*(use|call|invoke|exec)", re.IGNORECASE)
 _THINKING_RE = re.compile(r"(think|reason|plann|analy)", re.IGNORECASE)
 _WRITING_RE = re.compile(r"(writ|creat|generat|build)", re.IGNORECASE)
 _READING_RE = re.compile(r"(read|fetch|load|search|scan)", re.IGNORECASE)
+_SESSION_INDEX_RELATIVE = Path(".openclaw") / "agents"
 
 
 def classify_progress(line: str) -> str:
@@ -110,10 +115,17 @@ def _extract_cli_payload(stdout: str, stderr: str = "") -> dict[str, Any]:
         )
         return {}
 
+    def _payload_container(payload: dict[str, Any]) -> dict[str, Any] | None:
+        if isinstance(payload.get("result"), dict):
+            return payload["result"]
+        return payload
+
     def score(payload: dict[str, Any]) -> tuple[int, int]:
-        has_payloads = 1 if isinstance(payload.get("payloads"), list) and payload.get("payloads") else 0
-        has_direct = 1 if any(isinstance(payload.get(key), str) and payload.get(key).strip() for key in ("response", "content", "message", "text")) else 0
-        return (has_payloads, has_direct)
+        container = _payload_container(payload) or payload
+        has_payloads = 1 if isinstance(container.get("payloads"), list) and container.get("payloads") else 0
+        has_direct = 1 if any(isinstance(container.get(key), str) and container.get(key).strip() for key in ("response", "content", "message", "text")) else 0
+        nested_payloads = 1 if isinstance(payload.get("result"), dict) and isinstance(payload["result"].get("payloads"), list) and payload["result"].get("payloads") else 0
+        return (has_payloads + nested_payloads, has_direct)
 
     return max(candidates, key=score)
 
@@ -135,6 +147,12 @@ def _extract_content(envelope: dict[str, Any]) -> str:
         if isinstance(first, str):
             return first
 
+    result = envelope.get("result")
+    if isinstance(result, dict):
+        nested = _extract_content(result)
+        if nested:
+            return nested
+
     # Fallbacks
     for key in ("content", "message"):
         val = envelope.get(key)
@@ -153,6 +171,159 @@ def _extract_timing(envelope: dict[str, Any]) -> dict[str, Any]:
         if key in meta:
             timing[key] = meta[key]
     return timing
+
+
+def _session_index_path(agent_id: str) -> Path:
+    """Return the sessions index for an OpenClaw agent."""
+    return Path.home() / _SESSION_INDEX_RELATIVE / agent_id / "sessions" / "sessions.json"
+
+
+def _latest_session_file(agent_id: str) -> Path | None:
+    """Return the most recent session log file for *agent_id* if available."""
+    index_path = _session_index_path(agent_id)
+    try:
+        index_data = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        index_data = None
+
+    if isinstance(index_data, dict):
+        entry = index_data.get(f"agent:{agent_id}:main")
+        if isinstance(entry, dict):
+            session_file = entry.get("sessionFile")
+            if isinstance(session_file, str) and session_file.strip():
+                candidate = Path(session_file).expanduser()
+                if candidate.exists():
+                    return candidate
+
+    sessions_dir = index_path.parent
+    if sessions_dir.exists():
+        candidates = sorted(sessions_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def _extract_last_assistant_text(session_file: Path) -> str:
+    """Extract the latest assistant text from a JSONL OpenClaw session log."""
+    try:
+        lines = session_file.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return ""
+
+    for raw_line in reversed(lines):
+        try:
+            entry = json.loads(raw_line)
+        except Exception:
+            continue
+
+        message = entry.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+
+        content = message.get("content")
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text") or item.get("thinking")
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+            if chunks:
+                return "\n".join(chunks)
+
+        for key in ("text", "content", "message"):
+            val = message.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+    return ""
+
+
+def _recover_content_from_session_log(agent_id: str) -> str:
+    """Best-effort fallback when the CLI result content is unexpectedly empty."""
+    session_file = _latest_session_file(agent_id)
+    if not session_file:
+        return ""
+    return _extract_last_assistant_text(session_file)
+
+
+def _profile_root(profile_name: str | None = None) -> Path | None:
+    profile = (profile_name or OPENCLAW_RUNTIME_PROFILE).strip()
+    if not profile:
+        return None
+    return OPENCLAW_RUNTIME_HOME / f".openclaw-{profile}"
+
+
+def _profile_config_path(profile_name: str | None = None) -> Path:
+    root = _profile_root(profile_name)
+    return root / "openclaw.json" if root is not None else OPENCLAW_CONFIG_PATH
+
+
+def _active_config_path(path: Path | None = None) -> Path:
+    if path is not None:
+        return path
+    profile_cfg = _profile_config_path()
+    if profile_cfg.exists():
+        return profile_cfg
+    return OPENCLAW_CONFIG_PATH
+
+
+def _rewrite_openclaw_paths(value: Any, *, base_root: Path, profile_root: Path) -> Any:
+    base_prefix = str(base_root)
+    profile_prefix = str(profile_root)
+
+    if isinstance(value, dict):
+        return {
+            key: _rewrite_openclaw_paths(inner, base_root=base_root, profile_root=profile_root)
+            for key, inner in value.items()
+        }
+    if isinstance(value, list):
+        return [_rewrite_openclaw_paths(item, base_root=base_root, profile_root=profile_root) for item in value]
+    if isinstance(value, str) and value.startswith(base_prefix):
+        suffix = value[len(base_prefix):].lstrip("/")
+        return str(profile_root / suffix) if suffix else profile_prefix
+    return value
+
+
+def _ensure_runtime_profile(profile_name: str | None = None) -> Path | None:
+    """Clone the base OpenClaw tree into a writable runtime profile if needed."""
+    root = _profile_root(profile_name)
+    if root is None:
+        return None
+
+    config_path = root / "openclaw.json"
+    if config_path.exists():
+        return root
+
+    # First-use bootstrap: copy the base tree so agent/session state becomes writable.
+    if not root.exists() and _BASE_OPENCLAW_ROOT.exists():
+        shutil.copytree(_BASE_OPENCLAW_ROOT, root)
+    else:
+        root.mkdir(parents=True, exist_ok=True)
+
+    if OPENCLAW_CONFIG_PATH.exists():
+        try:
+            base_cfg = json.loads(OPENCLAW_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("Could not load base OpenClaw config for runtime profile bootstrap: %s", exc)
+            return root
+
+        if isinstance(base_cfg, dict):
+            rewritten = _rewrite_openclaw_paths(base_cfg, base_root=_BASE_OPENCLAW_ROOT, profile_root=root)
+            agents_list = rewritten.get("agents", {}).get("list", []) if isinstance(rewritten.get("agents"), dict) else []
+            for agent in agents_list:
+                agent_id = agent.get("id")
+                if not agent_id:
+                    continue
+                sessions_dir = root / "agents" / agent_id / "sessions"
+                if sessions_dir.exists():
+                    shutil.rmtree(sessions_dir, ignore_errors=True)
+                sessions_dir.mkdir(parents=True, exist_ok=True)
+                (sessions_dir / "sessions.json").write_text("{}\n", encoding="utf-8")
+            config_path.write_text(json.dumps(rewritten, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            log.info("Bootstrapped OpenClaw runtime profile at %s", root)
+    return root
 
 
 # Type alias for progress callbacks.
@@ -186,10 +357,13 @@ class Agent:
         self,
         prompt: str,
         *,
+        session_id: str | None = None,
+        use_local: bool = False,
+        thinking: str | None = None,
         on_progress: ProgressCallback | None = None,
         progress_throttle_sec: float = _PROGRESS_THROTTLE_SEC,
     ) -> AgentResult:
-        """Run ``openclaw agent --local --json`` and return the result.
+        """Run ``openclaw agent`` and return the result.
 
         If *on_progress* is provided it is called for each non-empty stderr
         line emitted by the CLI.  The callback receives
@@ -197,29 +371,48 @@ class Agent:
         async.  Calls are throttled to at most once every
         *progress_throttle_sec* seconds to avoid Telegram spam.
         """
-        cmd = [
-            "openclaw",
+        runtime_profile = OPENCLAW_RUNTIME_PROFILE or None
+        if runtime_profile:
+            _ensure_runtime_profile(runtime_profile)
+
+        cmd = ["openclaw"]
+        if runtime_profile:
+            cmd.extend(["--profile", runtime_profile])
+        cmd.extend([
             "agent",
-            "--local",
+        ])
+        if use_local:
+            cmd.append("--local")
+        cmd.extend([
             "--json",
             "--agent",
             self.agent_id,
-            "--session-id",
-            f"{self.agent_id}-{uuid.uuid4().hex}",
             "--message",
             prompt,
-        ]
+        ])
+        if session_id:
+            cmd.extend(["--session-id", session_id])
+        if thinking:
+            cmd.extend(["--thinking", thinking])
         log.info(
-            "Executing: openclaw agent --local --json --agent %s (prompt len=%d)",
+            "Executing: openclaw%s%s agent --json --agent %s (prompt len=%d, session_id=%s, profile=%s)",
+            " --local" if use_local else "",
+            f" --profile {runtime_profile}" if runtime_profile else "",
             self.agent_id,
             len(prompt),
+            session_id or "auto",
+            runtime_profile or "default",
         )
 
         t0 = time.monotonic()
+        env = os.environ.copy()
+        env["HOME"] = str(OPENCLAW_RUNTIME_HOME)
+        env.setdefault("OPENCLAW_PROFILE", runtime_profile or "")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
 
         # Stream stderr in real-time while stdout is buffered.
@@ -284,6 +477,16 @@ class Agent:
         timing = _extract_timing(envelope)
 
         if not content:
+            recovered = _recover_content_from_session_log(self.agent_id)
+            if recovered:
+                log.warning(
+                    "Recovered empty CLI content for agent=%s from session log %s",
+                    self.agent_id,
+                    _latest_session_file(self.agent_id),
+                )
+                content = recovered
+
+        if not content:
             log.error(
                 "Empty content after extraction for agent=%s (%.1fs); "
                 "envelope_keys=%s stdout[:200]=%s last_stderr=%s",
@@ -328,7 +531,7 @@ class Agent:
 
 def load_openclaw_config(path: Path | None = None) -> dict[str, Any]:
     """Load and return the full ``openclaw.json`` config."""
-    p = path or OPENCLAW_CONFIG_PATH
+    p = _active_config_path(path)
     if not p.exists():
         log.warning("OpenClaw config not found at %s", p)
         return {}
@@ -341,7 +544,9 @@ def load_openclaw_config(path: Path | None = None) -> dict[str, Any]:
 
 def save_openclaw_config(config: dict[str, Any], path: Path | None = None) -> None:
     """Write *config* back to ``openclaw.json`` with a backup."""
-    p = path or OPENCLAW_CONFIG_PATH
+    if path is None and OPENCLAW_RUNTIME_PROFILE:
+        _ensure_runtime_profile(OPENCLAW_RUNTIME_PROFILE)
+    p = _active_config_path(path)
     # Safety backup before writing.
     if p.exists():
         backup = p.with_suffix(".json.bak")

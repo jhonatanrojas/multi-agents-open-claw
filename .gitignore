@@ -6,3 +6,4 @@ __pycache__/
 shared/MEMORY.lock
 MEMORY.json
 shared/MEMORY.json
+.openclaw-runtime/

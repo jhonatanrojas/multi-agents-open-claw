@@ -29,12 +29,14 @@ Auth (GAP-1 / P5):
 
 import json
 import asyncio
+import hashlib
 import re
 import sys
 import subprocess
 import os
 import signal
 from copy import deepcopy
+import shutil
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -337,12 +339,104 @@ def _normalize_gateway_event(frame: dict[str, Any]) -> dict[str, Any] | None:
     return normalized
 
 
+def _gateway_fingerprint_payload(value: Any) -> Any:
+    """Return a normalized payload used only for deduplication."""
+    if isinstance(value, dict):
+        return {
+            key: _gateway_fingerprint_payload(item)
+            for key, item in sorted(value.items())
+            if key not in {"timestamp", "ts", "received_at", "_meta", "date"}
+        }
+    if isinstance(value, list):
+        return [_gateway_fingerprint_payload(item) for item in value]
+    return value
+
+
+def _gateway_event_fingerprint(event: dict[str, Any]) -> str:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    fingerprint_source = {
+        "agent_id": event.get("agent_id"),
+        "session_key": event.get("session_key"),
+        "event": event.get("event"),
+        "kind": event.get("kind"),
+        "payload": _gateway_fingerprint_payload(payload),
+    }
+    blob = json.dumps(fingerprint_source, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _gateway_event_group_key(event: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (
+        event.get("agent_id"),
+        event.get("session_key"),
+        event.get("seq"),
+    )
+
+
+def _gateway_event_rank(event: dict[str, Any]) -> tuple[int, int, int, int]:
+    event_name = str(event.get("event") or "").strip().lower()
+    kind = str(event.get("kind") or "").strip().lower()
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    payload_state = ""
+    if isinstance(payload, dict):
+        payload_state = str(payload.get("state") or payload.get("status") or "").strip().lower()
+    if event_name == "chat" or kind == "message":
+        primary = 0
+    elif event_name == "agent":
+        primary = 1
+    elif kind in {"thinking", "tool"}:
+        primary = 2
+    else:
+        primary = 3
+    has_summary = 0 if _gateway_payload_summary(payload) else 1
+    has_text = 0 if payload_state or event.get("summary") else 1
+    seq = event.get("seq")
+    seq_rank = 0 if isinstance(seq, int) else 1
+    return (primary, has_summary, has_text, seq_rank)
+
+
+def _gateway_event_sort_key(event: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+    received = event.get("received_at")
+    seq = event.get("seq")
+    return (
+        received or "",
+        seq if isinstance(seq, int) else -1,
+        str(event.get("event") or ""),
+        str(event.get("kind") or ""),
+    )
+
+
+def _gateway_consolidate_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, Any, Any], list[dict[str, Any]]] = {}
+    for event in events:
+        key = _gateway_event_group_key(event)
+        grouped.setdefault(key, []).append(event)
+
+    consolidated: list[dict[str, Any]] = []
+    for items in grouped.values():
+        if not items:
+            continue
+        items_sorted = sorted(items, key=lambda event: (_gateway_event_rank(event), _gateway_event_sort_key(event)))
+        best = items_sorted[0]
+        if len(items_sorted) > 1:
+            merged = dict(best)
+            merged["variants"] = [event for event in items_sorted if event is not best]
+            merged["variant_count"] = len(items_sorted)
+            best = merged
+        consolidated.append(best)
+
+    consolidated.sort(key=_gateway_event_sort_key)
+    return consolidated
+
+
 class _GatewayEventBroadcaster:
     """Maintain a live mirror of OpenClaw Gateway agent events."""
 
     def __init__(self) -> None:
         self._clients: set[WebSocket] = set()
         self._events: deque[dict[str, Any]] = deque(maxlen=GATEWAY_EVENT_LIMIT)
+        self._recent_fingerprints: deque[str] = deque()
+        self._recent_fingerprint_set: set[str] = set()
         self._status: dict[str, Any] = {
             "connected": False,
             "url": None,
@@ -362,6 +456,17 @@ class _GatewayEventBroadcaster:
             "events": list(self._events),
         }
 
+    def _is_duplicate_event(self, event: dict[str, Any]) -> bool:
+        fingerprint = _gateway_event_fingerprint(event)
+        if fingerprint in self._recent_fingerprint_set:
+            return True
+        self._recent_fingerprints.append(fingerprint)
+        self._recent_fingerprint_set.add(fingerprint)
+        while len(self._recent_fingerprints) > GATEWAY_EVENT_LIMIT * 4:
+            old = self._recent_fingerprints.popleft()
+            self._recent_fingerprint_set.discard(old)
+        return False
+
     async def _broadcast_status(self) -> None:
         payload = json.dumps(
             {"type": "status", "status": dict(self._status)},
@@ -376,6 +481,8 @@ class _GatewayEventBroadcaster:
         self._clients -= dead
 
     async def publish(self, event: dict[str, Any]) -> None:
+        if self._is_duplicate_event(event):
+            return
         self._events.append(event)
         self._status.update(
             connected=True,
@@ -904,7 +1011,7 @@ def get_state():
 def get_gateway_events(limit: int = 100):
     limit = max(1, min(int(limit or 100), GATEWAY_EVENT_LIMIT))
     snapshot = _gateway_events.snapshot()
-    events = snapshot.get("events", [])[-limit:]
+    events = _gateway_consolidate_events(list(snapshot.get("events", [])))[-limit:]
     return {
         "status": snapshot.get("status", {}),
         "events": events,
@@ -1203,9 +1310,11 @@ async def resume_project(req: ProjectResumeRequest):
         if should_resume:
             task["status"] = "pending"
             task.pop("error", None)
+            task.pop("failure_kind", None)
             task.pop("retryable", None)
             task.pop("next_action", None)
             task.pop("raw_response", None)
+            task.pop("blocked_note", None)
             resumed.append(task_id)
         task_ids.append(task_id)
 
@@ -1312,12 +1421,45 @@ async def delete_project(payload: dict[str, Any] | None = None):
     stop_result = _stop_orchestrator(reason=reason or "Eliminado desde el dashboard")
     mem = load_memory()
     project_id = mem.get("project", {}).get("id")
+    project_name = mem.get("project", {}).get("name")
+    project_repo_path = mem.get("project", {}).get("repo_path") or mem.get("project", {}).get("output_dir")
+    project_key = slugify(str(project_id or project_name or "project"))
+
+    def _safe_remove(path_value: str | None) -> bool:
+        if not path_value:
+            return False
+        path = Path(path_value).expanduser()
+        if not path.exists():
+            return False
+        resolved = path.resolve()
+        allowed_roots = [
+            (BASE_DIR / "projects").resolve(),
+            (BASE_DIR / "workspaces").resolve(),
+            (BASE_DIR / "output").resolve(),
+        ]
+        if not any(str(resolved).startswith(str(root) + os.sep) or resolved == root for root in allowed_roots):
+            return False
+        shutil.rmtree(resolved)
+        return True
+
+    removed_paths: list[str] = []
+    for candidate in {
+        project_repo_path,
+        str(BASE_DIR / "workspaces" / "designer" / project_key),
+        str(BASE_DIR / "workspaces" / "programmer" / project_key),
+        str(BASE_DIR / "workspaces" / "coordinator" / project_key),
+    }:
+        if candidate and _safe_remove(candidate):
+            removed_paths.append(candidate)
+
     if project_id:
         mem.setdefault("projects", [])
         for existing in mem["projects"]:
             if existing.get("id") == project_id:
                 existing["status"] = "deleted"
                 existing["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                existing["deleted_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                existing["removed_paths"] = removed_paths
                 break
 
     defaults = deepcopy(DEFAULT_MEMORY)
@@ -1333,7 +1475,7 @@ async def delete_project(payload: dict[str, Any] | None = None):
     mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
     refresh_project_runtime_state(mem)
     save_memory(mem)
-    result = {"ok": True, "stopped": stop_result.get("ok", False)}
+    result = {"ok": True, "stopped": stop_result.get("ok", False), "removed_paths": removed_paths}
     return JSONResponse(result, status_code=200)
 
 
