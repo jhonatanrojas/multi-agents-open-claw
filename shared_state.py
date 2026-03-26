@@ -19,9 +19,14 @@ LEGACY_MEMORY = [
 _FLOCK_PATH = PRIMARY_MEMORY.with_suffix(".lock")
 
 # Limits for unbounded-growth arrays (GAP-4 / P2)
+from datetime import datetime, timezone
 MAX_LOG_ENTRIES = 500
 MAX_MESSAGES = 200
 MAX_BLOCKERS = 100
+
+def utc_now() -> str:
+    """Return an ISO-8601 UTC timestamp without tzinfo (database compatible)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 DEFAULT_MEMORY: dict[str, Any] = {
     "schema_version": "2.0",

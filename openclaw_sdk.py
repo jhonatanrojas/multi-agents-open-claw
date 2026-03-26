@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Literal
 
+import requests
+
 log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -43,6 +45,13 @@ _BASE_OPENCLAW_ROOT = OPENCLAW_CONFIG_PATH.parent
 
 # Minimum seconds between Telegram-bound progress updates (avoid spam).
 _PROGRESS_THROTTLE_SEC = 15.0
+_MODEL_DISCOVERY_TIMEOUT_SEC = float(os.getenv("OPENCLAW_MODEL_DISCOVERY_TIMEOUT_SEC", "3.0"))
+_MODEL_DISCOVERY_TTL_SEC = float(os.getenv("OPENCLAW_MODEL_DISCOVERY_TTL_SEC", "30.0"))
+_MODEL_DISCOVERY_CACHE: dict[str, Any] = {
+    "signature": None,
+    "expires_at": 0.0,
+    "models": [],
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -682,48 +691,383 @@ def save_openclaw_config(config: dict[str, Any], path: Path | None = None) -> No
     log.info("OpenClaw config saved to %s", p)
 
 
-def get_available_models(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Return a flat list of all models available across all providers.
+def _clean_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return str(value).strip()
 
-    Each entry: ``{"qualified": "provider/model_id", "provider": ..., "name": ..., ...}``
-    """
-    cfg = config or load_openclaw_config()
+
+def _coerce_model_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "models", "items", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        nested = payload.get("result")
+        if isinstance(nested, dict):
+            return _coerce_model_rows(nested)
+    return []
+
+
+def _normalize_model_status(entry: dict[str, Any]) -> str:
+    if not isinstance(entry, dict):
+        return "ready"
+
+    for key in ("needs_setup", "setup_required", "needsSetup"):
+        value = entry.get(key)
+        if isinstance(value, bool) and value:
+            return "needs_setup"
+
+    for key in ("status", "state", "availability"):
+        value = entry.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+        if normalized in {"ready", "available", "enabled", "active", "online", "configured"}:
+            return "ready"
+        if normalized in {"needs_setup", "setup_required", "not_configured", "missing_credentials"}:
+            return "needs_setup"
+        if normalized in {"blocked", "unavailable", "offline", "inactive", "disabled"}:
+            return "blocked"
+        return normalized or "ready"
+
+    for key in ("available", "ready", "enabled", "active"):
+        value = entry.get(key)
+        if isinstance(value, bool):
+            return "ready" if value else "blocked"
+
+    return "ready"
+
+
+def _local_model_index(models: list[dict[str, Any]]) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    index: dict[str, dict[str, list[dict[str, Any]]]] = {
+        "by_qualified": {},
+        "by_model_id": {},
+        "by_name": {},
+    }
+    for model in models:
+        qualified = _clean_text(model.get("qualified"))
+        if qualified:
+            index["by_qualified"][qualified] = [model]
+        model_id = _clean_text(model.get("model_id"))
+        if model_id:
+            index["by_model_id"].setdefault(model_id, []).append(model)
+        name = _clean_text(model.get("name")).lower()
+        if name:
+            index["by_name"].setdefault(name, []).append(model)
+    return index
+
+
+def _infer_provider_from_local_index(
+    model_id: str,
+    name: str,
+    local_index: dict[str, dict[str, list[dict[str, Any]]]] | None,
+) -> str:
+    if not local_index:
+        return ""
+
+    for bucket in (
+        local_index.get("by_model_id", {}).get(model_id, []),
+        local_index.get("by_name", {}).get(name.lower(), []) if name else [],
+    ):
+        providers = {entry.get("provider") for entry in bucket if _clean_text(entry.get("provider"))}
+        if len(providers) == 1:
+            provider = providers.pop()
+            if isinstance(provider, str) and provider.strip():
+                return provider.strip()
+    return ""
+
+
+def _normalize_model_entry(
+    entry: dict[str, Any],
+    *,
+    source: str,
+    local_index: dict[str, dict[str, list[dict[str, Any]]]] | None = None,
+) -> dict[str, Any]:
+    qualified = _clean_text(
+        entry.get("qualified")
+        or entry.get("id")
+        or entry.get("model")
+        or entry.get("slug")
+    )
+    provider = _clean_text(
+        entry.get("provider")
+        or entry.get("owned_by")
+        or entry.get("owner")
+    )
+    model_id = _clean_text(
+        entry.get("model_id")
+        or entry.get("id")
+        or entry.get("model")
+        or entry.get("slug")
+    )
+
+    if qualified and "/" in qualified:
+        provider_part, model_part = qualified.split("/", 1)
+        provider = provider or provider_part
+        model_id = model_id or model_part
+    elif provider and model_id:
+        qualified = f"{provider}/{model_id}"
+    else:
+        inferred_provider = _infer_provider_from_local_index(model_id, _clean_text(entry.get("name")), local_index)
+        if inferred_provider:
+            provider = inferred_provider
+        elif not provider:
+            provider = "gateway" if source == "gateway" else "unknown"
+        if model_id:
+            qualified = f"{provider}/{model_id}"
+        elif qualified:
+            model_id = qualified
+            qualified = f"{provider}/{model_id}"
+        else:
+            qualified = provider or "unknown"
+
+    if not model_id:
+        model_id = qualified.rsplit("/", 1)[-1] if qualified else ""
+
+    name = (
+        _clean_text(entry.get("name"))
+        or _clean_text(entry.get("display_name"))
+        or _clean_text(entry.get("alias"))
+        or model_id
+        or qualified
+    )
+    reasoning = entry.get("reasoning")
+    context_window = (
+        entry.get("context_window")
+        or entry.get("contextWindow")
+        or entry.get("context_length")
+        or entry.get("max_context_tokens")
+    )
+    max_tokens = (
+        entry.get("max_tokens")
+        or entry.get("maxTokens")
+        or entry.get("max_output_tokens")
+    )
+    status = _normalize_model_status(entry)
+    if source != "gateway" and status == "ready":
+        status = "fallback"
+
+    normalized = {
+        "qualified": qualified,
+        "provider": provider or "unknown",
+        "model_id": model_id or qualified,
+        "name": name,
+        "reasoning": reasoning,
+        "context_window": context_window,
+        "max_tokens": max_tokens,
+        "source": source,
+        "status": status,
+    }
+
+    for key in ("description", "family", "version"):
+        value = entry.get(key)
+        if value is not None and value != "":
+            normalized[key] = value
+
+    return normalized
+
+
+def _merge_model_entries(primary: dict[str, Any], fallback: dict[str, Any] | None) -> dict[str, Any]:
+    if not fallback:
+        return primary
+
+    merged = dict(fallback)
+    for key, value in primary.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+        elif key not in merged:
+            merged[key] = value
+    return merged
+
+
+def _model_sort_key(model: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+    source_priority = 0 if model.get("source") == "gateway" else 1
+    provider = _clean_text(model.get("provider")) or "unknown"
+    name = _clean_text(model.get("name")) or _clean_text(model.get("model_id")) or _clean_text(model.get("qualified"))
+    qualified = _clean_text(model.get("qualified"))
+    return (provider, source_priority, name.lower(), qualified)
+
+
+def _build_local_model_catalog(config: dict[str, Any]) -> list[dict[str, Any]]:
     models: list[dict[str, Any]] = []
+    providers = config.get("models", {}).get("providers", {})
+    if isinstance(providers, dict):
+        for provider_id, provider_cfg in providers.items():
+            if not isinstance(provider_cfg, dict):
+                continue
+            provider_models = provider_cfg.get("models", [])
+            if not isinstance(provider_models, list):
+                continue
+            for model in provider_models:
+                if not isinstance(model, dict):
+                    continue
+                model_id = _clean_text(model.get("id"))
+                if not model_id:
+                    continue
+                models.append(
+                    _normalize_model_entry(
+                        {
+                            "qualified": f"{provider_id}/{model_id}",
+                            "provider": provider_id,
+                            "id": model_id,
+                            "name": model.get("name"),
+                            "reasoning": model.get("reasoning", False),
+                            "contextWindow": model.get("contextWindow"),
+                            "maxTokens": model.get("maxTokens"),
+                        },
+                        source="provider",
+                    )
+                )
 
-    # 1. Models declared in providers (with full metadata).
-    providers = cfg.get("models", {}).get("providers", {})
-    for provider_id, provider_cfg in providers.items():
-        for m in provider_cfg.get("models", []):
-            model_id = m.get("id", "")
-            qualified = f"{provider_id}/{model_id}"
-            models.append({
-                "qualified": qualified,
-                "provider": provider_id,
-                "model_id": model_id,
-                "name": m.get("name", model_id),
-                "reasoning": m.get("reasoning", False),
-                "context_window": m.get("contextWindow"),
-                "max_tokens": m.get("maxTokens"),
-                "source": "provider",
-            })
-
-    # 2. Models referenced in agents.defaults.models (may add extras).
-    defaults_models = cfg.get("agents", {}).get("defaults", {}).get("models", {})
-    known_qualified = {m["qualified"] for m in models}
-    for qualified, meta in defaults_models.items():
-        if qualified not in known_qualified:
+    defaults_models = config.get("agents", {}).get("defaults", {}).get("models", {})
+    if isinstance(defaults_models, dict):
+        seen = {model["qualified"] for model in models}
+        for qualified, meta in defaults_models.items():
+            if qualified in seen or not isinstance(meta, dict):
+                continue
             parts = qualified.split("/", 1)
             provider = parts[0] if len(parts) > 1 else "unknown"
             model_id = parts[1] if len(parts) > 1 else qualified
-            models.append({
-                "qualified": qualified,
-                "provider": provider,
-                "model_id": model_id,
-                "name": meta.get("alias", model_id),
-                "source": "defaults",
-            })
+            models.append(
+                _normalize_model_entry(
+                    {
+                        "qualified": qualified,
+                        "provider": provider,
+                        "id": model_id,
+                        "name": meta.get("alias") or meta.get("name"),
+                        "reasoning": meta.get("reasoning"),
+                        "contextWindow": meta.get("contextWindow"),
+                        "maxTokens": meta.get("maxTokens"),
+                    },
+                    source="defaults",
+                )
+            )
 
     return models
+
+
+def _gateway_connection_details(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = config if isinstance(config, dict) else load_openclaw_config()
+    gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+    gateway_auth = gateway_cfg.get("auth", {}) if isinstance(gateway_cfg, dict) else {}
+
+    token = _clean_text(
+        os.getenv("OPENCLAW_GATEWAY_TOKEN")
+        or gateway_auth.get("token")
+    )
+    base_url = _clean_text(
+        os.getenv("OPENCLAW_GATEWAY_URL")
+        or gateway_cfg.get("url")
+        or gateway_cfg.get("baseUrl")
+        or gateway_cfg.get("base_url")
+    )
+    host = _clean_text(
+        os.getenv("OPENCLAW_GATEWAY_HOST")
+        or gateway_cfg.get("host")
+        or "127.0.0.1"
+    ) or "127.0.0.1"
+    port_raw = os.getenv("OPENCLAW_GATEWAY_PORT") or gateway_cfg.get("port") or 18789
+    scheme = _clean_text(
+        os.getenv("OPENCLAW_GATEWAY_SCHEME")
+        or gateway_cfg.get("scheme")
+    )
+    try:
+        port = int(port_raw)
+    except Exception:
+        port = 18789
+
+    if not base_url:
+        scheme = scheme or "http"
+        base_url = f"{scheme}://{host}:{port}"
+
+    return {
+        "base_url": base_url.rstrip("/"),
+        "host": host,
+        "port": port,
+        "scheme": scheme or base_url.split("://", 1)[0],
+        "token": token,
+    }
+
+
+def _discover_gateway_model_rows(
+    config: dict[str, Any] | None = None,
+    *,
+    force_refresh: bool = False,
+) -> list[dict[str, Any]]:
+    details = _gateway_connection_details(config)
+    cache_signature = (details["base_url"], details["token"])
+    now = time.monotonic()
+
+    if (
+        not force_refresh
+        and _MODEL_DISCOVERY_CACHE.get("signature") == cache_signature
+        and now < float(_MODEL_DISCOVERY_CACHE.get("expires_at", 0.0))
+    ):
+        cached = _MODEL_DISCOVERY_CACHE.get("models", [])
+        return [dict(model) for model in cached if isinstance(model, dict)]
+
+    url = f"{details['base_url']}/v1/models"
+    headers = {"Accept": "application/json"}
+    if details["token"]:
+        headers["Authorization"] = f"Bearer {details['token']}"
+        headers["X-OpenClaw-Token"] = details["token"]
+        headers["X-API-Key"] = details["token"]
+
+    rows: list[dict[str, Any]] = []
+    try:
+        response = requests.get(url, headers=headers, timeout=_MODEL_DISCOVERY_TIMEOUT_SEC)
+        response.raise_for_status()
+        rows = _coerce_model_rows(response.json())
+        log.info("Discovered %d model(s) from OpenClaw Gateway at %s", len(rows), url)
+    except Exception as exc:
+        log.debug("OpenClaw Gateway model discovery failed at %s: %s", url, exc)
+
+    _MODEL_DISCOVERY_CACHE.update(
+        {
+            "signature": cache_signature,
+            "expires_at": now + _MODEL_DISCOVERY_TTL_SEC,
+            "models": [dict(model) for model in rows],
+        }
+    )
+    return rows
+
+
+def get_available_models(
+    config: dict[str, Any] | None = None,
+    *,
+    force_refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """Return the normalized model catalog.
+
+    The gateway-discovered catalog is preferred when available, but local
+    ``openclaw.json`` model definitions are kept as fallback entries so the
+    dashboard can consume one consistent list.
+    """
+    cfg = config or load_openclaw_config()
+    local_models = _build_local_model_catalog(cfg)
+    catalog_by_qualified: dict[str, dict[str, Any]] = {
+        model["qualified"]: dict(model) for model in local_models
+    }
+    local_index = _local_model_index(local_models)
+
+    for row in _discover_gateway_model_rows(cfg, force_refresh=force_refresh):
+        normalized = _normalize_model_entry(row, source="gateway", local_index=local_index)
+        fallback = catalog_by_qualified.get(normalized["qualified"])
+        if fallback is None:
+            fallback_by_id = [model for model in local_models if model.get("model_id") == normalized["model_id"]]
+            if len(fallback_by_id) == 1:
+                fallback = fallback_by_id[0]
+        catalog_by_qualified[normalized["qualified"]] = _merge_model_entries(normalized, fallback)
+
+    for model in local_models:
+        catalog_by_qualified.setdefault(model["qualified"], dict(model))
+
+    return sorted(catalog_by_qualified.values(), key=_model_sort_key)
 
 
 def get_agent_models(config: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
@@ -865,8 +1209,8 @@ class OpenClawClient:
     # -- config helpers (convenience pass-throughs) --------------------------
 
     @staticmethod
-    def available_models() -> list[dict[str, Any]]:
-        return get_available_models()
+    def available_models(force_refresh: bool = False) -> list[dict[str, Any]]:
+        return get_available_models(force_refresh=force_refresh)
 
     @staticmethod
     def agent_models() -> dict[str, dict[str, Any]]:

@@ -11,10 +11,11 @@ Endpoints:
   GET  /api/gateway/events -> live OpenClaw Gateway agent events
   WS   /ws/gateway-events  -> WebSocket push of Gateway agent events
   GET  /api/agents/world   -> proxies Miniverse /api/agents
+  GET  /api/miniverse      -> GitHub repo metadata + live Miniverse snapshot
   GET  /api/logs           -> last log entries
   POST /api/project/start  -> triggers orchestrator
-  GET  /api/models           -> current agent models + available models from OpenClaw
-  GET  /api/models/available -> flat list of all models across providers
+  GET  /api/models           -> current agent models + normalized model catalog
+  GET  /api/models/available -> normalized flat list of gateway models + local fallback
   GET  /api/models/providers -> provider configs (without API keys)
   PUT  /api/models           -> bulk-update arch/byte/pixel models
   PUT  /api/models/agent     -> change model for a single agent
@@ -35,6 +36,7 @@ import sys
 import subprocess
 import os
 import signal
+import time
 from copy import deepcopy
 import shutil
 from collections import deque
@@ -64,13 +66,25 @@ from shared_state import (
     load_memory,
     refresh_project_runtime_state,
     save_memory,
+    utc_now,
 )
 
 from websockets.exceptions import ConnectionClosed
 
 MINIVERSE_URL = os.getenv("MINIVERSE_URL", "https://miniverse-public-production.up.railway.app")
+MINIVERSE_UI_URL = os.getenv("MINIVERSE_UI_URL", "https://www.minivrs.com")
+MINIVERSE_GITHUB_OWNER = "ianscott313"
+MINIVERSE_GITHUB_REPO = "miniverse"
+MINIVERSE_GITHUB_API_URL = f"https://api.github.com/repos/{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}"
+MINIVERSE_REQUEST_TIMEOUT_SEC = float(os.getenv("MINIVERSE_REQUEST_TIMEOUT_SEC", "6"))
+MINIVERSE_CACHE_TTL_SEC = float(os.getenv("MINIVERSE_CACHE_TTL_SEC", "300"))
 LOCK_FILE = BASE_DIR / "logs" / "orchestrator.lock"
 JSONL_LOG_FILE = BASE_DIR / "logs" / "orchestrator.jsonl"
+_MINIVERSE_CACHE: dict[str, Any] = {
+    "signature": None,
+    "expires_at": 0.0,
+    "payload": None,
+}
 
 # GAP-1 / P5 — API key auth (empty string = disabled)
 _API_KEY: str = os.getenv("DASHBOARD_API_KEY", "")
@@ -333,7 +347,7 @@ def _normalize_gateway_event(frame: dict[str, Any]) -> dict[str, Any] | None:
         "kind": _gateway_event_kind(frame, payload),
         "seq": frame.get("seq"),
         "stateVersion": frame.get("stateVersion"),
-        "received_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "received_at": utc_now(),
         "summary": _gateway_payload_summary(payload),
     }
     return normalized
@@ -487,7 +501,7 @@ class _GatewayEventBroadcaster:
         self._status.update(
             connected=True,
             last_error=None,
-            last_event_at=event.get("received_at") or datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            last_event_at=event.get("received_at") or utc_now(),
         )
         dead: set[WebSocket] = set()
         payload = json.dumps(event, ensure_ascii=False)
@@ -684,10 +698,10 @@ def _stop_orchestrator(reason: str | None = None) -> dict[str, Any]:
             "status": "paused",
             "phase": "paused",
             "detail": reason or "Pausado desde el dashboard",
-            "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            "updated_at": utc_now(),
         }
     )
-    mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    mem["project"]["updated_at"] = utc_now()
     refresh_project_runtime_state(mem)
     save_memory(mem)
     return {"ok": True, "pid": pid, "alive": alive}
@@ -712,7 +726,7 @@ def build_health_snapshot() -> dict[str, Any]:
     return {
         "ok": ok,
         "service": "dashboard_api",
-        "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "timestamp": utc_now(),
         "lockfile": lock_state,
         "orchestrator": orchestrator_state,
         "issues": issues,
@@ -743,10 +757,10 @@ def _stop_orchestrator(reason: str | None = None) -> dict[str, Any]:
             "status": "paused",
             "phase": "paused",
             "detail": reason or "Pausado desde el dashboard",
-            "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            "updated_at": utc_now(),
         }
     )
-    mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    mem["project"]["updated_at"] = utc_now()
     save_memory(mem)
     return {"ok": True, "pid": pid, "alive": alive}
 
@@ -857,7 +871,7 @@ def _rewrite_lockfile_for_pid(pid: int, argv: list[str] | None = None) -> None:
         json.dumps(
             {
                 "pid": pid,
-                "started_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                "started_at": utc_now(),
                 "argv": argv or [sys.executable, str(BASE_DIR / "orchestrator.py")],
             },
             indent=2,
@@ -907,7 +921,7 @@ def _sync_orchestrator_pid(pid: int | None) -> None:
         mem["project"]["orchestrator"]["pid"] = pid
     else:
         mem["project"]["orchestrator"].pop("pid", None)
-    mem["project"]["orchestrator"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    mem["project"]["orchestrator"]["updated_at"] = utc_now()
     refresh_project_runtime_state(mem)
     save_memory(mem)
 
@@ -915,7 +929,7 @@ def _sync_orchestrator_pid(pid: int | None) -> None:
 @app.get("/api/runtime/orchestrators")
 def get_runtime_orchestrators():
     return {
-        "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "timestamp": utc_now(),
         **_runtime_process_snapshot(),
     }
 
@@ -952,10 +966,10 @@ async def cleanup_runtime_orchestrators(payload: dict[str, Any] | None = None):
                 "status": "paused",
                 "phase": "paused",
                 "detail": "Ejecuciones detenidas desde el dashboard",
-                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                "updated_at": utc_now(),
             }
         )
-        mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        mem["project"]["updated_at"] = utc_now()
         refresh_project_runtime_state(mem)
         save_memory(mem)
     elif isinstance(primary_pid, int) and _pid_is_alive(primary_pid):
@@ -976,10 +990,10 @@ async def cleanup_runtime_orchestrators(payload: dict[str, Any] | None = None):
                 "status": "paused",
                 "phase": "paused",
                 "detail": "Estado huérfano limpiado desde el dashboard",
-                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                "updated_at": utc_now(),
             }
         )
-        mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        mem["project"]["updated_at"] = utc_now()
         refresh_project_runtime_state(mem)
         save_memory(mem)
 
@@ -989,7 +1003,7 @@ async def cleanup_runtime_orchestrators(payload: dict[str, Any] | None = None):
         "force": force,
         "terminated": result,
         "runtime": _runtime_process_snapshot(),
-        "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "timestamp": utc_now(),
     }
 
 
@@ -1077,17 +1091,236 @@ def agents_in_world():
         return {"error": str(e), "agents": []}
 
 
+def _miniverse_repo_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "OpenClaw-Portal",
+    }
+    token = (
+        os.getenv("OPENCLAW_GITHUB_TOKEN")
+        or os.getenv("GITHUB_TOKEN")
+        or os.getenv("GH_TOKEN")
+        or ""
+    ).strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _miniverse_ui_headers() -> dict[str, str]:
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "OpenClaw-Portal",
+    }
+
+
+def _normalize_miniverse_repo(repo: dict[str, Any]) -> dict[str, Any]:
+    license_info = repo.get("license") if isinstance(repo, dict) else None
+    license_name = None
+    if isinstance(license_info, dict):
+        license_name = license_info.get("spdx_id") or license_info.get("name")
+
+    return {
+        "name": repo.get("name"),
+        "full_name": repo.get("full_name"),
+        "html_url": repo.get("html_url") or f"https://github.com/{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}",
+        "description": repo.get("description"),
+        "homepage": repo.get("homepage"),
+        "default_branch": repo.get("default_branch") or "main",
+        "language": repo.get("language"),
+        "license": license_name,
+        "topics": repo.get("topics") if isinstance(repo.get("topics"), list) else [],
+        "stargazers_count": repo.get("stargazers_count"),
+        "forks_count": repo.get("forks_count"),
+        "watchers_count": repo.get("watchers_count"),
+        "open_issues_count": repo.get("open_issues_count"),
+        "created_at": repo.get("created_at"),
+        "updated_at": repo.get("updated_at"),
+        "pushed_at": repo.get("pushed_at"),
+    }
+
+
+def _inspect_miniverse_ui() -> dict[str, Any]:
+    preview: dict[str, Any] = {
+        "url": MINIVERSE_UI_URL,
+        "final_url": MINIVERSE_UI_URL,
+        "status_code": None,
+        "embeddable": False,
+        "blocked_by": [],
+        "checked_at": utc_now(),
+    }
+    response = None
+    try:
+        response = requests.head(
+            MINIVERSE_UI_URL,
+            headers=_miniverse_ui_headers(),
+            timeout=MINIVERSE_REQUEST_TIMEOUT_SEC,
+            allow_redirects=True,
+        )
+        if response.status_code in {405, 501}:
+            response.close()
+            response = requests.get(
+                MINIVERSE_UI_URL,
+                headers=_miniverse_ui_headers(),
+                timeout=MINIVERSE_REQUEST_TIMEOUT_SEC,
+                allow_redirects=True,
+                stream=True,
+            )
+
+        x_frame_options = (response.headers.get("X-Frame-Options") or "").strip().lower()
+        content_security_policy = response.headers.get("Content-Security-Policy") or ""
+        blocked_by: list[str] = []
+
+        if x_frame_options in {"deny", "sameorigin"}:
+            blocked_by.append(f"x-frame-options:{x_frame_options}")
+
+        frame_ancestors_match = re.search(r"frame-ancestors\s+([^;]+)", content_security_policy, re.IGNORECASE)
+        if frame_ancestors_match:
+            frame_ancestors = frame_ancestors_match.group(1).strip()
+            if "*" not in frame_ancestors:
+                blocked_by.append(f"frame-ancestors:{frame_ancestors}")
+
+        preview.update(
+            {
+                "final_url": response.url or MINIVERSE_UI_URL,
+                "status_code": response.status_code,
+                "embeddable": not blocked_by,
+                "blocked_by": blocked_by,
+            }
+        )
+    except Exception as exc:
+        preview["error"] = str(exc)
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+    return preview
+
+
+def _load_miniverse_snapshot(force_refresh: bool = False) -> dict[str, Any]:
+    now = time.monotonic()
+    cached_payload = _MINIVERSE_CACHE.get("payload")
+    if (
+        not force_refresh
+        and cached_payload
+        and _MINIVERSE_CACHE.get("signature") == (MINIVERSE_GITHUB_API_URL, MINIVERSE_URL, MINIVERSE_UI_URL)
+        and now < float(_MINIVERSE_CACHE.get("expires_at", 0.0))
+    ):
+        return deepcopy(cached_payload)
+
+    payload: dict[str, Any] = {
+        "repo": {
+            "html_url": f"https://github.com/{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}",
+            "name": MINIVERSE_GITHUB_REPO,
+            "full_name": f"{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}",
+        },
+        "world": {
+            "base_url": MINIVERSE_URL,
+            "api_url": MINIVERSE_URL,
+            "ui_url": MINIVERSE_UI_URL,
+            "info": {},
+            "agents": {},
+        },
+        "links": {
+            "repo": f"https://github.com/{MINIVERSE_GITHUB_OWNER}/{MINIVERSE_GITHUB_REPO}",
+            "api": MINIVERSE_URL,
+            "world": MINIVERSE_UI_URL,
+            "ui": MINIVERSE_UI_URL,
+            "docs": "https://minivrs.com/docs/",
+        },
+        "ui": {
+            "url": MINIVERSE_UI_URL,
+            "final_url": MINIVERSE_UI_URL,
+            "embeddable": False,
+            "blocked_by": [],
+            "checked_at": utc_now(),
+        },
+        "meta": {
+            "source": "world+github+ui",
+            "cached": False,
+            "error": None,
+        },
+    }
+
+    repo_data: dict[str, Any] = {}
+    error_messages: list[str] = []
+
+    try:
+        repo_response = requests.get(
+            MINIVERSE_GITHUB_API_URL,
+            headers=_miniverse_repo_headers(),
+            timeout=MINIVERSE_REQUEST_TIMEOUT_SEC,
+        )
+        repo_response.raise_for_status()
+        repo_data = repo_response.json() if isinstance(repo_response.json(), dict) else {}
+        if repo_data:
+            payload["repo"].update(_normalize_miniverse_repo(repo_data))
+    except Exception as exc:
+        error_messages.append(f"repo: {exc}")
+
+    try:
+        world_response = requests.get(f"{MINIVERSE_URL}/api/info", timeout=5)
+        world_response.raise_for_status()
+        payload["world"]["info"] = world_response.json()
+    except Exception as exc:
+        payload["world"]["info"] = {"error": str(exc)}
+        error_messages.append(f"world_info: {exc}")
+
+    try:
+        agents_response = requests.get(f"{MINIVERSE_URL}/api/agents", timeout=5)
+        agents_response.raise_for_status()
+        payload["world"]["agents"] = agents_response.json()
+    except Exception as exc:
+        payload["world"]["agents"] = {"error": str(exc), "agents": []}
+        error_messages.append(f"world_agents: {exc}")
+
+    try:
+        payload["ui"].update(_inspect_miniverse_ui())
+        payload["links"]["ui"] = payload["ui"].get("final_url") or MINIVERSE_UI_URL
+        payload["links"]["world"] = payload["links"]["ui"]
+        payload["world"]["ui_url"] = payload["links"]["ui"]
+    except Exception as exc:
+        error_messages.append(f"ui: {exc}")
+
+    payload["meta"]["error"] = "; ".join(error_messages) if error_messages else None
+    payload["meta"]["cached"] = False
+
+    if error_messages and cached_payload:
+        stale = deepcopy(cached_payload)
+        stale.setdefault("meta", {})
+        stale["meta"]["stale"] = True
+        stale["meta"]["error"] = payload["meta"]["error"]
+        return stale
+
+    _MINIVERSE_CACHE.update(
+        {
+            "signature": (MINIVERSE_GITHUB_API_URL, MINIVERSE_URL, MINIVERSE_UI_URL),
+            "expires_at": now + MINIVERSE_CACHE_TTL_SEC,
+            "payload": deepcopy(payload),
+        }
+    )
+    return payload
+
+
+@app.get("/api/miniverse")
+def get_miniverse_snapshot(force: bool = False):
+    """Return repo metadata and the live Miniverse world snapshot."""
+    return _load_miniverse_snapshot(force_refresh=force)
+
+
 # ── Models config (GAP-5 / P6) ────────────────────────────────────────────────
 
 @app.get("/api/models")
 def get_models():
-    """Return current model assignments and all available models from OpenClaw config."""
+    """Return current model assignments and the normalized model catalog."""
     return _load_models_config()
 
 
 @app.get("/api/models/available")
 def get_available():
-    """Return flat list of all models available across configured providers."""
+    """Return the normalized flat list of all available models."""
     return {"models": get_available_models()}
 
 
@@ -1279,7 +1512,7 @@ async def start_project(req: ProjectRequest):
         "status": "started",
         "message": "Orquestador iniciado correctamente",
         "brief": safe_brief,
-        "ts": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "ts": utc_now(),
     }
 
 
@@ -1326,7 +1559,7 @@ async def resume_project(req: ProjectResumeRequest):
 
     mem.setdefault("project", {})
     mem["project"]["status"] = "in_progress"
-    mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    mem["project"]["updated_at"] = utc_now()
     mem["project"].setdefault("orchestrator", {})
     mem["project"]["orchestrator"].update(
         {
@@ -1334,7 +1567,7 @@ async def resume_project(req: ProjectResumeRequest):
             "phase": "execution",
             "detail": f"Reanudando {len(resumed)} tarea(s)",
             "task_id": resumed[0] if len(resumed) == 1 else None,
-            "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            "updated_at": utc_now(),
         }
     )
     refresh_project_runtime_state(mem)
@@ -1359,8 +1592,72 @@ async def resume_project(req: ProjectResumeRequest):
         "message": "Reanudación iniciada correctamente",
         "resumed_tasks": resumed,
         "task_ids": task_ids,
-        "ts": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        "ts": utc_now(),
     }
+
+
+@app.post("/api/project/load")
+async def load_project(payload: dict[str, Any] | None = None):
+    project_id = payload.get("project_id") if isinstance(payload, dict) else None
+    if not project_id:
+        return JSONResponse({"error": "Se requiere project_id"}, status_code=400)
+
+    mem = load_memory()
+    current_proj = mem.get("project", {})
+    if current_proj.get("id") == project_id:
+        return JSONResponse({"error": "El proyecto ya está activo"}, status_code=400)
+
+    # Buscar el proyecto en el archivo
+    archive = mem.get("projects", [])
+    project_to_load = next((p for p in archive if p.get("id") == project_id), None)
+    if not project_to_load:
+        return JSONResponse({"error": "Proyecto no encontrado en el archivo"}, status_code=404)
+
+    # Si hay un proyecto activo actualmente, lo archivamos
+    if current_proj.get("id"):
+        # Lo actualizamos en archive si ya existe, o lo agregamos
+        existing = next((p for p in archive if p.get("id") == current_proj["id"]), None)
+        if existing:
+            existing.update(current_proj)
+            existing["status"] = current_proj.get("status") or existing.get("status") or "paused"
+        else:
+            current_proj["status"] = current_proj.get("status") or "paused"
+            archive.append(current_proj)
+
+    # Detener cualquier ejecución actual
+    _stop_orchestrator(reason="Cargando otro proyecto")
+
+    # Restaurar el proyecto seleccionado a mem["project"]
+    # Nota: Sólo recuperamos sus metadatos básicos, tasks y logs no se archivan completos en "projects",
+    # pero al menos reanudamos sobre la ruta del repo donde OpenClaw reparará su estado
+    defaults = deepcopy(DEFAULT_MEMORY)
+    mem["project"] = project_to_load
+    mem["project"]["status"] = "in_progress"
+    mem["project"]["updated_at"] = utc_now()
+    
+    # Reset temporal de tasks/logs (se pueden repoblar si orchestrator.py reconstruye desde repo)
+    mem["tasks"] = []
+    mem["plan"] = defaults["plan"]
+    mem["log"] = []
+    mem["blockers"] = []
+    
+    mem["project"].setdefault("orchestrator", {})
+    mem["project"]["orchestrator"].update({
+        "status": "starting",
+        "phase": "execution",
+        "detail": "Proyecto cargado desde historial",
+        "updated_at": utc_now()
+    })
+    
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+
+    # Reanudar
+    args = [sys.executable, str(BASE_DIR / "orchestrator.py"), "--resume"]
+    args.append(project_to_load.get("description") or project_to_load.get("name") or "Resume project")
+    _spawn_orchestrator(args)
+
+    return {"status": "loaded", "message": "Proyecto cargado y reanudado", "ts": utc_now()}
 
 
 @app.post("/api/project/pause")
@@ -1385,7 +1682,7 @@ async def pause_project(payload: dict[str, Any] | None = None):
         if task_id and str(task.get("id") or "") != task_id and pause_running:
             continue
         task["status"] = "paused"
-        task["paused_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        task["paused_at"] = utc_now()
         task["pause_reason"] = reason or "Pausado desde el dashboard"
         paused_ids.append(str(task.get("id") or ""))
         if task_id:
@@ -1400,7 +1697,7 @@ async def pause_project(payload: dict[str, Any] | None = None):
                 "status": "paused",
                 "phase": "paused",
                 "detail": reason or f"Pausadas {len(paused_ids)} tarea(s)",
-                "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                "updated_at": utc_now(),
             }
         )
         refresh_project_runtime_state(mem)
@@ -1416,13 +1713,30 @@ async def pause_project(payload: dict[str, Any] | None = None):
 @app.post("/api/project/delete")
 async def delete_project(payload: dict[str, Any] | None = None):
     reason = None
+    target_project_id = None
     if isinstance(payload, dict):
         reason = payload.get("reason")
-    stop_result = _stop_orchestrator(reason=reason or "Eliminado desde el dashboard")
+        target_project_id = payload.get("project_id")
+
     mem = load_memory()
-    project_id = mem.get("project", {}).get("id")
-    project_name = mem.get("project", {}).get("name")
-    project_repo_path = mem.get("project", {}).get("repo_path") or mem.get("project", {}).get("output_dir")
+    current_project_id = mem.get("project", {}).get("id")
+    
+    is_active = not target_project_id or target_project_id == current_project_id
+
+    if is_active:
+        stop_result = _stop_orchestrator(reason=reason or "Eliminado desde el dashboard")
+        project_id = current_project_id
+        project_name = mem.get("project", {}).get("name")
+        project_repo_path = mem.get("project", {}).get("repo_path") or mem.get("project", {}).get("output_dir")
+    else:
+        stop_result = {"ok": False}
+        project_to_delete = next((p for p in mem.get("projects", []) if p.get("id") == target_project_id), None)
+        if not project_to_delete:
+            return JSONResponse({"error": "Project not found"}, status_code=404)
+        project_id = target_project_id
+        project_name = project_to_delete.get("name")
+        project_repo_path = project_to_delete.get("repo_path") or project_to_delete.get("output_dir")
+
     project_key = slugify(str(project_id or project_name or "project"))
 
     def _safe_remove(path_value: str | None) -> bool:
@@ -1439,16 +1753,23 @@ async def delete_project(payload: dict[str, Any] | None = None):
         ]
         if not any(str(resolved).startswith(str(root) + os.sep) or resolved == root for root in allowed_roots):
             return False
-        shutil.rmtree(resolved)
+        try:
+            if resolved.is_file():
+                resolved.unlink()
+            else:
+                shutil.rmtree(resolved)
+        except Exception:
+            return False
         return True
 
     removed_paths: list[str] = []
-    for candidate in {
+    candidates = [
         project_repo_path,
         str(BASE_DIR / "workspaces" / "designer" / project_key),
         str(BASE_DIR / "workspaces" / "programmer" / project_key),
         str(BASE_DIR / "workspaces" / "coordinator" / project_key),
-    }:
+    ]
+    for candidate in candidates:
         if candidate and _safe_remove(candidate):
             removed_paths.append(candidate)
 
@@ -1457,27 +1778,111 @@ async def delete_project(payload: dict[str, Any] | None = None):
         for existing in mem["projects"]:
             if existing.get("id") == project_id:
                 existing["status"] = "deleted"
-                existing["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-                existing["deleted_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                existing["updated_at"] = utc_now()
+                existing["deleted_at"] = utc_now()
                 existing["removed_paths"] = removed_paths
                 break
 
-    defaults = deepcopy(DEFAULT_MEMORY)
-    mem["project"] = defaults["project"]
-    mem["plan"] = defaults["plan"]
-    mem["tasks"] = []
-    mem["log"] = []
-    mem["blockers"] = []
-    mem["files_produced"] = []
-    mem["progress_files"] = []
-    mem["messages"] = []
-    mem["milestones"] = []
-    mem["project"]["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-    refresh_project_runtime_state(mem)
-    save_memory(mem)
-    result = {"ok": True, "stopped": stop_result.get("ok", False), "removed_paths": removed_paths}
+    if is_active:
+        defaults = deepcopy(DEFAULT_MEMORY)
+        mem["project"] = defaults["project"]
+        mem["plan"] = defaults["plan"]
+        mem["tasks"] = []
+        mem["log"] = []
+        mem["blockers"] = []
+        mem["files_produced"] = []
+        mem["progress_files"] = []
+        mem["messages"] = []
+        mem["milestones"] = []
+        mem["project"]["updated_at"] = utc_now()
+        refresh_project_runtime_state(mem)
+        save_memory(mem)
+        
+        result = {"ok": True, "stopped": stop_result.get("ok", False), "removed_paths": removed_paths}
+    else:
+        save_memory(mem)
+        result = {"ok": True, "stopped": False, "removed_paths": removed_paths}
+        
     return JSONResponse(result, status_code=200)
 
+
+from coordination import (
+    fetch_telegram_updates,
+    get_telegram_credentials,
+    slugify, # Needed for ID generation if not using SHA
+)
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on API startup."""
+    asyncio.create_task(background_telegram_polling())
+
+async def background_telegram_polling():
+    """Centralized polling loop for the whole project lifecycle."""
+    while True:
+        try:
+            token, chat_id = get_telegram_credentials()
+            if not token:
+                await asyncio.sleep(60)
+                continue
+
+            mem = load_memory()
+            offset = mem.setdefault("_telegram_offset", None)
+            
+            # Fetch updates
+            result = fetch_telegram_updates(offset=offset, timeout=15, token=token)
+            if not result.get("ok"):
+                await asyncio.sleep(30)
+                continue
+
+            updates = result.get("updates", [])
+            last_id = offset
+            
+            new_msgs = []
+            for up in updates:
+                last_id = max(last_id or 0, up.get("update_id", 0)) + 1
+                msg = up.get("message") or up.get("edited_message")
+                if not msg or not msg.get("text"):
+                    continue
+                
+                # Filter by chat_id if known
+                if chat_id and str(msg.get("chat", {}).get("id")) != str(chat_id):
+                    continue
+
+                text = msg.get("text").strip()
+                # Basic command handling could go here or in orchestrator
+                new_msgs.append({
+                    "id": f"tg-{up['update_id']}",
+                    "source": "telegram",
+                    "sender": msg.get("from", {}).get("username") or "user",
+                    "text": text,
+                    "timestamp": utc_now(),
+                    "raw": up
+                })
+
+            if new_msgs:
+                # Deduplicate and append
+                existing_ids = {m.get("id") for m in mem.get("messages", [])}
+                for nm in new_msgs:
+                    if nm["id"] not in existing_ids:
+                        mem.setdefault("messages", []).append(nm)
+                
+                # Limit memory
+                if len(mem["messages"]) > 200:
+                    mem["messages"] = mem["messages"][-200:]
+                
+                mem["_telegram_offset"] = last_id
+                save_memory(mem)
+                
+                # Notify UI via SSE/WS
+                # (Existing WebSocket connections will see the change in next broadcast)
+                broadcast_state_change(mem)
+
+        except Exception as e:
+            print(f"[Polling Error] {e}")
+            await asyncio.sleep(10)
+        
+        await asyncio.sleep(10) # Base interval between poll batches
 
 @app.get("/api/logs")
 def get_logs():

@@ -31,6 +31,7 @@ def _export(name: str) -> Any:
 
 Agent = _export("Agent")
 AgentResult = _export("AgentResult")
+FailureKind = _export("FailureKind")
 OpenClawClient = _export("OpenClawClient")
 ProgressCallback = _export("ProgressCallback")
 classify_progress = _export("classify_progress")
@@ -40,10 +41,12 @@ load_openclaw_config = _export("load_openclaw_config")
 save_openclaw_config = _export("save_openclaw_config")
 set_agent_model = _export("set_agent_model")
 set_default_model = _export("set_default_model")
+_infer_failure_kind = _export("_infer_failure_kind")
 
 __all__ = [
     "Agent",
     "AgentResult",
+    "FailureKind",
     "OpenClawClient",
     "ProgressCallback",
     "classify_progress",
@@ -53,4 +56,5 @@ __all__ = [
     "save_openclaw_config",
     "set_agent_model",
     "set_default_model",
+    "_infer_failure_kind",
 ]

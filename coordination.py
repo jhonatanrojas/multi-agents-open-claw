@@ -13,13 +13,15 @@ from typing import Any, Literal, TypedDict
 
 import requests
 
-from shared_state import BASE_DIR
+from shared_state import BASE_DIR, load_memory, refresh_project_runtime_state, save_memory, utc_now
 
 PROJECTS_ROOT = BASE_DIR / "projects"
 WORKSPACES_ROOT = BASE_DIR / "workspaces"
-OPENCLAW_AGENTS_ROOT = Path("/root/.openclaw/agents")
 LOG_DIR = BASE_DIR / "logs"
 OUTPUT_DIR = BASE_DIR / "output"
+OPENCLAW_RUNTIME_HOME = Path(os.getenv("OPENCLAW_RUNTIME_HOME", str(BASE_DIR / ".openclaw-runtime")))
+OPENCLAW_RUNTIME_PROFILE = os.getenv("OPENCLAW_PROFILE", "multi-agents-runtime-v2").strip()
+OPENCLAW_AGENTS_ROOT = OPENCLAW_RUNTIME_HOME / f".openclaw-{OPENCLAW_RUNTIME_PROFILE}" / "agents"
 WORKSPACE_NAMES = {
     "arch": "coordinator",
     "byte": "programmer",
@@ -53,7 +55,7 @@ class ProjectStructure(TypedDict, total=False):
     is_new_project: bool        # True si el brief describe un proyecto nuevo (no feature)
 
 
-FORBIDDEN_PATHS_DEFAULT = ["output/frontend", "output/", "dist/"]
+FORBIDDEN_PATHS_DEFAULT = ["output/", "dist/", ".git/"]
 
 
 class RepositoryBootstrapError(RuntimeError):
@@ -118,6 +120,43 @@ def _project_workspace_key(project: dict[str, Any] | None) -> str | None:
     if not raw_key:
         return None
     return slugify(str(raw_key))
+
+
+def ensure_project_id(project: dict[str, Any]) -> str:
+    """Return a stable project identifier, creating one when necessary."""
+    pid = project.get("id")
+    if pid:
+        return str(pid)
+    name = project.get("name") or "project"
+    return f"{slugify(str(name))}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+
+
+def update_project_history(mem: dict[str, Any]) -> None:
+    """Upsert the active project snapshot into the project history list."""
+    project = mem.get("project") or {}
+    if not isinstance(project, dict):
+        return
+    project_id = project.get("id")
+    if not project_id:
+        return
+    mem.setdefault("projects", [])
+    entry = {
+        "id": project_id,
+        "name": project.get("name"),
+        "description": project.get("description"),
+        "status": project.get("status"),
+        "created_at": project.get("created_at"),
+        "updated_at": project.get("updated_at"),
+        "repo_url": project.get("repo_url"),
+        "repo_path": project.get("repo_path"),
+        "branch": project.get("branch"),
+        "output_dir": project.get("output_dir"),
+    }
+    for existing in mem["projects"]:
+        if existing.get("id") == project_id:
+            existing.update(entry)
+            return
+    mem["projects"].append(entry)
 
 
 def workspace_root_for_agent(agent_id: str, project: dict[str, Any] | None = None) -> Path:
@@ -281,11 +320,10 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
                 "fonts": "fonts/",
             },
             "canonical_paths": ["", "css/", "js/", "assets/", "fonts/", "vendor/"],
-            "forbidden_paths": ["output/frontend", "output/", "dist/", "src/"],
+            "forbidden_paths": ["output/", "dist/", "src/"],
             "notes": [
                 "Mantén index.html en la raíz del proyecto.",
                 "Usa css/ para estilos, js/ para lógica y assets/ para recursos estáticos.",
-                "No uses output/frontend salvo que el brief lo pida explícitamente.",
             ],
             "is_new_project": new_project,
         }
@@ -305,7 +343,7 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
                 "public": "public/",
             },
             "canonical_paths": ["src/", "public/"],
-            "forbidden_paths": ["output/frontend", "output/", "dist/frontend"],
+            "forbidden_paths": ["output/", "dist/frontend"],
             "notes": [
                 "Estructura basada en funcionalidades y componentes reutilizables.",
                 "Coloca el código fuente en src/ y los estáticos en public/.",
@@ -326,7 +364,7 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
                 "config": "backend/config/",
             },
             "canonical_paths": ["backend/", "tests/", "config/"],
-            "forbidden_paths": ["output/frontend", "output/", "frontend/"],
+            "forbidden_paths": ["output/", "frontend/"],
             "notes": [
                 "Separa la lógica de dominio, rutas y tests.",
                 "No mezcles la salida del backend con estructuras de frontend.",
@@ -348,7 +386,7 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
                 "tests": "tests/",
             },
             "canonical_paths": ["app/", "resources/", "public/", "tests/", "database/", "routes/"],
-            "forbidden_paths": ["output/frontend", "output/"],
+            "forbidden_paths": ["output/"],
             "notes": [
                 "Respeta la convención estándar de Laravel.",
                 "Si el brief describe una feature sobre una app Laravel existente, trabaja dentro de su estructura actual.",
@@ -378,7 +416,7 @@ def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None
         "entrypoint": "root",
         "directories": {},
         "canonical_paths": [],
-        "forbidden_paths": ["output/frontend"],
+        "forbidden_paths": ["output/"],
         "notes": [
             "Usa la estructura que ya exista en el repositorio.",
         ],
@@ -428,7 +466,9 @@ def validate_project_structure(
     # Post-execution: check that each file landed inside execution_dir or a canonical path
     if files_written:
         exec_dir_path = Path(execution_dir).resolve() if execution_dir else None
-        canonical_paths = [Path(p).resolve() for p in canonical if p]
+        canonical_list = canonical or []
+        canonical_paths = [Path(p).resolve() for p in canonical_list if p]
+        forbidden_list = forbidden or []
         for fpath_str in files_written:
             fpath = Path(fpath_str).resolve()
             inside_exec = exec_dir_path and (
@@ -437,8 +477,8 @@ def validate_project_structure(
             inside_canonical = any(
                 fpath == cp or cp in fpath.parents for cp in canonical_paths
             )
-            for bad in forbidden:
-                bad_norm = bad.lower().replace("\\", "/")
+            for bad in forbidden_list:
+                bad_norm = str(bad).lower().replace("\\", "/")
                 if bad_norm in fpath_str.replace("\\", "/").lower():
                     violations.append(
                         f"[Fase 3] Archivo '{fpath_str}' escrito en ruta prohibida '{bad}'. "
@@ -586,7 +626,7 @@ def _base_skills_for_stack(stack: str, agent_id: str) -> tuple[list[str], list[s
             [
                 "Usa HTML semántico y divide la estructura en secciones claras.",
                 "Mantén el CSS simple, responsive y consistente con el contenido del proyecto.",
-                "La estructura canónica es raíz/index.html + css/ + js/ + assets/; evita output/frontend salvo indicación explícita.",
+                "La estructura canónica es raíz/index.html + css/ + js/ + assets/; evita buffers externos fuera del repo.",
                 "Si el proyecto usa JavaScript puro, evita introducir frameworks o dependencias innecesarias.",
             ],
             "Especialista en HTML/CSS/JavaScript",
@@ -694,6 +734,102 @@ def infer_task_execution_dir(project: dict[str, Any], task: dict[str, Any], repo
     if any(token in task_text for token in ("html", "css", "javascript", "localstorage", "vanilla")):
         return str(repo_root.resolve())
     return str(repo_root.resolve())
+
+
+def materialize_planned_project(
+    mem: dict[str, Any],
+    plan_json: dict[str, Any],
+    brief: str,
+) -> dict[str, Any]:
+    """Normalize a planning response into MEMORY and persist the project state."""
+    plan_payload = plan_json if isinstance(plan_json, dict) else {}
+    project_patch_raw = plan_payload.get("project", {})
+    project_patch = project_patch_raw if isinstance(project_patch_raw, dict) else {}
+
+    mem["tasks"] = []
+    mem["blockers"] = []
+    mem["proposals"] = []
+    mem["milestones"] = []
+    mem["files_produced"] = []
+    mem["progress_files"] = []
+    mem.setdefault("project", {})
+
+    project_structure = project_patch.get("project_structure") or infer_project_structure(
+        {
+            "name": project_patch.get("name") or mem["project"].get("name"),
+            "description": project_patch.get("description") or mem["project"].get("description") or brief,
+            "tech_stack": project_patch.get("tech_stack") or mem["project"].get("tech_stack", {}),
+            "repo_path": mem["project"].get("repo_path"),
+            "output_dir": mem["project"].get("output_dir"),
+        },
+        {},
+    )
+    mem["project"].update(
+        {
+            **project_patch,
+            "id": project_patch.get("id") or ensure_project_id(project_patch),
+            "status": "planned",
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+            "project_structure": project_structure,
+        }
+    )
+    plan_value = plan_payload.get("plan")
+    mem["plan"] = plan_value if isinstance(plan_value, dict) else {"phases": []}
+    mem["milestones"] = plan_payload.get("milestones", [])
+    update_project_history(mem)
+
+    all_tasks: list[dict[str, Any]] = []
+    task_skill_summary: dict[str, list[str]] = {}
+    for phase in mem["plan"].get("phases", []):
+        for task in phase.get("tasks", []):
+            task["phase"] = phase.get("id")
+            task["status"] = "pending"
+            profile = build_task_skill_profile(mem["project"], task)
+            task["execution_dir"] = infer_task_execution_dir(mem["project"], task, repo_state=None)
+            task["skill_family"] = profile["family"]
+            task["skill_profile"] = profile
+            task["skills"] = profile["skills"]
+            task["workspace_notes"] = profile["instructions"]
+            task_skill_summary[task["id"]] = profile["skills"]
+            all_tasks.append(task)
+
+    mem["tasks"] = all_tasks
+    mem["project"]["task_skill_summary"] = task_skill_summary
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+    return {
+        "tasks": all_tasks,
+        "task_skill_summary": task_skill_summary,
+        "project_structure": project_structure,
+    }
+
+
+def build_project_context(mem: dict[str, Any], repo_state: dict[str, Any]) -> str:
+    """Build a JSON context string for agent prompts."""
+    task_skill_map = {
+        task["id"]: {
+            "skills": task.get("skills", []),
+            "skill_family": task.get("skill_family"),
+            "workspace_notes": task.get("workspace_notes", []),
+            "execution_dir": task.get("execution_dir"),
+        }
+        for task in mem.get("tasks", [])
+        if isinstance(task, dict) and task.get("id")
+    }
+    context = {
+        "project": mem.get("project", {}),
+        "repo": repo_state,
+        "milestones": mem.get("milestones", []),
+        "task_skill_map": task_skill_map,
+        "output_dir": mem.get("project", {}).get("output_dir", "./output"),
+        "execution_dir_map": {
+            task.get("id"): task.get("execution_dir")
+            for task in mem.get("tasks", [])
+            if isinstance(task, dict) and task.get("id")
+        },
+    }
+    return json.dumps(context, indent=2, ensure_ascii=False)
 
 
 def render_task_context_md(
@@ -1600,6 +1736,69 @@ def check_task_content(task: dict[str, Any], project: dict[str, Any]) -> list[st
 
     return []
 
+
+def has_open_tasks(tasks: list[dict[str, Any]]) -> bool:
+    """Return True when at least one task is still pending, running, or blocked."""
+    return any(task.get("status") != "done" for task in tasks if isinstance(task, dict))
+
+
+def has_tasks_needing_correction(tasks: list[dict[str, Any]]) -> bool:
+    """Return True when a task is waiting for correction before delivery."""
+    return any(task.get("review_status") == "needs_correction" for task in tasks if isinstance(task, dict))
+
+
+def task_matches_acceptance(task: dict[str, Any], project: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Lightweight final validation to catch obvious mismatches before delivery."""
+    acceptance = [str(item).lower() for item in (task.get("acceptance") or []) if isinstance(item, str)]
+    notes = [str(task.get("notes") or "").lower(), str(task.get("raw_response") or "").lower()]
+    files = [str(path).lower() for path in _task_files_for_review(task, project)]
+    observations: list[str] = []
+
+    if not files:
+        observations.append(f"{task.get('id')}: sin archivos escritos")
+
+    for requirement in acceptance:
+        if "backend/" in requirement and not any("backend/" in f for f in files):
+            observations.append("falta backend/")
+        if "requirements.txt" in requirement and not any("requirements.txt" in f for f in files):
+            observations.append("falta requirements.txt")
+        if "main.py" in requirement and not any("main.py" in f for f in files):
+            observations.append("falta main.py")
+        if "database.py" in requirement and not any("database.py" in f for f in files):
+            observations.append("falta database.py")
+        if "models/" in requirement and not any("models/" in f for f in files):
+            observations.append("falta models/")
+        if "schemas/" in requirement and not any("schemas/" in f for f in files):
+            observations.append("falta schemas/")
+        if "routes/" in requirement and not any("routes/" in f for f in files):
+            observations.append("falta routes/")
+
+    if any(re.search(r"\b(todo|placeholder|ok)\b", note) for note in notes if note):
+        observations.append("notes/resultado demasiado generico")
+
+    observations.extend(check_task_content(task, project))
+
+    execution_dir = str(task.get("execution_dir") or "")
+    if files:
+        structure_violations = validate_project_structure(execution_dir, project, task, files_written=files)
+        observations.extend(structure_violations)
+
+    return (not observations, observations)
+
+
+def record_task_review(task_id: str, review_round: int, issues: list[str]) -> None:
+    """Persist the review result for a task in shared memory."""
+    mem = load_memory()
+    for task in mem.get("tasks", []):
+        if task.get("id") != task_id:
+            continue
+        task["review_round"] = review_round
+        task["review_issues"] = issues
+        task["review_status"] = "needs_correction" if issues else "passed"
+        task["updated_at"] = utc_now()
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+
 def _task_files_existing(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
     files = []
     for raw_path in task.get("files", []) or []:
@@ -1639,3 +1838,150 @@ def _task_files_for_review(task: dict[str, Any], project: dict[str, Any]) -> lis
     if files:
         return files
     return _task_files_from_manifest(task, project)
+
+
+def _task_files_for_manifest(task: dict[str, Any], project: dict[str, Any]) -> list[str]:
+    """Return resolved file paths for the project manifest."""
+    files: list[str] = []
+    for raw_path in task.get("files", []) or []:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        candidate = _resolve_task_artifact_path(raw_path, project)
+        if candidate is not None:
+            files.append(normalize_output_path(candidate))
+    return files
+
+
+def _project_artifact_entries(mem: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    project = mem.setdefault("project", {})
+    tasks = [task for task in mem.get("tasks", []) if isinstance(task, dict)]
+    task_entries: list[dict[str, Any]] = []
+    file_entries: list[dict[str, Any]] = []
+
+    for task in tasks:
+        task_files = _task_files_for_manifest(task, project)
+        task_entries.append(
+            {
+                "id": task.get("id"),
+                "title": task.get("title"),
+                "agent": task.get("agent"),
+                "status": task.get("status"),
+                "skill_family": task.get("skill_family"),
+                "failure_count": task.get("failure_count", 0),
+                "next_action": task.get("next_action"),
+                "files": task_files,
+                "notes": task.get("notes"),
+            }
+        )
+        for path in task_files:
+            file_entries.append(
+                {
+                    "task_id": task.get("id"),
+                    "agent": task.get("agent"),
+                    "path": path,
+                }
+            )
+
+    return project, task_entries, file_entries
+
+
+def synchronize_project_artifacts(mem: dict[str, Any]) -> dict[str, Any]:
+    """Write project manifest, index, and evidence files for the dashboard."""
+    project, task_entries, file_entries = _project_artifact_entries(mem)
+    output_dir = resolve_path(project.get("output_dir"), OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "project": {
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "status": project.get("status"),
+            "runtime_status": project.get("runtime_status"),
+            "repo_path": project.get("repo_path"),
+            "output_dir": project.get("output_dir"),
+            "branch": project.get("branch"),
+            "updated_at": project.get("updated_at"),
+        },
+        "generated_at": utc_now(),
+        "task_count": len(task_entries),
+        "file_count": len(file_entries),
+        "tasks": task_entries,
+        "files": file_entries,
+    }
+
+    manifest_path = output_dir / "PROJECT_MANIFEST.json"
+    index_path = output_dir / "PROJECT_INDEX.md"
+    evidence_path = output_dir / "evidence.json"
+
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    lines = [
+        f"# {project.get('name') or project.get('id') or 'Project'}",
+        "",
+        f"- Project ID: {project.get('id') or 'N/A'}",
+        f"- Runtime status: {project.get('runtime_status') or project.get('status') or 'idle'}",
+        f"- Tasks: {len(task_entries)}",
+        f"- Files: {len(file_entries)}",
+        "",
+        "## Task Map",
+        "",
+    ]
+    for entry in task_entries:
+        lines.append(f"### {entry['id']} - {entry['title'] or 'Sin titulo'}")
+        lines.append(f"- Agent: {entry.get('agent') or 'N/A'}")
+        lines.append(f"- Status: {entry.get('status') or 'N/A'}")
+        if entry.get("skill_family"):
+            lines.append(f"- Skill family: {entry.get('skill_family')}")
+        if entry.get("next_action"):
+            lines.append(f"- Next action: {entry.get('next_action')}")
+        if entry.get("files"):
+            lines.append("- Files:")
+            for path in entry["files"]:
+                lines.append(f"  - {path}")
+        else:
+            lines.append("- Files: none")
+        lines.append("")
+
+    if file_entries:
+        lines.extend(["## Unified Files", ""])
+        for item in file_entries:
+            lines.append(f"- {item['path']}  ({item.get('task_id')})")
+    else:
+        lines.extend(["## Unified Files", "", "- No files produced yet."])
+
+    index_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+    evidence_payload = {
+        "project": manifest["project"],
+        "generated_at": manifest["generated_at"],
+        "summary": {
+            "task_count": manifest["task_count"],
+            "file_count": manifest["file_count"],
+            "done_tasks": sum(1 for task in task_entries if task.get("status") == "done"),
+            "open_tasks": sum(1 for task in task_entries if task.get("status") != "done"),
+        },
+        "artifacts": {
+            "manifest": normalize_output_path(manifest_path),
+            "index": normalize_output_path(index_path),
+            "evidence": normalize_output_path(evidence_path),
+        },
+        "tasks": task_entries,
+        "files": file_entries,
+    }
+    evidence_path.write_text(
+        json.dumps(evidence_payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    project["artifact_manifest"] = str(manifest_path)
+    project["artifact_index"] = str(index_path)
+    project["artifact_evidence"] = str(evidence_path)
+    project["artifacts_updated_at"] = utc_now()
+    project["artifact_file_count"] = len(file_entries)
+    project["artifact_task_count"] = len(task_entries)
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+    return manifest

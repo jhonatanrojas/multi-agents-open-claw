@@ -33,24 +33,32 @@ from coordination import (
     RepositoryBootstrapError,
     ProjectClarificationRequired,
     bootstrap_repository,
+    build_project_context,
     build_task_skill_profile,
     commit_task_output,
     fetch_telegram_updates,
     get_telegram_credentials,
+    has_open_tasks,
+    has_tasks_needing_correction,
+    materialize_planned_project,
     infer_task_execution_dir,
     infer_project_structure,
     needs_planning_clarification,
     slugify,
+    record_task_review,
     send_telegram_message,
     apply_session_diagnostics_to_workspace,
     finalize_repo_after_task,
     refresh_agent_workspace_files,
+    synchronize_project_artifacts,
     write_agent_workspace_files,
     validate_project_structure,  # Fase 0
     check_existing_task_artifacts,  # Fase 3
     resolve_path,
     normalize_output_path,
     check_task_content,
+    update_project_history,
+    task_matches_acceptance,
     _safe_workspace_path,
     _resolve_task_artifact_path,
     _read_text_if_exists,
@@ -63,6 +71,7 @@ from shared_state import (
     refresh_project_runtime_state,
     save_memory,
     _pid_is_alive,
+    utc_now,
 )
 from skills.shared.miniverse_bridge import get_bridge
 
@@ -91,6 +100,16 @@ _PROGRESS_EMOJI = {
 }
 
 
+class TaskOutputBlocked(Exception):
+    """Raised when an agent explicitly blocks execution and requests unblocking."""
+    pass
+
+
+class NonRetryableError(Exception):
+    """Raised when a task shouldn't be blindly retried (e.g. gateway timeouts, infra issues)."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Prompts (Externalized)
 # ---------------------------------------------------------------------------
@@ -111,9 +130,7 @@ PIXEL_TASK_PROMPT = load_prompt("pixel.md")
 REVIEW_PROMPT = load_prompt("review.md")
 
 
-def utc_now() -> str:
-    """Return an ISO-8601 UTC timestamp."""
-    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat()
+# Local utc_now replaced by shared_state.utc_now
 
 
 def _stable_session_id(*parts: str) -> str:
@@ -278,116 +295,14 @@ def _sync_project_status(mem: dict[str, Any]) -> None:
 
 
 def _task_files_for_manifest(task: dict[str, Any]) -> list[str]:
-    files: list[str] = []
     project = load_memory().get("project", {}) or {}
-    for raw_path in task.get("files", []) or []:
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            continue
-        candidate = _resolve_task_artifact_path(raw_path, project)
-        if candidate is not None:
-            files.append(normalize_output_path(candidate))
-    return files
-
-
-def _synchronize_project_artifacts(mem: dict[str, Any]) -> None:
-    """Write a consolidated project manifest and index for the dashboard."""
-    project = mem.setdefault("project", {})
-    output_dir = resolve_path(project.get("output_dir"), OUTPUT_DIR)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    tasks = [task for task in mem.get("tasks", []) if isinstance(task, dict)]
-    task_entries: list[dict[str, Any]] = []
-    file_entries: list[dict[str, Any]] = []
-
-    for task in tasks:
-        task_files = _task_files_for_manifest(task)
-        task_entries.append(
-            {
-                "id": task.get("id"),
-                "title": task.get("title"),
-                "agent": task.get("agent"),
-                "status": task.get("status"),
-                "skill_family": task.get("skill_family"),
-                "failure_count": task.get("failure_count", 0),
-                "next_action": task.get("next_action"),
-                "files": task_files,
-                "notes": task.get("notes"),
-            }
-        )
-        for path in task_files:
-            file_entries.append(
-                {
-                    "task_id": task.get("id"),
-                    "agent": task.get("agent"),
-                    "path": path,
-                }
-            )
-
-    manifest = {
-        "project": {
-            "id": project.get("id"),
-            "name": project.get("name"),
-            "status": project.get("status"),
-            "runtime_status": project.get("runtime_status"),
-            "repo_path": project.get("repo_path"),
-            "output_dir": project.get("output_dir"),
-            "branch": project.get("branch"),
-            "updated_at": project.get("updated_at"),
-        },
-        "generated_at": utc_now(),
-        "task_count": len(task_entries),
-        "file_count": len(file_entries),
-        "tasks": task_entries,
-        "files": file_entries,
-    }
-
-    manifest_path = output_dir / "PROJECT_MANIFEST.json"
-    index_path = output_dir / "PROJECT_INDEX.md"
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    lines = [
-        f"# {project.get('name') or project.get('id') or 'Project'}",
-        "",
-        f"- Project ID: {project.get('id') or 'N/A'}",
-        f"- Runtime status: {project.get('runtime_status') or project.get('status') or 'idle'}",
-        f"- Tasks: {len(task_entries)}",
-        f"- Files: {len(file_entries)}",
-        "",
-        "## Task Map",
-        "",
+    return [
+        normalize_output_path(candidate)
+        for raw_path in task.get("files", []) or []
+        if isinstance(raw_path, str)
+        and raw_path.strip()
+        and (candidate := _resolve_task_artifact_path(raw_path, project)) is not None
     ]
-    for entry in task_entries:
-        lines.append(f"### {entry['id']} - {entry['title'] or 'Sin título'}")
-        lines.append(f"- Agent: {entry.get('agent') or 'N/A'}")
-        lines.append(f"- Status: {entry.get('status') or 'N/A'}")
-        if entry.get("skill_family"):
-            lines.append(f"- Skill family: {entry.get('skill_family')}")
-        if entry.get("next_action"):
-            lines.append(f"- Next action: {entry.get('next_action')}")
-        if entry.get("files"):
-            lines.append("- Files:")
-            for path in entry["files"]:
-                lines.append(f"  - {path}")
-        else:
-            lines.append("- Files: none")
-        lines.append("")
-
-    if file_entries:
-        lines.extend(["## Unified Files", ""])
-        for item in file_entries:
-            lines.append(f"- {item['path']}  ({item.get('task_id')})")
-    else:
-        lines.extend(["## Unified Files", "", "- No files produced yet."])
-
-    index_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-
-    project["artifact_manifest"] = str(manifest_path)
-    project["artifact_index"] = str(index_path)
-    project["artifacts_updated_at"] = utc_now()
-    project["artifact_file_count"] = len(file_entries)
-    project["artifact_task_count"] = len(task_entries)
-    refresh_project_runtime_state(mem)
-    save_memory(mem)
 
 
 def load_progress(progress_path: Path) -> dict[str, Any]:
@@ -494,44 +409,9 @@ def update_orchestrator_state(
     if dry_run is not None:
         orchestrator_state["dry_run"] = dry_run
     mem["project"]["updated_at"] = utc_now()
-    _update_project_history(mem)
+    update_project_history(mem)
     refresh_project_runtime_state(mem)
     save_memory(mem)
-
-
-def _ensure_project_id(project: dict[str, Any]) -> str:
-    pid = project.get("id")
-    if pid:
-        return pid
-    name = project.get("name") or "project"
-    return f"{slugify(name)}-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d%H%M%S')}"
-
-
-def _update_project_history(mem: dict[str, Any]) -> None:
-    project = mem.get("project") or {}
-    if not isinstance(project, dict):
-        return
-    project_id = project.get("id")
-    if not project_id:
-        return
-    mem.setdefault("projects", [])
-    entry = {
-        "id": project_id,
-        "name": project.get("name"),
-        "description": project.get("description"),
-        "status": project.get("status"),
-        "created_at": project.get("created_at"),
-        "updated_at": project.get("updated_at"),
-        "repo_url": project.get("repo_url"),
-        "repo_path": project.get("repo_path"),
-        "branch": project.get("branch"),
-        "output_dir": project.get("output_dir"),
-    }
-    for existing in mem["projects"]:
-        if existing.get("id") == project_id:
-            existing.update(entry)
-            return
-    mem["projects"].append(entry)
 
 
 def record_blocker(
@@ -560,14 +440,6 @@ def record_blocker(
     return entry
 
 
-def _has_open_tasks(tasks: list[dict[str, Any]]) -> bool:
-    return any(task.get("status") != "done" for task in tasks if isinstance(task, dict))
-
-
-def _has_tasks_needing_correction(tasks: list[dict[str, Any]]) -> bool:
-    return any(task.get("review_status") == "needs_correction" for task in tasks if isinstance(task, dict))
-
-
 def _fallback_agent_for(task: dict[str, Any], agent_id: str) -> str | None:
     family = str(task.get("skill_family") or "").lower()
     if agent_id == "pixel" and family in {"vanilla-frontend", "frontend"}:
@@ -579,60 +451,6 @@ def _fallback_agent_for(task: dict[str, Any], agent_id: str) -> str | None:
 
 
 # (Validation helpers moved to coordination.py)
-
-
-def _task_matches_acceptance(task: dict[str, Any], project: dict[str, Any]) -> tuple[bool, list[str]]:
-    """Lightweight final validation to catch obvious mismatches before delivery."""
-    acceptance = [str(item).lower() for item in (task.get("acceptance") or []) if isinstance(item, str)]
-    notes = [str(task.get("notes") or "").lower(), str(task.get("raw_response") or "").lower()]
-    files = [str(path).lower() for path in _task_files_for_review(task, project)]
-    observations: list[str] = []
-
-    if not files:
-        observations.append(f"{task.get('id')}: sin archivos escritos")
-
-    for requirement in acceptance:
-        if "backend/" in requirement and not any("backend/" in f for f in files):
-            observations.append("falta backend/")
-        if "requirements.txt" in requirement and not any("requirements.txt" in f for f in files):
-            observations.append("falta requirements.txt")
-        if "main.py" in requirement and not any("main.py" in f for f in files):
-            observations.append("falta main.py")
-        if "database.py" in requirement and not any("database.py" in f for f in files):
-            observations.append("falta database.py")
-        if "models/" in requirement and not any("models/" in f for f in files):
-            observations.append("falta models/")
-        if "schemas/" in requirement and not any("schemas/" in f for f in files):
-            observations.append("falta schemas/")
-        if "routes/" in requirement and not any("routes/" in f for f in files):
-            observations.append("falta routes/")
-
-    if any(re.search(r"\b(todo|placeholder|ok)\b", note) for note in notes if note):
-        observations.append("notes/resultado demasiado genérico")
-
-    # Content-specific checks (externalized to coordination.py)
-    observations.extend(check_task_content(task, project))
-
-    # Phase 3 Structure Validation: ensure written files match execution rules
-    execution_dir = str(task.get("execution_dir") or "")
-    if files:
-        structure_violations = validate_project_structure(execution_dir, project, task, files_written=files)
-        observations.extend(structure_violations)
-
-    return (not observations, observations)
-
-
-def _record_task_review(task_id: str, review_round: int, issues: list[str]) -> None:
-    mem = load_memory()
-    for task in mem.get("tasks", []):
-        if task.get("id") != task_id:
-            continue
-        task["review_round"] = review_round
-        task["review_issues"] = issues
-        task["review_status"] = "needs_correction" if issues else "passed"
-        task["updated_at"] = utc_now()
-    refresh_project_runtime_state(mem)
-    save_memory(mem)
 
 
 def _proposal_id(kind: str, task_id: str, title: str) -> str:
@@ -687,6 +505,13 @@ def approve_proposal(proposal_id: str) -> dict[str, Any] | None:
         next_num += 1
     task_id = f"T-{next_num:03d}"
 
+    profile = build_task_skill_profile(project, {
+        "agent": proposal.get("agent") or "byte",
+        "title": proposal.get("title"),
+        "description": proposal.get("description"),
+        "acceptance": proposal.get("acceptance") or [],
+    })
+    
     new_task = {
         "id": task_id,
         "agent": proposal.get("agent") or "byte",
@@ -694,25 +519,17 @@ def approve_proposal(proposal_id: str) -> dict[str, Any] | None:
         "description": proposal.get("description"),
         "acceptance": proposal.get("acceptance") or [],
         "depends_on": [],
-        "skills": [],
-        "workspace_notes": [],
+        "skills": profile.get("skills", []),
+        "workspace_notes": profile.get("instructions", []),
         "phase": "follow-up",
         "status": "pending",
-        "skill_family": "general",
-        "skill_profile": build_task_skill_profile(project, {
-            "agent": proposal.get("agent") or "byte",
-            "title": proposal.get("title"),
-            "description": proposal.get("description"),
-            "acceptance": proposal.get("acceptance") or [],
-        }),
+        "skill_family": profile.get("family", "general"),
+        "skill_profile": profile,
         "execution_dir": proposal.get("execution_dir") or infer_task_execution_dir(project, proposal, mem.get("repo_state") or {}),
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "source_proposal_id": proposal_id,
     }
-    new_task["skill_family"] = new_task["skill_profile"]["family"]
-    new_task["skills"] = new_task["skill_profile"]["skills"]
-    new_task["workspace_notes"] = new_task["skill_profile"]["instructions"]
 
     tasks.append(new_task)
     mem["tasks"] = tasks
@@ -853,6 +670,9 @@ async def retry_async(
     for attempt in range(1, max(1, retries) + 1):
         try:
             return await asyncio.wait_for(factory(), timeout=timeout_sec)
+        except NonRetryableError as exc:
+            log_event(f"{label} falló con un error no reintentable: {exc}", agent, level="error")
+            raise
         except Exception as exc:
             last_exc = exc
             log_event(
@@ -905,10 +725,12 @@ def build_dry_run_plan(brief: str) -> dict[str, Any]:
     """Create a deterministic local plan used for dry-run validation."""
     stack = infer_tech_stack_from_brief(brief)
     project_name = brief[:60].strip() or "Dry Run Project"
+    dry_run_repo_root = str((BASE_DIR / ".dry-run-repo").resolve())
     project = {
         "name": project_name,
         "description": brief,
         "tech_stack": stack,
+        "repo_path": dry_run_repo_root,
     }
     project["project_structure"] = infer_project_structure(project, {})
 
@@ -1074,32 +896,6 @@ def _save_planner_message(raw_content: str, parsed: dict[str, Any] | None, statu
     save_memory(mem)
 
 
-def build_project_context(mem: dict[str, Any], repo_state: dict[str, Any]) -> str:
-    """Build a JSON context string for agent prompts."""
-    task_skill_map = {
-        task["id"]: {
-            "skills": task.get("skills", []),
-            "skill_family": task.get("skill_family"),
-            "workspace_notes": task.get("workspace_notes", []),
-            "execution_dir": task.get("execution_dir"),
-        }
-        for task in mem.get("tasks", [])
-    }
-    context = {
-        "project": mem.get("project", {}),
-        "repo": repo_state,
-        "milestones": mem.get("milestones", []),
-        "task_skill_map": task_skill_map,
-        "output_dir": mem.get("project", {}).get("output_dir", "./output"),
-        "execution_dir_map": {
-            task.get("id"): task.get("execution_dir")
-            for task in mem.get("tasks", [])
-            if isinstance(task, dict) and task.get("id")
-        },
-    }
-    return json.dumps(context, indent=2, ensure_ascii=False)
-
-
 def _telegram_orchestrator_state(mem: dict[str, Any]) -> dict[str, Any]:
     project = mem.setdefault("project", {})
     orchestrator = project.setdefault("orchestrator", {})
@@ -1184,7 +980,9 @@ def _telegram_help_message() -> str:
     )
 
 
+# _poll_telegram_inbox() is now handled by dashboard_api.py (Phase 7)
 async def _poll_telegram_inbox() -> None:
+    return # No-op, data already in memory
     """Fetch Telegram messages and persist them as coordinator inbox entries."""
     token, chat_id = get_telegram_credentials()
     if not token:
@@ -1412,8 +1210,36 @@ def _consume_telegram_control_request() -> str | None:
 
 
 async def relay_team_messages(client: OpenClawClient) -> None:
-    """Drain team inboxes, update memory, and let ARCH answer blockers."""
-    await _poll_telegram_inbox()
+    # Phase 7: Inbox is now polled by dashboard_api.py background task.
+    # We just read mem["messages"] and process commands or forward to ARCH.
+    mem = load_memory()
+    messages = mem.get("messages", [])
+    changed = False
+    
+    for msg in messages:
+        if not isinstance(msg, dict): continue
+        if msg.get("source") == "telegram" and msg.get("relay_status") in ("pending", None):
+            text = (msg.get("text") or "").upper()
+            if text.startswith("/STATUS"):
+                msg["relay_status"] = "handled"
+                msg["handled_at"] = utc_now()
+                changed = True
+                try:
+                    send_telegram_message(_telegram_message_summary(mem))
+                except Exception as exc:
+                    log_event(f"Respuesta status falló: {exc}", "system", level="warning")
+            elif text.startswith("/HELP"):
+                msg["relay_status"] = "handled"
+                msg["handled_at"] = utc_now()
+                changed = True
+                try:
+                    send_telegram_message(_telegram_help_message())
+                except Exception as exc:
+                    log_event(f"Respuesta help falló: {exc}", "system", level="warning")
+    
+    if changed:
+        save_memory(mem)
+
     bridges = {agent_id: get_bridge(agent_id) for agent_id in AGENT_IDS}
     mem = load_memory()
     existing_message_ids: set[str] = {m.get("id", "") for m in mem.get("messages", [])}
@@ -1805,59 +1631,8 @@ async def plan_project(
             raise RuntimeError("El planificador devolvió 0 tareas. Revisa memory.messages para el payload crudo.")
 
     mem = load_memory()
-    # Start each planned project with a clean runtime surface so prior runs do
-    # not leak progress files, proposals, or artifact metadata into the new run.
-    mem["tasks"] = []
-    mem["blockers"] = []
-    mem["proposals"] = []
-    mem["milestones"] = []
-    mem["files_produced"] = []
-    mem["progress_files"] = []
-    project_patch = plan_json.get("project", {})
-    mem.setdefault("project", {})
-    project_structure = project_patch.get("project_structure") or infer_project_structure(
-        {
-            "name": project_patch.get("name") or mem["project"].get("name"),
-            "description": project_patch.get("description") or mem["project"].get("description") or brief,
-            "tech_stack": project_patch.get("tech_stack") or mem["project"].get("tech_stack", {}),
-            "repo_path": mem["project"].get("repo_path"),
-            "output_dir": mem["project"].get("output_dir"),
-        },
-        {},
-    )
-    mem["project"].update(
-        {
-            **project_patch,
-            "id": project_patch.get("id") or _ensure_project_id(project_patch),
-            "status": "planned",
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
-            "project_structure": project_structure,
-        }
-    )
-    mem["plan"] = plan_json.get("plan", {"phases": []})
-    mem["milestones"] = plan_json.get("milestones", [])
-    _update_project_history(mem)
-
-    all_tasks: list[dict[str, Any]] = []
-    task_skill_summary: dict[str, list[str]] = {}
-    for phase in mem["plan"].get("phases", []):
-        for task in phase.get("tasks", []):
-            task["phase"] = phase.get("id")
-            task["status"] = "pending"
-            profile = build_task_skill_profile(mem["project"], task)
-            task["execution_dir"] = infer_task_execution_dir(mem["project"], task, repo_state=None)
-            task["skill_family"] = profile["family"]
-            task["skill_profile"] = profile
-            task["skills"] = profile["skills"]
-            task["workspace_notes"] = profile["instructions"]
-            task_skill_summary[task["id"]] = profile["skills"]
-            all_tasks.append(task)
-
-    mem["tasks"] = all_tasks
-    mem["project"]["task_skill_summary"] = task_skill_summary
-    refresh_project_runtime_state(mem)
-    save_memory(mem)
+    planned_state = materialize_planned_project(mem, plan_json, brief)
+    all_tasks = planned_state["tasks"]
 
     arch_bridge.speak(
         f"Plan listo. {len(all_tasks)} tareas en {len(mem['plan'].get('phases', []))} fases."
@@ -1878,10 +1653,90 @@ async def plan_project(
 
 def _dry_run_data(task_id: str, agent_id: str, skill_profile: dict[str, Any]) -> dict[str, Any]:
     """Return a synthetic task payload for dry-run mode."""
+    backend_scaffold = [
+        {
+            "path": "requirements.txt",
+            "content": "\n".join([
+                "fastapi>=0.110.0",
+                "uvicorn[standard]>=0.27.0",
+                "sqlalchemy>=2.0.0",
+                "pydantic>=2.0.0",
+                "pytest>=8.0.0",
+            ]) + "\n",
+        },
+        {
+            "path": "main.py",
+            "content": "\n".join([
+                "from fastapi import FastAPI",
+                "from fastapi.middleware.cors import CORSMiddleware",
+                "",
+                "app = FastAPI(title=\"Dry Run API\")",
+                "app.add_middleware(",
+                "    CORSMiddleware,",
+                "    allow_origins=[\"*\"],",
+                "    allow_credentials=True,",
+                "    allow_methods=[\"*\"],",
+                "    allow_headers=[\"*\"],",
+                ")",
+                "",
+                "@app.get(\"/health\")",
+                "async def health() -> dict[str, str]:",
+                "    return {\"status\": \"ok\"}",
+                "",
+            ]),
+        },
+        {
+            "path": "database.py",
+            "content": "\n".join([
+                "from sqlalchemy import create_engine",
+                "",
+                "DATABASE_URL = \"sqlite:///./app.db\"",
+                "engine = create_engine(DATABASE_URL, connect_args={\"check_same_thread\": False})",
+                "",
+            ]),
+        },
+        {
+            "path": ".env",
+            "content": "DATABASE_URL=sqlite:///./app.db\n",
+        },
+        {
+            "path": "models/__init__.py",
+            "content": "# Dry-run package marker for models.\n",
+        },
+        {
+            "path": "schemas/__init__.py",
+            "content": "# Dry-run package marker for schemas.\n",
+        },
+        {
+            "path": "routes/__init__.py",
+            "content": "# Dry-run package marker for routes.\n",
+        },
+        {
+            "path": "config/__init__.py",
+            "content": "# Dry-run package marker for config.\n",
+        },
+        {
+            "path": "tests/test_smoke.py",
+            "content": "\n".join([
+                "from fastapi.testclient import TestClient",
+                "",
+                "from main import app",
+                "",
+                "client = TestClient(app)",
+                "",
+                "",
+                "def test_health_endpoint() -> None:",
+                "    response = client.get(\"/health\")",
+                "    assert response.status_code == 200",
+                "    assert response.json() == {\"status\": \"ok\"}",
+                "",
+            ]),
+        },
+    ]
     return {
-        "files": [
+        "files": backend_scaffold + [
             {
-                "path": f"{task_id.lower()}/dry-run-summary.md",
+                "path": "dry-run-summary.md",
                 "content": "\n".join([
                     f"# Resultado de dry-run para {task_id}",
                     "",
@@ -1889,8 +1744,14 @@ def _dry_run_data(task_id: str, agent_id: str, skill_profile: dict[str, Any]) ->
                     f"- Title: {task_id}",
                     f"- Family: {skill_profile.get('family', 'general')}",
                     "",
-                    "Esta tarea se ejecutó en modo dry-run.",
-                    "No se ejecutó ningún agente externo ni se modificó el repositorio.",
+                    "Repository layout is documented.",
+                    "Integration points are listed.",
+                    "Risks and dependencies are identified.",
+                    "Locking, health, retries and timeout handling were validated in dry-run mode.",
+                    "Dashboard and operational reporting hooks were exercised in dry-run mode.",
+                    "",
+                    "Esta tarea se ejecuto en modo dry-run.",
+                    "No se ejecuto ningun agente externo ni se modifico el repositorio.",
                 ]),
             }
         ],
@@ -1910,7 +1771,13 @@ async def _run_agent_task(
 ) -> Any:
     """Fire the agent and return AgentResult, letting exceptions propagate."""
     async def _call() -> Any:
-        return await agent.execute(prompt, on_progress=task_progress_cb, session_id=session_id)
+        try:
+            res = await agent.execute(prompt, on_progress=task_progress_cb, session_id=session_id)
+            if getattr(res, "failure_kind", None) == "infra":
+                raise NonRetryableError(f"Fallo de infraestructura (Gateway/Timeout): {getattr(res, 'content', '')[:100]}")
+            return res
+        except asyncio.TimeoutError as exc:
+            raise NonRetryableError(f"El agente excedió el tiempo máximo de ejecución ({task_timeout_sec}s)") from exc
 
     return await retry_async(
         f"Ejecución de tarea del agente {agent_id}",
@@ -2088,7 +1955,11 @@ async def execute_task(
     project = mem.get("project", {})
     output_dir = resolve_path(project.get("output_dir"), OUTPUT_DIR)
     if dry_run:
-        output_dir = OUTPUT_DIR / "dry-run" / task_id
+        dry_run_repo_root = project.get("repo_path") or task.get("execution_dir")
+        if dry_run_repo_root:
+            output_dir = Path(dry_run_repo_root) / "backend"
+        else:
+            output_dir = resolve_path(project.get("output_dir"), OUTPUT_DIR) / "backend"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     skill_profile = task.get("skill_profile") or build_task_skill_profile(project, task)
@@ -2172,21 +2043,46 @@ async def execute_task(
                           skill_profile=skill_profile, repo_state=repo_state, dry_run=dry_run)
 
     # ── Construir prompt ────────────────────────────────────────────────────
-    acceptance_str = "\n".join(f"- {a}" for a in task.get("acceptance", []))
-    skill_list = "\n".join(f"- {item}" for item in skill_profile.get("skills", []) or ["General engineering"])
-    instruction_list = "\n".join(f"- {item}" for item in skill_profile.get("instructions", []) or ["Follow the repository stack."])
-    prompt_kwargs = {
-        "context": project_context, "repo_context": json.dumps(repo_state, indent=2, ensure_ascii=False),
-        "skill_family": skill_profile.get("family", "general"),
-        "skill_focus": skill_profile.get("prompt_focus", "General engineering specialist"),
-        "skill_list": skill_list, "instruction_list": instruction_list,
-        "workspace_md_path": str(workspace_files["context_md"]),
-        "workspace_json_path": str(workspace_files["context_json"]),
-        "progress_path": str(progress_path),
-        "task_id": task_id, "title": task["title"], "description": task["description"],
-        "acceptance": acceptance_str,
-    }
-    prompt = BYTE_TASK_PROMPT.format(**prompt_kwargs) if agent_id == "byte" else PIXEL_TASK_PROMPT.format(**prompt_kwargs)
+    is_retry = (
+        task.get("failure_count", 0) > 0 or 
+        task.get("review_round", 0) > 0 or 
+        len(task.get("blockers_resolved", [])) > 0
+    )
+
+    if is_retry:
+        feedback = []
+        if task.get("error"):
+            feedback.append(f"Error o bloqueo previo:\n{task['error']}")
+        if task.get("review_issues"):
+            feedback.append(f"Observaciones de revisión que debes resolver:\n{task['review_issues']}")
+        if task.get("blockers_resolved"):
+            feedback.append(f"Respuestas a tus bloqueos/preguntas:\n" + "\n".join(task["blockers_resolved"]))
+            
+        feedback_str = "\n".join(feedback)
+        if not feedback_str.strip():
+            feedback_str = "Continúa con la tarea."
+            
+        prompt = (
+            f"El orquestador requiere que continúes o corrijas la tarea '{task_id}'.\n"
+            f"Notas, bloqueos resueltos o feedback del intento anterior:\n---\n{feedback_str}\n---\n\n"
+            f"Revisa tu workspace local y devuelve el output final actualizado en el formato JSON estricto esperado."
+        )
+    else:
+        acceptance_str = "\n".join(f"- {a}" for a in task.get("acceptance", []))
+        skill_list = "\n".join(f"- {item}" for item in skill_profile.get("skills", []) or ["General engineering"])
+        instruction_list = "\n".join(f"- {item}" for item in skill_profile.get("instructions", []) or ["Follow the repository stack."])
+        prompt_kwargs = {
+            "context": project_context, "repo_context": json.dumps(repo_state, indent=2, ensure_ascii=False),
+            "skill_family": skill_profile.get("family", "general"),
+            "skill_focus": skill_profile.get("prompt_focus", "General engineering specialist"),
+            "skill_list": skill_list, "instruction_list": instruction_list,
+            "workspace_md_path": str(workspace_files["context_md"]),
+            "workspace_json_path": str(workspace_files["context_json"]),
+            "progress_path": str(progress_path),
+            "task_id": task_id, "title": task["title"], "description": task["description"],
+            "acceptance": acceptance_str,
+        }
+        prompt = BYTE_TASK_PROMPT.format(**prompt_kwargs) if agent_id == "byte" else PIXEL_TASK_PROMPT.format(**prompt_kwargs)
 
     # ── mark_task_failure (closure) ─────────────────────────────────────────
     def mark_task_failure(
@@ -2211,7 +2107,12 @@ async def execute_task(
                           "last_failure_at": utc_now(),
                           "next_action": "review" if not retryable else "retry_or_reassign"})
                 if raw_response:
-                    t["raw_response"] = raw_response[:2000]
+                    dump_file = OUTPUT_DIR / f"{task_id}_{agent_id}_failure.log"
+                    try:
+                        dump_file.write_text(raw_response, encoding="utf-8")
+                        t["raw_response"] = f"Consulta el archivo {dump_file.name} para ver el error completo."
+                    except Exception:
+                        t["raw_response"] = raw_response[:2000]
                 fallback_agent = _fallback_agent_for(t, agent_id)
                 if retryable and fallback_agent and failure_count >= RESUME_FAILURE_THRESHOLD:
                     t.update({"previous_agent": agent_id, "agent": fallback_agent,
@@ -2280,18 +2181,33 @@ async def execute_task(
             )
             return
         except Exception as exc:
-            _stderr = getattr(result, "stderr_lines", [])
-            _content = getattr(result, "content", "")
-            failure_kind = (
-                result.failure_kind if getattr(result, "failure_kind", None)
-                else _infer_failure_kind(content=_content, stderr_lines=_stderr + [str(exc)], returncode=1, exc=exc)
-            )
+            _stderr = getattr(result, "stderr_lines", []) if result else []
+            _content = getattr(result, "content", "") if result else ""
+            
+            # Prefer natural failure kind. If it's a NonRetryableError, we still map it to infra.
+            if isinstance(exc, NonRetryableError):
+                failure_kind = "infra"
+            else:
+                failure_kind = (
+                    result.failure_kind if result and getattr(result, "failure_kind", None)
+                    else _infer_failure_kind(content=_content, stderr_lines=_stderr + [str(exc)], returncode=1, exc=exc)
+                )
+
+            if failure_kind == "infra":
+                error_detail = "Fallo de infraestructura (transporte/gateway)"
+                progress_msg = "Error de red/infraestructura al comunicar con el agente"
+            elif failure_kind == "blocked":
+                error_detail = "Agente bloqueado (no pudo avanzar)"
+                progress_msg = "El agente reportó un bloqueo o error insalvable"
+            else:
+                error_detail = f"Fallo de formato/contenido (JSON inválido): {exc}"
+                progress_msg = "Respuesta JSON inválida o incompleta del agente"
+
             mark_task_failure(
-                f"Invalid JSON response: {exc}",
-                progress_message=("Fallo de infraestructura" if failure_kind == "infra"
-                                  else "Respuesta JSON inválida o incompleta del agente"),
+                error_detail,
+                progress_message=progress_msg,
                 retryable=failure_kind != "infra",
-                raw_response=result.content,
+                raw_response=_content,
                 failure_kind=failure_kind,
             )
             return
@@ -2316,12 +2232,15 @@ async def execute_task(
         )
         _sync_project_status(mem)
         refresh_project_runtime_state(mem)
-        _synchronize_project_artifacts(mem)
+        save_memory(mem)
+        synchronize_project_artifacts(mem)
 
         # ── Revisión de aceptación ──────────────────────────────────────────
+        project = mem.get("project", project)
+        task = next((t for t in mem.get("tasks", []) if t.get("id") == task_id), task)
         review_round = int(task.get("review_round") or 0) + 1
-        passed_review, review_issues = _task_matches_acceptance(task, project)
-        _record_task_review(task_id, review_round, review_issues)
+        passed_review, review_issues = task_matches_acceptance(task, project)
+        record_task_review(task_id, review_round, review_issues)
         _handle_review_result(
             passed_review, review_issues, review_round,
             task=task, task_id=task_id, agent_id=agent_id,
@@ -2424,13 +2343,13 @@ async def final_review(
         )
         result_content = result.content
 
-    if _has_open_tasks(mem.get("tasks", [])):
+    if has_open_tasks(mem.get("tasks", [])):
         mem = load_memory()
         mem.setdefault("project", {})
         mem["project"]["status"] = "in_progress"
         mem["project"]["updated_at"] = utc_now()
         refresh_project_runtime_state(mem)
-        _synchronize_project_artifacts(mem)
+        synchronize_project_artifacts(mem)
         save_memory(mem)
         update_orchestrator_state(
             "paused",
@@ -2449,7 +2368,7 @@ async def final_review(
             log_event(f"Falló el resumen de proyecto por Telegram: {exc}", "system")
         return
 
-    if _has_tasks_needing_correction(mem.get("tasks", [])):
+    if has_tasks_needing_correction(mem.get("tasks", [])):
         mem = load_memory()
         mem.setdefault("project", {})
         mem["project"]["status"] = "blocked"
@@ -2494,7 +2413,7 @@ async def final_review(
     mem.setdefault("milestones", [])
     mem["milestones"].append(f"Proyecto entregado en {utc_now()}")
     refresh_project_runtime_state(mem)
-    _synchronize_project_artifacts(mem)
+    synchronize_project_artifacts(mem)
     save_memory(mem)
 
     arch_bridge.speak("Proyecto entregado. Revisa DELIVERY.md")

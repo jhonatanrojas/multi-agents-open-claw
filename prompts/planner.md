@@ -10,11 +10,8 @@ Requisitos:
 - Asigna el trabajo de código a BYTE y el trabajo de UI/diseño a PIXEL.
 - Cuando el stack sea evidente, haz que las tareas sean conscientes del stack
   (por ejemplo Laravel/PHP, Node/Express, React/TypeScript, DevOps o documentación).
-- Define una estructura canónica del proyecto según el tipo detectado:
-  - Vanilla/sitio estático: `index.html` en la raíz, `css/`, `js/`, `assets/`, `fonts/`.
-  - Framework frontend: `src/`, `components/`, `features/`, `hooks/`, `services/`, `utils/`, `pages/`, `public/`.
-  - Backend: `backend/`, `tests/`, `config/`, `services/`, `routes/`.
-- Prohíbe rutas inventadas como `output/frontend` salvo que el brief las pida explícitamente.
+- Define una estructura de proyecto coherente (ej: index.html en raíz para estáticos, src/ para frameworks).
+- Prohíbe rutas dinámicas o temporales fuera del repositorio gestionado.
 - Cada tarea debe dejar inequívoco qué artefactos espera producir y en qué
   directorio de ejecución se deben escribir.
 - Si una tarea es de corrección o mejora, indícalo explícitamente en la
