@@ -2339,3 +2339,98 @@ def get_logs():
         "log": mem.get("log", [])[-100:],
         "structured_log": _read_jsonl_tail(JSONL_LOG_FILE, 100),
     }
+
+
+# ── OpenAPI Documentation (Tarea 4.2) ────────────────────────────────────────
+
+def custom_openapi():
+    """
+    Generate custom OpenAPI schema for the Dev Squad Dashboard API.
+    
+    This provides comprehensive documentation for all endpoints,
+    including request/response models and authentication requirements.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    from fastapi.openapi.utils import get_openapi
+    
+    openapi_schema = get_openapi(
+        title="Dev Squad Multi-Agent Dashboard API",
+        version="1.0.0",
+        description="""
+## Dev Squad Multi-Agent Programming Team
+
+API para orquestar agentes ARCH (Coordinator), BYTE (Programmer) y PIXEL (Designer).
+
+### Autenticación
+
+Todos los endpoints excepto `/health` requieren el header:
+```
+X-API-Key: <valor de DASHBOARD_API_KEY>
+```
+
+### Agentes
+
+| Agente | Rol | Modelo Default |
+|--------|-----|----------------|
+| ARCH | Coordinator | nvidia/z-ai/glm5 |
+| BYTE | Programmer | nvidia/moonshotai/kimi-k2.5 |
+| PIXEL | Designer | deepseek/deepseek-chat |
+
+### Endpoints Principales
+
+- **Proyectos**: `/api/project/start`, `/api/project/resume`
+- **Modelos**: `/api/models`, `/api/models/agent`
+- **Estado**: `/api/state`, `/api/logs`
+- **Health**: `/api/health/models`, `/api/health/summary`
+- **Streaming**: WebSocket en `/ws/state`
+        """,
+        routes=app.routes,
+        tags=[
+            {
+                "name": "health",
+                "description": "Health checks públicos (sin auth)"
+            },
+            {
+                "name": "models",
+                "description": "Gestión de modelos por agente"
+            },
+            {
+                "name": "project",
+                "description": "Control de proyectos y orquestador"
+            },
+            {
+                "name": "state",
+                "description": "Estado del sistema y logs"
+            },
+            {
+                "name": "streaming",
+                "description": "WebSocket y SSE para actualizaciones en tiempo real"
+            },
+        ],
+    )
+    
+    # Añadir información de seguridad
+    openapi_schema["components"]["securitySchemes"] = {
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+            "description": "API Key para autenticación"
+        }
+    }
+    
+    # Aplicar seguridad global excepto health endpoints
+    for path in openapi_schema["paths"]:
+        if path not in ["/health", "/api/health"]:
+            for method in openapi_schema["paths"][path]:
+                openapi_schema["paths"][path][method]["security"] = [
+                    {"ApiKeyAuth": []}
+                ]
+    
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
