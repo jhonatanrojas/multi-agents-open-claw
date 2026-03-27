@@ -73,7 +73,7 @@ from shared_state import (
 
 from websockets.exceptions import ConnectionClosed
 
-MINIVERSE_URL = os.getenv("MINIVERSE_URL", "https://miniverse-public-production.up.railway.app")
+MINIVERSE_URL = os.getenv("MINIVERSE_URL", "http://127.0.0.1:9999")
 MINIVERSE_UI_URL = os.getenv("MINIVERSE_UI_URL", MINIVERSE_URL).strip() or MINIVERSE_URL
 MINIVERSE_GITHUB_OWNER = "ianscott313"
 MINIVERSE_GITHUB_REPO = "miniverse"
@@ -1764,6 +1764,103 @@ def get_providers():
         entry["has_api_key"] = "apiKey" in pcfg
         safe[pid] = entry
     return {"providers": safe}
+
+
+# ── Model Health (Tarea 2.1) ───────────────────────────────────────────────────
+
+@app.get("/api/health/models")
+def get_models_health():
+    """
+    Return health status of all configured models.
+    
+    Shows which models are available, which have failed recently,
+    and recommendations for switching.
+    """
+    try:
+        from model_fallback import get_models_health_report
+        report = get_models_health_report()
+        return report
+    except ImportError:
+        # Fallback si model_fallback no está disponible
+        models_data = get_available_models()
+        return {
+            "models": {
+                "available": [m.get("qualified") for m in models_data],
+                "status": "unknown",
+                "note": "model_fallback module not loaded"
+            }
+        }
+
+
+@app.get("/api/health/summary")
+def get_health_summary():
+    """
+    Return a comprehensive health summary of the system.
+    
+    Includes:
+    - Model status
+    - Gateway status
+    - Orchestrator status
+    - Project status
+    """
+    from shared_state import load_memory, _pid_is_alive
+    
+    mem = load_memory()
+    
+    # Gateway health
+    gateway_ok = False
+    gateway_error = None
+    try:
+        resp = requests.get("http://127.0.0.1:18789/", timeout=2)
+        gateway_ok = resp.status_code == 200
+    except Exception as e:
+        gateway_error = str(e)
+    
+    # Orchestrator health
+    orchestrator = mem.get("project", {}).get("orchestrator", {})
+    orchestrator_pid = orchestrator.get("pid")
+    orchestrator_alive = _pid_is_alive(orchestrator_pid)
+    
+    # Model health
+    model_health = {"status": "unknown"}
+    try:
+        from model_fallback import get_models_health_report
+        model_health = get_models_health_report()
+    except:
+        pass
+    
+    # Project health
+    project = mem.get("project", {})
+    tasks = mem.get("tasks", [])
+    task_counts = {
+        "total": len(tasks),
+        "done": sum(1 for t in tasks if t.get("status") == "done"),
+        "pending": sum(1 for t in tasks if t.get("status") == "pending"),
+        "in_progress": sum(1 for t in tasks if t.get("status") == "in_progress"),
+        "error": sum(1 for t in tasks if t.get("status") == "error"),
+    }
+    
+    return {
+        "status": "healthy" if gateway_ok and orchestrator_alive else "degraded",
+        "gateway": {
+            "status": "ok" if gateway_ok else "error",
+            "error": gateway_error,
+        },
+        "orchestrator": {
+            "status": orchestrator.get("status", "idle"),
+            "pid": orchestrator_pid,
+            "alive": orchestrator_alive,
+            "phase": orchestrator.get("phase"),
+        },
+        "project": {
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "status": project.get("status"),
+            "task_counts": task_counts,
+        },
+        "models": model_health,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ── Project launch ────────────────────────────────────────────────────────────
