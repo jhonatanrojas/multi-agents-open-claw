@@ -60,6 +60,7 @@ from openclaw_sdk import (
     set_agent_model as sdk_set_agent_model,
     set_default_model as sdk_set_default_model,
 )
+from coordination import send_telegram_message
 from shared_state import (
     BASE_DIR,
     DEFAULT_MEMORY,
@@ -1021,6 +1022,29 @@ def health():
 @app.get("/api/state")
 def get_state():
     return load_memory()
+
+
+@app.post("/api/project/restart")
+async def restart_project():
+    """Stops the orchestrator and allows it to be restarted."""
+    res = _stop_orchestrator(reason="Reinicio forzado desde el agente OpenClaw.")
+    return {"ok": True, "stopped_pid": res.get("pid"), "alive": res.get("alive")}
+
+
+class TelegramAlert(BaseModel):
+    message: str
+
+
+@app.post("/api/alerts/telegram")
+async def alert_telegram(payload: TelegramAlert):
+    """Allows an agent to manually dispatch an alert via Telegram."""
+    if not payload.message:
+        return {"ok": False, "error": "Message is empty"}
+    try:
+        send_telegram_message(f"🚨 [OpenClaw Agent Alert]: {payload.message}")
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/gateway/events")

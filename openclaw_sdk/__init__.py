@@ -42,6 +42,10 @@ save_openclaw_config = _export("save_openclaw_config")
 set_agent_model = _export("set_agent_model")
 set_default_model = _export("set_default_model")
 _infer_failure_kind = _export("_infer_failure_kind")
+parse_json_content = _export("parse_json_content")
+make_session_id = _export("make_session_id")
+is_valid_session_id = _export("is_valid_session_id")
+truncate_prompt = _export("truncate_prompt")
 
 __all__ = [
     "Agent",
@@ -57,4 +61,8 @@ __all__ = [
     "set_agent_model",
     "set_default_model",
     "_infer_failure_kind",
+    "parse_json_content",
+    "make_session_id",
+    "is_valid_session_id",
+    "truncate_prompt",
 ]

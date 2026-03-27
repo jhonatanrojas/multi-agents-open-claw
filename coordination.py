@@ -1985,3 +1985,133 @@ def synchronize_project_artifacts(mem: dict[str, Any]) -> dict[str, Any]:
     refresh_project_runtime_state(mem)
     save_memory(mem)
     return manifest
+
+
+def _compact_review_memory(mem: dict[str, Any]) -> dict[str, Any]:
+    """Return a trimmed review payload to keep ARCH under context limits."""
+    project = mem.get("project") if isinstance(mem.get("project"), dict) else {}
+    plan = mem.get("plan") if isinstance(mem.get("plan"), dict) else {}
+    tasks = mem.get("tasks") if isinstance(mem.get("tasks"), list) else []
+    agents = mem.get("agents") if isinstance(mem.get("agents"), dict) else {}
+    blockers = mem.get("blockers") if isinstance(mem.get("blockers"), list) else []
+    proposals = mem.get("proposals") if isinstance(mem.get("proposals"), list) else []
+    milestones = mem.get("milestones") if isinstance(mem.get("milestones"), list) else []
+    files_produced = mem.get("files_produced") if isinstance(mem.get("files_produced"), list) else []
+    progress_files = mem.get("progress_files") if isinstance(mem.get("progress_files"), list) else []
+
+    def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": task.get("id"),
+            "agent": task.get("agent"),
+            "title": task.get("title"),
+            "status": task.get("status"),
+            "failure_kind": task.get("failure_kind"),
+            "retryable": task.get("retryable"),
+            "error": task.get("error"),
+            "next_action": task.get("next_action"),
+            "files": task.get("files"),
+            "notes": task.get("notes"),
+            "last_failure_at": task.get("last_failure_at"),
+            "progress_file": task.get("progress_file"),
+            "workspace_context": task.get("workspace_context"),
+        }
+
+    def _compact_phase(phase: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": phase.get("id"),
+            "name": phase.get("name"),
+            "tasks": [
+                {
+                    "id": t.get("id"),
+                    "agent": t.get("agent"),
+                    "title": t.get("title"),
+                    "status": t.get("status"),
+                    "depends_on": t.get("depends_on"),
+                }
+                for t in (phase.get("tasks") if isinstance(phase.get("tasks"), list) else [])[:20]
+            ],
+        }
+
+    compact_agents = {
+        agent_id: {
+            "status": data.get("status"),
+            "current_task": data.get("current_task"),
+            "last_seen": data.get("last_seen"),
+        }
+        for agent_id, data in agents.items()
+        if isinstance(data, dict)
+    }
+
+    return {
+        "schema_version": mem.get("schema_version"),
+        "project": {
+            "id": project.get("id"),
+            "name": project.get("name"),
+            "description": project.get("description"),
+            "repo_path": project.get("repo_path"),
+            "output_dir": project.get("output_dir"),
+            "branch": project.get("branch"),
+            "status": project.get("status"),
+            "runtime_status": project.get("runtime_status"),
+            "blocked_reason": project.get("blocked_reason"),
+            "task_counts": project.get("task_counts"),
+            "project_structure": project.get("project_structure"),
+        },
+        "plan": {
+            "current_phase": plan.get("current_phase"),
+            "phases": [_compact_phase(phase) for phase in (plan.get("phases") if isinstance(plan.get("phases"), list) else [])[:10]],
+        },
+        "tasks": [_compact_task(task) for task in tasks[:20]],
+        "agents": compact_agents,
+        "blockers": blockers[:10],
+        "proposals": proposals[:10],
+        "milestones": milestones[:10],
+        "files_produced": files_produced[:20],
+        "progress_files": progress_files[:20],
+        "meta": {
+            "task_count": len(tasks),
+            "project_count": len(mem.get("projects", [])) if isinstance(mem.get("projects"), list) else None,
+            "messages_count": len(mem.get("messages", [])) if isinstance(mem.get("messages"), list) else None,
+            "log_count": len(mem.get("log", [])) if isinstance(mem.get("log"), list) else None,
+        },
+    }
+
+
+def _compact_coordination_messages(messages: list[dict[str, Any]], limit: int = 40) -> list[dict[str, Any]]:
+    """Return a compact, bounded message list for ARCH coordination calls."""
+    compacted: list[dict[str, Any]] = []
+
+    for msg in messages[-limit:]:
+        if not isinstance(msg, dict):
+            continue
+
+        compact: dict[str, Any] = {
+            "id": msg.get("id"),
+            "from": msg.get("from"),
+            "to": msg.get("to"),
+            "message": msg.get("message") or msg.get("text") or msg.get("content") or "",
+            "received_at": msg.get("received_at"),
+        }
+
+        for key in ("task_id", "kind", "relay_status", "source", "in_reply_to"):
+            value = msg.get(key)
+            if value is not None:
+                compact[key] = value
+
+        raw = msg.get("raw")
+        if isinstance(raw, dict):
+            raw_summary = {
+                key: raw.get(key)
+                for key in ("id", "type", "event", "state", "seq", "task_id", "from", "to", "sessionKey", "session_id")
+                if raw.get(key) is not None
+            }
+            if raw_summary:
+                compact["raw_summary"] = raw_summary
+
+        message_text = str(compact.get("message") or "").strip()
+        if len(message_text) > 1200:
+            compact["message"] = f"{message_text[:1200]}…"
+
+        compacted.append(compact)
+
+    return compacted

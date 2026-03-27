@@ -21,6 +21,7 @@ heartbeats while the agent is working.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -186,6 +187,79 @@ def _parse_stderr_events(stderr_lines: list[str], agent_id: str, t0: float) -> l
     return events
 
 
+
+# ---------------------------------------------------------------------------
+# Public session and prompt utilities (Fase 2 – hybrid architecture)
+# ---------------------------------------------------------------------------
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def make_session_id(*parts: str) -> str:
+    """Build a deterministic, URL-safe session ID from arbitrary string parts.
+
+    The result is at most ~85 chars: slug prefix (≤72 chars) + SHA-1 suffix
+    (12 hex chars).  This is the canonical replacement for the private
+    ``_stable_session_id`` helper previously duplicated in the orchestrator.
+
+    Example::
+
+        make_session_id("arch", "planning", "my brief text")
+        # → "arch-planning-my-brief-t-a1b2c3d4e5f6"
+    """
+    cleaned = [_SLUG_RE.sub("-", (p or "")).strip("-")[:24] for p in parts if p]
+    base = "-".join(part for part in cleaned if part).strip("-")
+    digest = hashlib.sha1("::".join(parts).encode("utf-8")).hexdigest()[:12]
+    if base:
+        return f"{base}-{digest}"
+    return f"session-{digest}"
+
+
+def is_valid_session_id(value: str | None) -> bool:
+    """Return *True* if *value* is a non-empty alphanumeric/dash/underscore string.
+
+    Replaces the private ``_is_valid_session_id`` helper in the orchestrator.
+    """
+    if not value:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", value))
+
+
+def truncate_prompt(
+    text: str | None,
+    max_chars: int = 400_000,
+    context: str = "prompt",
+) -> str:
+    """Prevent context-window overflows by centre-truncating long prompts.
+
+    400 000 chars ≈ 100 k tokens, leaving headroom for system prompts and
+    model overhead.  The middle section is replaced with a visible sentinel so
+    agents know the content was trimmed.
+
+    Replaces the private ``_truncate_prompt`` helper previously duplicated in
+    the orchestrator.
+    """
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+
+    half = (max_chars // 2) - 150
+    log.warning(
+        "Content for '%s' (%d chars) exceeds safety limit (%d). "
+        "Truncating the middle to avoid token overflow.",
+        context,
+        len(text),
+        max_chars,
+    )
+    return (
+        f"{text[:half]}\n\n"
+        f"--- [CONTENIDO INTERMEDIO TRUNCADO POR SEGURIDAD DE CONTEXTO "
+        f"({len(text)} CHARS → {max_chars}) ---]\n\n"
+        f"{text[-half:]}"
+    )
+
+
 def _find_json_document(text: str) -> Any:
     """Return the first decodable JSON object found inside mixed CLI output."""
     text = (text or "").strip()
@@ -207,6 +281,35 @@ def _find_json_document(text: str) -> Any:
         except json.JSONDecodeError:
             continue
     return None
+
+
+def parse_json_content(content: str) -> Any:
+    """Public helper: parse JSON from plain text, fenced markdown, or mixed output.
+
+    Strips markdown code fences (```json ... ```) before attempting JSON
+    extraction so callers do not need to pre-process agent responses.
+
+    Returns the decoded Python object, or raises ``ValueError`` if no valid
+    JSON document is found.
+    """
+    text = (content or "").strip()
+
+    # Strip leading code fence (```json or ```)
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    result = _find_json_document(text)
+    if result is None:
+        raise ValueError(
+            f"No valid JSON document found in content "
+            f"(first 200 chars): {content[:200]!r}"
+        )
+    return result
 
 
 def _extract_cli_payload(stdout: str, stderr: str = "") -> dict[str, Any]:
@@ -668,6 +771,96 @@ class Agent:
             session_id=session_id,
             events=_parse_stderr_events(stderr_lines, self.agent_id, t0),
         )
+
+    async def get_session_status(self, session_id: str) -> dict[str, Any] | None:
+        """Query OpenClaw CLI for session metadata.
+
+        Returns a dict with keys like 'status', 'model', 'tokens', 'startedAt',
+        or None if the session was not found.
+        """
+        runtime_profile = OPENCLAW_RUNTIME_PROFILE or None
+        cmd = ["openclaw"]
+        if runtime_profile:
+            cmd.extend(["--profile", runtime_profile])
+        cmd.extend(["sessions", "--json", "--agent", self.agent_id])
+
+        env = os.environ.copy()
+        env["HOME"] = str(OPENCLAW_RUNTIME_HOME)
+        env.setdefault("OPENCLAW_PROFILE", runtime_profile or "")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
+            if proc.returncode != 0:
+                log.debug(
+                    "openclaw sessions exited %d: %s",
+                    proc.returncode,
+                    stderr_bytes.decode("utf-8", errors="replace").strip(),
+                )
+                return None
+
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            # openclaw sessions --json returns either a list or a dict
+            data = parse_json_content(stdout)
+            if not data:
+                return None
+
+            # If it's a list, find the session.
+            if isinstance(data, list):
+                for sess in data:
+                    if sess.get("sessionId") == session_id or sess.get("id") == session_id:
+                        return sess
+                return None
+            
+            # If it's a dict (sometimes keyed by sessionKey), check values.
+            if isinstance(data, dict):
+                # Check direct match if keyed by session_id
+                if session_id in data:
+                    return data[session_id]
+                # Search values
+                for sess in data.values():
+                    if isinstance(sess, dict) and (sess.get("sessionId") == session_id or sess.get("id") == session_id):
+                        return sess
+            
+            return None
+        except Exception as exc:
+            log.warning("Failed to get session status for %s: %s", session_id, exc)
+            return None
+
+    async def steer(
+        self,
+        session_id: str,
+        message: str,
+        **kwargs: Any,
+    ) -> AgentResult:
+        """Inject a corrective message into an active session.
+
+        This is a semantic wrapper around execute() that ensures the session_id
+        is maintained and logs the action as 'steering'.
+        """
+        log.info("Steering session %s for agent %s", session_id, self.agent_id)
+        return await self.execute(message, session_id=session_id, **kwargs)
+
+    async def resume(
+        self,
+        session_id: str,
+        context_update: str | None = None,
+        **kwargs: Any,
+    ) -> AgentResult:
+        """Resume a session that was paused or failed.
+
+        If *context_update* is provided, it is sent as the first message of the
+        resumed session. If None, it sends a 'continue' signal (model dependent).
+        """
+        log.info("Resuming session %s for agent %s", session_id, self.agent_id)
+        # Some agents use "continue" or "..." to resume without new instructions.
+        msg = context_update if context_update is not None else "Please continue your work."
+        return await self.execute(msg, session_id=session_id, **kwargs)
 
 
 # ---------------------------------------------------------------------------

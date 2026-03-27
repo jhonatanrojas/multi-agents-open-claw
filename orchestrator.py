@@ -24,7 +24,15 @@ from uuid import uuid4
 from pathlib import Path
 from typing import Any
 
-from openclaw_sdk import OpenClawClient, ProgressCallback, _infer_failure_kind, FailureKind
+from openclaw_sdk import (
+    OpenClawClient,
+    ProgressCallback,
+    FailureKind,
+    parse_json_content,
+    make_session_id,
+    is_valid_session_id,
+    truncate_prompt,
+)
 
 from coordination import (
     LOG_DIR,
@@ -63,6 +71,8 @@ from coordination import (
     _resolve_task_artifact_path,
     _read_text_if_exists,
     _task_files_for_review,
+    _compact_review_memory,
+    _compact_coordination_messages,
 )
 from shared_state import (
     BASE_DIR,
@@ -133,19 +143,7 @@ REVIEW_PROMPT = load_prompt("review.md")
 # Local utc_now replaced by shared_state.utc_now
 
 
-def _stable_session_id(*parts: str) -> str:
-    cleaned = [slugify(p or "")[:24] for p in parts if p]
-    base = "-".join(part for part in cleaned if part).strip("-")
-    digest = hashlib.sha1("::".join(parts).encode("utf-8")).hexdigest()[:12]
-    if base:
-        return f"{base}-{digest}"
-    return f"session-{digest}"
-
-
-def _is_valid_session_id(value: str | None) -> bool:
-    if not value:
-        return False
-    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", value))
+# (session and prompt helpers moved to openclaw_sdk — Fase 2 refactoring)
 
 
 def _append_agent_log(agent_id: str, record: dict[str, Any]) -> None:
@@ -270,9 +268,6 @@ def _normalize_task_output(data: dict[str, Any], *, agent_id: str, task_id: str)
 
 class TaskOutputBlocked(ValueError):
     """Task agent reported a BLOCKER/QUESTION with valid JSON but no files."""
-
-
-# (_classify_task_failure delegado a _infer_failure_kind del SDK)
 
 
 def _sync_project_status(mem: dict[str, Any]) -> None:
@@ -693,145 +688,25 @@ async def retry_async(
 
 
 
-def _compact_review_memory(mem: dict[str, Any]) -> dict[str, Any]:
-    """Return a trimmed review payload to keep ARCH under context limits."""
-    project = mem.get("project") if isinstance(mem.get("project"), dict) else {}
-    plan = mem.get("plan") if isinstance(mem.get("plan"), dict) else {}
-    tasks = mem.get("tasks") if isinstance(mem.get("tasks"), list) else []
-    agents = mem.get("agents") if isinstance(mem.get("agents"), dict) else {}
-    blockers = mem.get("blockers") if isinstance(mem.get("blockers"), list) else []
-    proposals = mem.get("proposals") if isinstance(mem.get("proposals"), list) else []
-    milestones = mem.get("milestones") if isinstance(mem.get("milestones"), list) else []
-    files_produced = mem.get("files_produced") if isinstance(mem.get("files_produced"), list) else []
-    progress_files = mem.get("progress_files") if isinstance(mem.get("progress_files"), list) else []
 
-    def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "id": task.get("id"),
-            "agent": task.get("agent"),
-            "title": task.get("title"),
-            "status": task.get("status"),
-            "failure_kind": task.get("failure_kind"),
-            "retryable": task.get("retryable"),
-            "error": task.get("error"),
-            "next_action": task.get("next_action"),
-            "files": task.get("files"),
-            "notes": task.get("notes"),
-            "last_failure_at": task.get("last_failure_at"),
-            "progress_file": task.get("progress_file"),
-            "workspace_context": task.get("workspace_context"),
-        }
-
-    def _compact_phase(phase: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "id": phase.get("id"),
-            "name": phase.get("name"),
-            "tasks": [
-                {
-                    "id": t.get("id"),
-                    "agent": t.get("agent"),
-                    "title": t.get("title"),
-                    "status": t.get("status"),
-                    "depends_on": t.get("depends_on"),
-                }
-                for t in (phase.get("tasks") if isinstance(phase.get("tasks"), list) else [])[:20]
-            ],
-        }
-
-    compact_agents = {
-        agent_id: {
-            "status": data.get("status"),
-            "current_task": data.get("current_task"),
-            "last_seen": data.get("last_seen"),
-        }
-        for agent_id, data in agents.items()
-        if isinstance(data, dict)
-    }
-
-    return {
-        "schema_version": mem.get("schema_version"),
-        "project": {
-            "id": project.get("id"),
-            "name": project.get("name"),
-            "description": project.get("description"),
-            "repo_path": project.get("repo_path"),
-            "output_dir": project.get("output_dir"),
-            "branch": project.get("branch"),
-            "status": project.get("status"),
-            "runtime_status": project.get("runtime_status"),
-            "blocked_reason": project.get("blocked_reason"),
-            "task_counts": project.get("task_counts"),
-            "project_structure": project.get("project_structure"),
-        },
-        "plan": {
-            "current_phase": plan.get("current_phase"),
-            "phases": [_compact_phase(phase) for phase in (plan.get("phases") if isinstance(plan.get("phases"), list) else [])[:10]],
-        },
-        "tasks": [_compact_task(task) for task in tasks[:20]],
-        "agents": compact_agents,
-        "blockers": blockers[:10],
-        "proposals": proposals[:10],
-        "milestones": milestones[:10],
-        "files_produced": files_produced[:20],
-        "progress_files": progress_files[:20],
-        "meta": {
-            "task_count": len(tasks),
-            "project_count": len(mem.get("projects", [])) if isinstance(mem.get("projects"), list) else None,
-            "messages_count": len(mem.get("messages", [])) if isinstance(mem.get("messages"), list) else None,
-            "log_count": len(mem.get("log", [])) if isinstance(mem.get("log"), list) else None,
-        },
-    }
-
-
-def _compact_coordination_messages(messages: list[dict[str, Any]], limit: int = 40) -> list[dict[str, Any]]:
-    """Return a compact, bounded message list for ARCH coordination calls."""
-    compacted: list[dict[str, Any]] = []
-
-    for msg in messages[-limit:]:
-        if not isinstance(msg, dict):
-            continue
-
-        compact: dict[str, Any] = {
-            "id": msg.get("id"),
-            "from": msg.get("from"),
-            "to": msg.get("to"),
-            "message": msg.get("message") or msg.get("text") or msg.get("content") or "",
-            "received_at": msg.get("received_at"),
-        }
-
-        for key in ("task_id", "kind", "relay_status", "source", "in_reply_to"):
-            value = msg.get(key)
-            if value is not None:
-                compact[key] = value
-
-        raw = msg.get("raw")
-        if isinstance(raw, dict):
-            raw_summary = {
-                key: raw.get(key)
-                for key in ("id", "type", "event", "state", "seq", "task_id", "from", "to", "sessionKey", "session_id")
-                if raw.get(key) is not None
-            }
-            if raw_summary:
-                compact["raw_summary"] = raw_summary
-
-        message_text = str(compact.get("message") or "").strip()
-        if len(message_text) > 1200:
-            compact["message"] = f"{message_text[:1200]}…"
-
-        compacted.append(compact)
-
-    return compacted
 
 
 def normalize_message(agent_id: str, raw: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a Miniverse inbox payload."""
+    """Normalize a Miniverse inbox payload, supporting hierarchical routing."""
     sender = raw.get("from") or raw.get("sender") or raw.get("agent") or "unknown"
     message = raw.get("message") or raw.get("text") or raw.get("body") or ""
     message_id = raw.get("id") or raw.get("message_id") or f"{agent_id}-{abs(hash(message)) % 1_000_000}"
+    
+    # Extract routes injected by message_agent or assume defaults
+    from_route = raw.get("from_route") or f"/root/worker/{sender}"
+    to_route = raw.get("to_route") or f"/root/worker/{agent_id}"
+
     return {
         "id": message_id,
         "from": sender,
         "to": agent_id,
+        "from_route": from_route,
+        "to_route": to_route,
         "message": message,
         "raw": raw,
         "received_at": utc_now(),
@@ -854,29 +729,7 @@ def infer_tech_stack_from_brief(brief: str) -> dict[str, str]:
     return {"frontend": "Modern UI", "backend": "Generic API", "database": "Auto"}
 
 
-def _truncate_prompt(text: str | None, max_chars: int = 400000, context: str = "prompt") -> str:
-    """Evita que el prompt desborde el contexto de los agentes truncando el medio.
-    
-    Un límite de 400k caracteres equivale a ~100k tokens, dejando espacio
-    suficiente para el resto del prompt del sistema y overhead del modelo.
-    """
-    if not text:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    
-    half = (max_chars // 2) - 150
-    log_event(
-        f"Contenido de {context} ({len(text)} chars) excede el límite de seguridad ({max_chars}). "
-        f"Se ha truncado el centro para evitar error de tokens.",
-        "system",
-        level="warning"
-    )
-    return (
-        f"{text[:half]}\n\n"
-        f"--- [CONTENIDO INTERMEDIO TRUNCADO POR SEGURIDAD DE CONTEXTO ({len(text)} CHARS → {max_chars}) ---]\n\n"
-        f"{text[-half:]}"
-    )
+# (truncate_prompt moved to openclaw_sdk — Fase 2 refactoring)
 
 
 def build_dry_run_plan(brief: str) -> dict[str, Any]:
@@ -939,84 +792,7 @@ def build_dry_run_plan(brief: str) -> dict[str, Any]:
     return plan
 
 
-def _load_json_loose(content: str) -> Any:
-    """Parse JSON from plain text, fenced markdown, or mixed wrapper text."""
-    text = (content or "").strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        decoder = json.JSONDecoder()
-        for idx, ch in enumerate(text):
-            if ch not in "[{":
-                continue
-            try:
-                obj, _end = decoder.raw_decode(text[idx:])
-                return obj
-            except json.JSONDecodeError:
-                continue
-        raise
-
-
-def _parse_agent_json_payload(content: str) -> dict[str, Any]:
-    """Parse agent JSON output and unwrap OpenClaw payload envelopes."""
-    parsed = _load_json_loose(content)
-    if isinstance(parsed, dict) and isinstance(parsed.get("plan"), dict):
-        return parsed
-
-    if isinstance(parsed, dict):
-        payloads = parsed.get("payloads")
-        if isinstance(payloads, list):
-            for payload in payloads:
-                if not isinstance(payload, dict):
-                    continue
-                payload_text = payload.get("text")
-                if not isinstance(payload_text, str) or not payload_text.strip():
-                    continue
-                try:
-                    return _parse_agent_json_payload(payload_text)
-                except Exception:
-                    continue
-
-        embedded_text = parsed.get("text")
-        if isinstance(embedded_text, str) and embedded_text.strip():
-            return _parse_agent_json_payload(embedded_text)
-
-    raise ValueError("No se encontró un plan JSON válido en la respuesta del agente")
-
-
-def _parse_task_json_payload(content: str) -> dict[str, Any]:
-    """Parse task output from BYTE or PIXEL, tolerating common wrapper formats."""
-    parsed = _load_json_loose(content)
-    if isinstance(parsed, dict) and isinstance(parsed.get("files"), list):
-        return parsed
-
-    if isinstance(parsed, dict):
-        payloads = parsed.get("payloads")
-        if isinstance(payloads, list):
-            for payload in payloads:
-                if not isinstance(payload, dict):
-                    continue
-                payload_text = payload.get("text")
-                if not isinstance(payload_text, str) or not payload_text.strip():
-                    continue
-                try:
-                    return _parse_task_json_payload(payload_text)
-                except Exception:
-                    continue
-
-        embedded_text = parsed.get("text")
-        if isinstance(embedded_text, str) and embedded_text.strip():
-            return _parse_task_json_payload(embedded_text)
-
-    raise ValueError("No se encontró una salida JSON válida de la tarea")
+# (JSON parsing helpers moved to openclaw_sdk.parse_json_content — Fase 2 refactoring)
 
 
 def _count_planned_tasks(plan_json: dict[str, Any]) -> int:
@@ -1138,222 +914,7 @@ def _telegram_help_message() -> str:
     )
 
 
-# _poll_telegram_inbox() is now handled by dashboard_api.py (Phase 7)
-async def _poll_telegram_inbox() -> None:
-    return # No-op, data already in memory
-    """Fetch Telegram messages and persist them as coordinator inbox entries."""
-    token, chat_id = get_telegram_credentials()
-    if not token:
-        return
 
-    mem = load_memory()
-    telegram_state = _telegram_orchestrator_state(mem)
-    offset = telegram_state.get("update_offset")
-    try:
-        offset_int = int(offset) if offset is not None else None
-    except Exception:
-        offset_int = None
-
-    result = fetch_telegram_updates(offset=offset_int, timeout=20, limit=50, token=token)
-    if not result.get("ok"):
-        reason = result.get("reason")
-        if reason:
-            log_event(f"Telegram polling failed: {reason}", "system", level="warning")
-        return
-
-    updates = result.get("updates", [])
-    if not updates:
-        return
-
-    existing_ids = {m.get("id", "") for m in mem.get("messages", [])}
-    seen_updates: list[int] = []
-    for update in updates:
-        if not isinstance(update, dict):
-            continue
-        update_id = update.get("update_id")
-        try:
-            update_id_int = int(update_id)
-        except Exception:
-            continue
-        seen_updates.append(update_id_int)
-
-        message = update.get("message") or update.get("edited_message") or update.get("channel_post")
-        if not isinstance(message, dict):
-            continue
-        text = message.get("text") or message.get("caption") or ""
-        if not isinstance(text, str):
-            text = str(text)
-        text = text.strip()
-        if not text:
-            continue
-
-        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
-        incoming_chat_id = chat.get("id") if isinstance(chat, dict) else None
-        if not _telegram_chat_id_matches(incoming_chat_id):
-            continue
-
-        normalized = {
-            "id": f"telegram-{update_id_int}",
-            "from": "telegram",
-            "to": "arch",
-            "message": text,
-            "raw": update,
-            "received_at": utc_now(),
-            "source": "telegram",
-            "relay_status": "pending",
-            "chat_id": str(incoming_chat_id) if incoming_chat_id is not None else None,
-            "update_id": update_id_int,
-        }
-
-        if normalized["id"] not in existing_ids:
-            existing_ids.add(normalized["id"])
-            upper = text.upper()
-            if upper.startswith("/STATUS"):
-                normalized["relay_status"] = "handled"
-                mem.setdefault("messages", [])
-                mem["messages"].append(normalized)
-                log_event(f"Telegram command /status received: {text}", "telegram")
-                try:
-                    send_telegram_message(_telegram_message_summary(mem))
-                except Exception as exc:
-                    log_event(f"Telegram status reply failed: {exc}", "system", level="warning")
-                continue
-            elif upper.startswith("/HELP"):
-                normalized["relay_status"] = "handled"
-                mem.setdefault("messages", [])
-                mem["messages"].append(normalized)
-                log_event(f"Telegram command /help received: {text}", "telegram")
-                try:
-                    send_telegram_message(_telegram_help_message())
-                except Exception as exc:
-                    log_event(f"Telegram help reply failed: {exc}", "system", level="warning")
-                continue
-            elif upper.startswith("/PAUSE"):
-                normalized["relay_status"] = "handled"
-                mem.setdefault("messages", [])
-                mem["messages"].append(normalized)
-                telegram_state["control_request"] = "pause"
-                log_event(f"Telegram command /pause received: {text}", "telegram")
-                try:
-                    send_telegram_message("Pausa solicitada por Telegram. Se aplicará en el siguiente ciclo.")
-                except Exception as exc:
-                    log_event(f"Telegram pause ack failed: {exc}", "system", level="warning")
-                continue
-            elif upper.startswith("/RESUME"):
-                normalized["relay_status"] = "handled"
-                mem.setdefault("messages", [])
-                mem["messages"].append(normalized)
-                log_event(f"Telegram command /resume received: {text}", "telegram")
-                try:
-                    send_telegram_message("Reanudación solicitada por Telegram. Usa /devsquad o /api/project/resume para aplicarla.")
-                except Exception as exc:
-                    log_event(f"Telegram resume ack failed: {exc}", "system", level="warning")
-                continue
-            elif upper.startswith("APROBAR "):
-                normalized["relay_status"] = "handled"
-                mem.setdefault("messages", [])
-                mem["messages"].append(normalized)
-                proposal_id = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
-                if not proposal_id:
-                    try:
-                        send_telegram_message("Uso: APROBAR <proposal_id>")
-                    except Exception as exc:
-                        log_event(f"Telegram approve usage reply failed: {exc}", "system", level="warning")
-                    continue
-                approved_task = approve_proposal(proposal_id)
-                if not approved_task:
-                    try:
-                        send_telegram_message(f"No se encontró la propuesta {proposal_id}")
-                    except Exception as exc:
-                        log_event(f"Telegram approve miss reply failed: {exc}", "system", level="warning")
-                    continue
-                log_event(f"Telegram aprobó {proposal_id} -> {approved_task.get('id')}", "telegram")
-                try:
-                    send_telegram_message(
-                        "\n".join(
-                            [
-                                f"Propuesta aprobada: {proposal_id}",
-                                f"Nueva tarea en cola: {approved_task.get('id')} ({approved_task.get('agent')})",
-                                f"Directorio: {approved_task.get('execution_dir') or 'n/a'}",
-                            ]
-                        )
-                    )
-                except Exception as exc:
-                    log_event(f"Telegram approve ack failed: {exc}", "system", level="warning")
-                continue
-            elif upper.startswith("/ACLARAR ") or upper.startswith("ACLARAR "):
-                # Fase 1: el usuario responde a una pregunta de planificacion pendiente
-                clarification_text = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else text.strip()
-                normalized["relay_status"] = "handled"
-                normalized["kind"] = "clarification_reply"
-                mem.setdefault("messages", [])
-                mem["messages"].append(normalized)
-
-                # guardar la respuesta en el bloque pending_clarification
-                pending = mem.get("project", {}).get("pending_clarification")
-                if isinstance(pending, dict) and not pending.get("resolved"):
-                    pending["reply"] = clarification_text
-                    pending["resolved"] = True
-                    pending["replied_at"] = utc_now()
-                    mem.setdefault("project", {})["status"] = "pending"
-                    mem["project"]["bootstrap_status"] = "clarification_received"
-                    log_event(
-                        f"[Fase 1] Aclaración recibida por Telegram: {clarification_text[:120]}",
-                        "telegram",
-                    )
-                    try:
-                        send_telegram_message(
-                            f"✅ Aclaración registrada. ARCH reanudará la planificación en el siguiente ciclo.\n"
-                            f"Respuesta recibida: {clarification_text[:120]}"
-                        )
-                    except Exception as exc:
-                        log_event(f"Telegram clarification ack failed: {exc}", "system", level="warning")
-                else:
-                    log_event(
-                        "[Fase 1] Respuesta /ACLARAR recibida pero no había pregunta pendiente",
-                        "telegram",
-                        level="warning",
-                    )
-                    try:
-                        send_telegram_message(
-                            "No hay ninguna pregunta de planificación pendiente. "
-                            "Para iniciar un proyecto escribe directamente el brief."
-                        )
-                    except Exception:
-                        pass
-                continue
-            else:
-                mem.setdefault("messages", [])
-                mem["messages"].append(normalized)
-                log_event(f"Telegram -> coordinator: {text}", "telegram")
-                # Fase 1: si hay un pending_clarification sin reply, tratar mensaje libre como respuesta
-                pending = mem.get("project", {}).get("pending_clarification")
-                if isinstance(pending, dict) and not pending.get("reply") and not upper.startswith("/"):
-                    pending["reply"] = text
-                    pending["resolved"] = True
-                    pending["replied_at"] = utc_now()
-                    mem.setdefault("project", {})["status"] = "pending"
-                    mem["project"]["bootstrap_status"] = "clarification_received"
-                    log_event(
-                        f"[Fase 1] Mensaje libre interpretado como aclaración: {text[:120]}",
-                        "telegram",
-                    )
-                    try:
-                        send_telegram_message(
-                            f"✅ Respuesta registrada como aclaración de planificación.\n"
-                            f"ARCH reanudará en el siguiente ciclo.\nRespuesta: {text[:120]}"
-                        )
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        send_telegram_message("Mensaje recibido. ARCH lo revisará en el siguiente ciclo.")
-                    except Exception as exc:
-                        log_event(f"Telegram ack failed: {exc}", "system", level="warning")
-
-    if seen_updates:
-        telegram_state["update_offset"] = max(seen_updates) + 1
-    save_memory(mem)
 
 
 def _consume_telegram_control_request() -> str | None:
@@ -1532,11 +1093,10 @@ async def relay_team_messages(client: OpenClawClient) -> None:
     ).hexdigest()[:12]
 
     arch = client.get_agent("arch")
-    arch = client.get_agent("arch")
     coord_cb = make_progress_callback(notify_telegram=False)
     
     # Truncamiento de coordinación para evitar saturar ARCH con mensajes históricos
-    coord_payload = _truncate_prompt(
+    coord_payload = truncate_prompt(
         COORDINATION_PROMPT.format(
             messages=json.dumps(coordination_messages, indent=2, ensure_ascii=False),
         ),
@@ -1546,7 +1106,7 @@ async def relay_team_messages(client: OpenClawClient) -> None:
     result = await arch.execute(
         coord_payload,
         on_progress=coord_cb,
-        session_id=_stable_session_id(project_identity, "arch", "coordination", coordination_digest),
+        session_id=make_session_id(project_identity, "arch", "coordination", coordination_digest),
     )
 
     try:
@@ -1754,9 +1314,9 @@ async def plan_project(
         progress_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
         
         # Truncamiento preventivo para evitar el error de 166k+ tokens detectado en P2
-        secure_brief = _truncate_prompt(brief, context="brief")
+        secure_brief = truncate_prompt(brief, context="brief")
         planner_prompt = PLANNER_PROMPT.format(project_brief=secure_brief)
-        planner_session_id = _stable_session_id("arch", "planning", secure_brief)
+        planner_session_id = make_session_id("arch", "planning", secure_brief)
         result = await retry_async(
             "Planner execution",
             lambda: arch.execute(
@@ -1784,7 +1344,7 @@ async def plan_project(
         )
 
         try:
-            plan_json = _parse_agent_json_payload(planner_content)
+            plan_json = parse_json_content(planner_content)
         except (json.JSONDecodeError, ValueError) as exc:
             _save_planner_message(planner_content, parsed=None, status="invalid_json")
             update_agent_status("arch", "error", "planning_failed")
@@ -1950,25 +1510,9 @@ async def _run_agent_task(
     agent_id: str,
 ) -> Any:
     """Fire the agent and return AgentResult, letting exceptions propagate."""
-    async def _call() -> Any:
-        try:
-            # Truncamiento de seguridad para prompts de tareas (Pixel/Byte)
-            secure_prompt = _truncate_prompt(prompt, context=f"task:{agent_id}")
-            res = await agent.execute(secure_prompt, on_progress=task_progress_cb, session_id=session_id)
-            if getattr(res, "failure_kind", None) == "infra":
-                raise NonRetryableError(f"Fallo de infraestructura (Gateway/Timeout): {getattr(res, 'content', '')[:100]}")
-            return res
-        except asyncio.TimeoutError as exc:
-            raise NonRetryableError(f"El agente excedió el tiempo máximo de ejecución ({task_timeout_sec}s)") from exc
-
-    return await retry_async(
-        f"Ejecución de tarea del agente {agent_id}",
-        _call,
-        timeout_sec=task_timeout_sec,
-        retries=retry_attempts,
-        delay_sec=retry_delay_sec,
-        agent=agent_id,
-    )
+    # Truncamiento de seguridad para prompts de tareas (Pixel/Byte)
+    secure_prompt = truncate_prompt(prompt, context=f"task:{agent_id}")
+    return await agent.execute(secure_prompt, on_progress=task_progress_cb, session_id=session_id)
 
 
 def _write_task_files(
@@ -2205,14 +1749,14 @@ async def execute_task(
 
     # ── Session ID ─────────────────────────────────────────────────────────
     mem = load_memory()
-    generated_session_id = _stable_session_id(
+    generated_session_id = make_session_id(
         str(mem.get("project", {}).get("id") or mem.get("project", {}).get("name") or "project"),
         agent_id, task_id,
     )
     for t in mem.get("tasks", []):
         if t.get("id") == task_id:
             stored = str(t.get("session_id") or "").strip()
-            session_id = stored if _is_valid_session_id(stored) else generated_session_id
+            session_id = stored if is_valid_session_id(stored) else generated_session_id
             t.update({"status": "in_progress", "progress_file": str(progress_path),
                       "workspace_context": str(workspace_files["context_md"]),
                       "skills": skill_profile["skills"], "skill_family": skill_profile["family"],
@@ -2323,27 +1867,44 @@ async def execute_task(
         task_progress_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
         try:
             result = await _run_agent_task(
-                agent, prompt, session_id, task_progress_cb,
-                task_timeout_sec, retry_attempts, retry_delay_sec, agent_id,
+                agent, prompt, session_id, task_progress_cb, agent_id,
             )
         except Exception as exc:
-            failure_kind: FailureKind | None = (
-                result.failure_kind if result is not None and getattr(result, "failure_kind", None)
-                else _infer_failure_kind(content="", stderr_lines=[str(exc)], returncode=1, exc=exc)
-            )
             mark_task_failure(
-                f"error de ejecución del agente: {exc}",
-                progress_message=("Fallo de infraestructura del agente" if failure_kind == "infra"
-                                  else f"Falló la ejecución del agente: {exc}"),
-                retryable=failure_kind != "infra",
-                failure_kind=failure_kind,
+                f"error de ejecución del SDK: {exc}",
+                progress_message="Fallo de infraestructura del agente (SDK crash)",
+                retryable=False,
+                failure_kind="infra",
             )
             return
 
         # Consumir failure_kind y events nativos del SDK
+        if result.failure_kind:
+            if result.failure_kind == "infra":
+                error_detail = "Fallo de infraestructura (transporte/gateway)"
+                progress_msg = "Error de red/infraestructura al comunicar con el agente"
+                retry_flag = False
+            elif result.failure_kind == "blocked":
+                error_detail = "Agente bloqueado (no pudo avanzar)"
+                progress_msg = "El agente reportó un bloqueo o error insalvable"
+                retry_flag = True
+            else:
+                error_detail = f"Fallo clasificado por SDK: {result.failure_kind}"
+                progress_msg = f"Error en el agente: {result.failure_kind}"
+                retry_flag = True
+
+            mark_task_failure(
+                error_detail,
+                progress_message=progress_msg,
+                retryable=retry_flag,
+                raw_response=result.content,
+                failure_kind=result.failure_kind,
+            )
+            return
+
         log_event(
             f"{agent_id.upper()} respondió en {result.elapsed_sec:.0f}s "
-            f"(content_len={len(result.content)}, failure_kind={result.failure_kind or 'none'})",
+            f"(content_len={len(result.content)}, failure_kind='none')",
             agent_id,
         )
         for ev in (result.events or []):
@@ -2351,9 +1912,9 @@ async def execute_task(
                 append_progress_event(progress_path, ev["kind"], ev.get("label", "")[:200],
                                       status="running", notes=ev.get("tool_name"))
 
-        # Parsear respuesta
+        # Parsear respuesta (si el SDK no detectó fallo, entonces el error de parseo es 'format')
         try:
-            data = _parse_task_json_payload(result.content)
+            data = parse_json_content(result.content)
             files_payload, task_notes = _normalize_task_output(data, agent_id=agent_id, task_id=task_id)
         except TaskOutputBlocked as exc:
             _handle_task_blocked(
@@ -2363,34 +1924,12 @@ async def execute_task(
             )
             return
         except Exception as exc:
-            _stderr = getattr(result, "stderr_lines", []) if result else []
-            _content = getattr(result, "content", "") if result else ""
-            
-            # Prefer natural failure kind. If it's a NonRetryableError, we still map it to infra.
-            if isinstance(exc, NonRetryableError):
-                failure_kind = "infra"
-            else:
-                failure_kind = (
-                    result.failure_kind if result and getattr(result, "failure_kind", None)
-                    else _infer_failure_kind(content=_content, stderr_lines=_stderr + [str(exc)], returncode=1, exc=exc)
-                )
-
-            if failure_kind == "infra":
-                error_detail = "Fallo de infraestructura (transporte/gateway)"
-                progress_msg = "Error de red/infraestructura al comunicar con el agente"
-            elif failure_kind == "blocked":
-                error_detail = "Agente bloqueado (no pudo avanzar)"
-                progress_msg = "El agente reportó un bloqueo o error insalvable"
-            else:
-                error_detail = f"Fallo de formato/contenido (JSON inválido): {exc}"
-                progress_msg = "Respuesta JSON inválida o incompleta del agente"
-
             mark_task_failure(
-                error_detail,
-                progress_message=progress_msg,
-                retryable=failure_kind != "infra",
-                raw_response=_content,
-                failure_kind=failure_kind,
+                f"Fallo de formato/contenido (JSON inválido): {exc}",
+                progress_message="Respuesta JSON inválida o incompleta del agente",
+                retryable=True,
+                raw_response=result.content,
+                failure_kind="format",
             )
             return
 
@@ -2421,7 +1960,17 @@ async def execute_task(
         project = mem.get("project", project)
         task = next((t for t in mem.get("tasks", []) if t.get("id") == task_id), task)
         review_round = int(task.get("review_round") or 0) + 1
+        
+        # [Fase 3] Validar rutas de los archivos producidos
+        structure_violations = validate_project_structure(
+            str(task.get("execution_dir") or ""), project, task, files_written=files_written
+        )
         passed_review, review_issues = task_matches_acceptance(task, project)
+        if structure_violations:
+            passed_review = False
+            violation_msg = "Violación de rutas (Fase 3):\n" + "\n".join(f"- {v}" for v in structure_violations)
+            review_issues = (review_issues + [violation_msg]) if review_issues else [violation_msg]
+            
         record_task_review(task_id, review_round, review_issues)
         _handle_review_result(
             passed_review, review_issues, review_round,
@@ -2504,11 +2053,11 @@ async def final_review(
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
         arch = client.get_agent("arch")
         review_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
-        review_prompt = _truncate_prompt(
+        review_prompt = truncate_prompt(
             REVIEW_PROMPT.format(memory=json.dumps(_compact_review_memory(mem), indent=2, ensure_ascii=False)),
             context="final-review"
         )
-        review_session_id = _stable_session_id(
+        review_session_id = make_session_id(
             str(mem.get("project", {}).get("id") or mem.get("project", {}).get("name") or "project"),
             "arch",
             "review",

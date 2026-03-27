@@ -75,11 +75,17 @@ class MiniverseBridge:
         }
         self._post("/api/act", payload)
 
-    def message_agent(self, to: str, message: str):
-        """Send a direct message to another agent (delivered to inbox)."""
+    def message_agent(self, to: str, message: str, from_route: str | None = None, to_route: str | None = None):
+        """Send a direct message to another agent (delivered to inbox) with optional hierarchical routing."""
         payload = {
             "agent": self.agent_id,
-            "action": {"type": "message", "to": to, "message": message},
+            "action": {
+                "type": "message", 
+                "to": to, 
+                "message": message,
+                "from_route": from_route or f"/root/worker/{self.agent_id}",
+                "to_route": to_route or f"/root/worker/{to}"
+            },
         }
         self._post("/api/act", payload)
 

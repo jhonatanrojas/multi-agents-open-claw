@@ -47,10 +47,12 @@
 
 Cambia los modelos sin reiniciar el código con `PUT /api/models` o editando `models_config.json`.
 
-## Design Notes
+## Arquitectura Híbrida
 
-- [Arquitectura híbrida objetivo y fases de implementación](docs/hybrid-openclaw-architecture-phases.md)
-- Este documento explica los problemas del esquema custom actual, cómo se corrigen con la arquitectura híbrida y en qué fases conviene migrar.
+El orquestador (`orchestrator.py`) ahora opera en un esquema híbrido apoyándose 100% en el **OpenClaw SDK**, lo que ha permitido delegar responsabilidades y mantener un núcleo ágil (≤ 1800 líneas):
+- **Gestión Nativa de Sesiones**: Se utilizan `session_id`, delegando al SDK la persistencia y proveyendo mecanismos nativos como `failure_kind` para la gestión de errores (Network, Blocked, Format, etc.).
+- **Workspace Aislado (Fase 3)**: Antes de integrar o hacer commits, el output de los agentes se filtra a través de `validate_project_structure()`, previniendo escrituras maliciosas o desordenadas fuera del directorio canónico.
+- [Análisis y bitácora del Refactor Híbrido](docs/hybrid-openclaw-architecture-phases.md)
 
 ---
 
@@ -287,7 +289,9 @@ main()
  ├── bootstrap_repository()      ← clona, inicializa o usa repo existente
  ├── Phase 2: execution loop
  │     ├── relay_team_messages() ← drena inboxes Miniverse (dedup)
- │     ├── asyncio.gather(N×BYTE + M×PIXEL)  ← paralelo configurable
+ │     ├── asyncio.gather(N×BYTE + M×PIXEL)  ← ejecuta tareas en paralelo
+ │     │     ├── agent.execute(session_id)   ← OpenClaw SDK nativo (con failure_kind)
+ │     │     └── validate_project_structure()← previene escapes de rutas
  │     └── commit_task_output()  ← git add -A + git commit por tarea
  └── Phase 3: final_review()
        ├── ARCH genera DELIVERY.md
@@ -312,6 +316,19 @@ Cada agente envía heartbeats cada 30 segundos:
 | Any    | `error`    | Indicador rojo               |
 
 Los agentes también se envían **mensajes directos** a través de `/api/act` (type: `message`). Los mensajes duplicados se descartan automáticamente.
+
+---
+
+## Comunicación Bidireccional y Control del Agente Principal
+
+El agente por defecto de OpenClaw (el trabajador *worker*) cuenta con una herramienta integrada en `scripts/default_agent_tools.py` que le permite interactuar directamente con la red de multiagentes (ARCH, BYTE, PIXEL) y supervisar la salud del coordinador. Las funciones principales incluyen:
+
+- **Monitoreo de Estado (`check_orchestrator_state()`)**: Permite consultar qué está haciendo el orquestador en tiempo real.
+- **Enrutamiento Jerárquico (`message_coordinator(content)`)**: El agente local de OpenClaw puede emitir mensajes directos dictando rutas de origen y destino explícitas (ej. `from_route: /root/openclaw/main`, `to_route: /root/worker/arch`). Esto se procesa directamente en la bandeja de entrada (*inbox*) del coordinador para poder recibir instrucciones o contexto de vuelta.
+- **Reporte de Fallos Autónomo (`report_multiagent_failure_telegram(message)`)**: Si los subagentes fallan catastróficamente, el trabajador primario está habilitado para alertar al desarrollador humano vía Telegram despachando un POST a `/api/alerts/telegram`.
+- **Reinicio Activo (`force_restart_processes()`)**: En caso de colapso por archivos `.lock` obsoletos o bloqueos, el agente trabajador puede limpiar todo y forzar la reanudación del proceso orquestador.
+
+Esta integración le otorga nivel de control al agente primario (trabajador principal) como un supervisor externo que tiene su propia línea de vida independiente.
 
 ---
 
