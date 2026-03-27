@@ -29,7 +29,9 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 DEFAULT_MEMORY: dict[str, Any] = {
-    "schema_version": "2.0",
+    "schema_version": "3.0",  # Nuevo schema con estado por proyecto
+    # Proyecto activo (solo uno a la vez)
+    "active_project_id": None,
     "project": {
         "id": None,
         "name": None,
@@ -64,14 +66,20 @@ DEFAULT_MEMORY: dict[str, Any] = {
         "byte": {"status": "idle", "current_task": None, "last_seen": None},
         "pixel": {"status": "idle", "current_task": None, "last_seen": None},
     },
+    # Proyectos archivados (máximo 10)
+    "archived_projects": [],
+    # Historial de proyectos entregados
+    "projects": [],
+    # Sistema y diagnóstico
     "blockers": [],
     "proposals": [],
     "milestones": [],
-    "projects": [],
     "files_produced": [],
     "progress_files": [],
     "messages": [],
     "log": [],
+    # Configuración de modelos con estado
+    "model_status": {},
 }
 
 _MEMORY_LOCK = threading.RLock()
@@ -243,3 +251,140 @@ def save_memory(data: dict[str, Any]) -> dict[str, Any]:
 def ensure_memory_file() -> dict[str, Any]:
     """Ensure the shared memory file exists and is normalized."""
     return save_memory(load_memory())
+
+
+# ---------------------------------------------------------------------------
+# Funciones para gestión de proyectos múltiples (Tarea 1.1)
+# ---------------------------------------------------------------------------
+
+MAX_ARCHIVED_PROJECTS = 10
+
+
+def archive_current_project(mem: dict[str, Any]) -> dict[str, Any]:
+    """
+    Archivar el proyecto actual si existe y está entregado.
+    
+    Mueve el proyecto a archived_projects y limpia el estado activo.
+    """
+    project = mem.get("project", {})
+    project_id = project.get("id")
+    
+    if not project_id:
+        # No hay proyecto activo, nada que archivar
+        return mem
+    
+    # Crear snapshot del proyecto
+    archived = {
+        "id": project_id,
+        "name": project.get("name"),
+        "description": project.get("description"),
+        "status": project.get("status"),
+        "created_at": project.get("created_at"),
+        "updated_at": project.get("updated_at"),
+        "repo_url": project.get("repo_url"),
+        "repo_name": project.get("repo_name"),
+        "task_count": len(mem.get("tasks", [])),
+        "archived_at": utc_now(),
+    }
+    
+    # Añadir a archivados
+    mem.setdefault("archived_projects", [])
+    mem["archived_projects"].append(archived)
+    
+    # Mantener solo los últimos MAX_ARCHIVED_PROJECTS
+    if len(mem["archived_projects"]) > MAX_ARCHIVED_PROJECTS:
+        mem["archived_projects"] = mem["archived_projects"][-MAX_ARCHIVED_PROJECTS:]
+    
+    return mem
+
+
+def start_fresh_project(mem: dict[str, Any], brief: str) -> dict[str, Any]:
+    """
+    Iniciar un proyecto completamente nuevo.
+    
+    Archiva el proyecto anterior si existe y limpia todas las tareas.
+    """
+    from datetime import datetime
+    
+    # Archivar proyecto anterior si existe
+    if mem.get("project", {}).get("id"):
+        mem = archive_current_project(mem)
+    
+    # Generar nuevo ID de proyecto
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    slug = "".join(c if c.isalnum() else "-" for c in brief[:30]).strip("-")
+    new_id = f"{slug}-{timestamp}"
+    
+    # Resetear estado del proyecto
+    mem["active_project_id"] = new_id
+    mem["project"] = {
+        "id": new_id,
+        "name": None,
+        "description": brief,
+        "tech_stack": {},
+        "output_dir": "./output",
+        "repo_url": None,
+        "repo_name": None,
+        "repo_path": None,
+        "branch": None,
+        "bootstrap_status": "idle",
+        "status": "planning",
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "orchestrator": {
+            "status": "starting",
+            "pid": None,
+            "phase": None,
+            "task_id": None,
+            "started_at": utc_now(),
+            "updated_at": utc_now(),
+            "dry_run": False,
+        },
+    }
+    
+    # Limpiar tareas y estado relacionado
+    mem["tasks"] = []
+    mem["plan"] = {"phases": [], "current_phase": None}
+    mem["blockers"] = []
+    mem["files_produced"] = []
+    mem["progress_files"] = []
+    mem["messages"] = []
+    mem["milestones"] = []
+    
+    # Resetear agentes
+    for agent_id in ["arch", "byte", "pixel"]:
+        mem["agents"][agent_id] = {
+            "status": "idle",
+            "current_task": None,
+            "last_seen": None,
+        }
+    
+    return mem
+
+
+def clean_blocked_tasks(mem: dict[str, Any]) -> int:
+    """
+    Mover tareas en in_progress a cancelled.
+    
+    Retorna el número de tareas limpiadas.
+    """
+    cleaned = 0
+    for task in mem.get("tasks", []):
+        if task.get("status") == "in_progress":
+            task["status"] = "cancelled"
+            task["cancelled_reason"] = "new_project_started"
+            task["cancelled_at"] = utc_now()
+            cleaned += 1
+    return cleaned
+
+
+def get_active_project(mem: dict[str, Any]) -> dict[str, Any] | None:
+    """Obtener el proyecto activo o None si no hay."""
+    if mem.get("active_project_id"):
+        return mem.get("project")
+    return None
+
+
+def is_project_active(mem: dict[str, Any]) -> bool:
+    """Verificar si hay un proyecto activo."""
+    return bool(mem.get("active_project_id") and mem.get("project", {}).get("id"))
