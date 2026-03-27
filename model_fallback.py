@@ -328,3 +328,112 @@ def get_models_health_report() -> dict[str, Any]:
     """Obtener reporte de salud de modelos."""
     manager = get_fallback_manager()
     return manager.get_status_report()
+
+
+# ── Persistencia de estado (Tarea 3.3) ────────────────────────────────────────
+
+def save_model_status_cache() -> None:
+    """
+    Guardar estado de modelos a disco.
+    
+    Persiste el estado del circuit breaker para sobrevivir reinicios.
+    """
+    manager = get_fallback_manager()
+    cache_data = {
+        "timestamp": time.time(),
+        "circuit_breaker": {
+            model: {
+                "failures": failures,
+                "last_failure": max(failures) if failures else None,
+            }
+            for model, failures in manager.circuit_breaker._failures.items()
+            if failures
+        },
+        "model_status": {
+            model: {
+                "last_error": status.last_error,
+                "last_error_code": status.last_error_code,
+                "last_error_time": status.last_error_time,
+                "consecutive_failures": status.consecutive_failures,
+                "is_available": status.is_available,
+            }
+            for model, status in manager._model_status.items()
+        },
+    }
+    
+    try:
+        with open(MODEL_STATUS_CACHE_PATH, "w") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception as e:
+        log.warning(f"Could not save model status cache: {e}")
+
+
+def load_model_status_cache() -> None:
+    """
+    Cargar estado de modelos desde disco.
+    
+    Restaura el estado del circuit breaker desde la sesión anterior.
+    """
+    if not MODEL_STATUS_CACHE_PATH.exists():
+        return
+    
+    try:
+        with open(MODEL_STATUS_CACHE_PATH) as f:
+            cache_data = json.load(f)
+        
+        manager = get_fallback_manager()
+        
+        # Restaurar circuit breaker
+        for model, data in cache_data.get("circuit_breaker", {}).items():
+            # Solo restaurar si el fallo fue hace menos de cooldown_seconds
+            last_failure = data.get("last_failure")
+            if last_failure:
+                age = time.time() - last_failure
+                if age < manager.circuit_breaker.cooldown_seconds:
+                    manager.circuit_breaker._failures[model] = [last_failure]
+        
+        # Restaurar model_status
+        for model, data in cache_data.get("model_status", {}).items():
+            if data.get("last_error_time", 0) > time.time() - 3600:  # Solo última hora
+                manager._model_status[model] = ModelStatus(
+                    qualified_name=model,
+                    last_error=data.get("last_error"),
+                    last_error_code=data.get("last_error_code"),
+                    last_error_time=data.get("last_error_time"),
+                    consecutive_failures=data.get("consecutive_failures", 0),
+                    is_available=data.get("is_available", True),
+                )
+        
+        log.info(f"Loaded model status cache from {MODEL_STATUS_CACHE_PATH}")
+        
+    except Exception as e:
+        log.warning(f"Could not load model status cache: {e}")
+
+
+def get_cached_model_status() -> dict[str, Any]:
+    """
+    Obtener estado cacheado de todos los modelos.
+    
+    Returns:
+        Dict con estado de cada modelo y recomendaciones.
+    """
+    manager = get_fallback_manager()
+    report = manager.get_status_report()
+    
+    # Añadir información adicional
+    report["recommendations"] = []
+    
+    for agent_id, chain_info in report.get("models", {}).items():
+        current = chain_info.get("current")
+        available = chain_info.get("available", [])
+        
+        if not available:
+            report["recommendations"].append(
+                f"⚠️ {agent_id}: Todos los modelos en cooldown"
+            )
+        elif current != chain_info.get("chain", [None])[0]:
+            report["recommendations"].append(
+                f"ℹ️ {agent_id}: Usando fallback {current}"
+            )
+    
+    return report
