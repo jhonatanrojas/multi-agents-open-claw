@@ -93,6 +93,50 @@ DEFAULT_TASK_TIMEOUT_SEC = 1800
 DEFAULT_PHASE_TIMEOUT_SEC = 7200
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY_SEC = 2.0
+
+# Prevención de overflow de contexto
+AGENTS_SESSION_DIR = Path("/root/.openclaw/agents")
+MAX_SESSION_SIZE_KB = 100  # Máximo 100KB por sesión para evitar overflow
+MAX_PROMPT_CHARS = 50000  # Máximo 50k chars para prompts (≈12k tokens)
+
+
+def clean_oversized_sessions(agent_id: str = None) -> int:
+    """
+    Limpia sesiones que exceden el tamaño máximo para evitar overflow de contexto.
+    Retorna el número de archivos limpiados.
+    """
+    cleaned = 0
+    agents = [agent_id] if agent_id else AGENT_IDS
+    
+    for agent in agents:
+        sessions_dir = AGENTS_SESSION_DIR / agent / "sessions"
+        if not sessions_dir.exists():
+            continue
+        
+        for session_file in sessions_dir.glob("*.jsonl"):
+            size_kb = session_file.stat().st_size / 1024
+            if size_kb > MAX_SESSION_SIZE_KB:
+                log_event(
+                    f"Limpiando sesión oversize: {session_file.name} ({size_kb:.1f}KB > {MAX_SESSION_SIZE_KB}KB)",
+                    agent, level="warning"
+                )
+                # Crear backup minimal
+                backup = {
+                    "original_file": str(session_file),
+                    "original_size_kb": size_kb,
+                    "cleaned_at": datetime.datetime.utcnow().isoformat(),
+                    "reason": "context_overflow_prevention"
+                }
+                backup_file = session_file.with_suffix(".cleaned.json")
+                with open(backup_file, "w") as f:
+                    json.dump(backup, f)
+                
+                # Eliminar archivo grande
+                session_file.unlink()
+                session_file.with_suffix(".jsonl.lock").unlink(missing_ok=True)
+                cleaned += 1
+    
+    return cleaned
 DEFAULT_DRY_RUN_SUMMARY_FILE = "dry-run-summary.md"
 AGENT_LOG_DIR = LOG_DIR / "agents"
 RESUME_FAILURE_THRESHOLD = 2
@@ -346,18 +390,60 @@ def _append_jsonl_record(record: dict[str, Any]) -> None:
         log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def log_event(message: str, agent: str = "system", level: str = "info", **extra: Any) -> None:
-    """Append a log event to shared memory."""
+def log_event(
+    message: str,
+    agent: str = "system",
+    level: str = "info",
+    category: str | None = None,
+    **extra: Any
+) -> None:
+    """
+    Append a log event to shared memory.
+    
+    Args:
+        message: Log message
+        agent: Agent ID (arch, byte, pixel, system)
+        level: Log level (debug, info, warning, error, critical)
+        category: Optional category for filtering (api_error, task_complete, etc.)
+        **extra: Additional fields to include in the log record
+    
+    Categories disponibles:
+        - api_error: Errores de API (rate limits, auth, etc.)
+        - task_complete: Tarea completada
+        - task_error: Error en tarea
+        - model_fallback: Cambio de modelo por fallback
+        - orchestrator: Eventos del orquestador
+        - review: Eventos de revisión
+        - delivery: Entrega de proyecto
+    """
+    # Validar nivel
+    valid_levels = {"debug", "info", "warning", "error", "critical"}
+    if level not in valid_levels:
+        level = "info"
+    
     record = {
         "ts": utc_now(),
         "agent": agent,
         "level": level,
         "msg": message,
-        **{k: v for k, v in extra.items() if v is not None},
     }
+    
+    # Añadir categoría si se proporciona
+    if category:
+        record["category"] = category
+    
+    # Añadir campos extra
+    if extra:
+        record["details"] = {k: v for k, v in extra.items() if v is not None}
+    
     mem = load_memory()
     mem.setdefault("log", [])
     mem["log"].append(record)
+    
+    # Truncar si excede el máximo
+    if len(mem["log"]) > 500:
+        mem["log"] = mem["log"][-500:]
+    
     mem.setdefault("project", {})
     mem["project"]["updated_at"] = utc_now()
     save_memory(mem)
@@ -1310,6 +1396,12 @@ async def plan_project(
     else:
         if client is None:
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
+        
+        # VALIDACIÓN: Limpiar sesiones oversize antes de ejecutar (prevención de overflow)
+        cleaned = clean_oversized_sessions("arch")
+        if cleaned > 0:
+            log_event(f"Sesiones oversize limpiadas antes de planificación: {cleaned}", "system")
+        
         arch = client.get_agent("arch")
         progress_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
         
@@ -1867,8 +1959,15 @@ async def execute_task(
         task_progress_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
         try:
             result = await _run_agent_task(
-                agent, prompt, session_id, task_progress_cb, agent_id,
-            )
+            agent,
+            prompt,
+            session_id,
+            task_progress_cb,
+            task_timeout_sec,
+            retry_attempts,
+            retry_delay_sec,
+            agent_id,
+        )
         except Exception as exc:
             mark_task_failure(
                 f"error de ejecución del SDK: {exc}",
@@ -2051,6 +2150,12 @@ async def final_review(
     else:
         if client is None:
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
+        
+        # VALIDACIÓN: Limpiar sesiones oversize antes de ejecutar (prevención de overflow)
+        cleaned = clean_oversized_sessions("arch")
+        if cleaned > 0:
+            log_event(f"Sesiones oversize limpiadas antes de planificación: {cleaned}", "system")
+        
         arch = client.get_agent("arch")
         review_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
         review_prompt = truncate_prompt(
