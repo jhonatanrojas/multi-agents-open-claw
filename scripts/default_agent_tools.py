@@ -42,7 +42,7 @@ def message_coordinator(content: str):
         }
     }
     # MINIVERSE_URL
-    miniverse_url = "https://miniverse-public-production.up.railway.app"
+    miniverse_url = "http://127.0.0.1:9999"
     try:
         r = requests.post(f"{miniverse_url}/api/act", json=payload)
         return {"ok": r.ok}

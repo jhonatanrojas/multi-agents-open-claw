@@ -1,28 +1,27 @@
 """
-miniverse_bridge.py
-Miniverse integration for the Dev Squad agents.
-Each agent imports this and calls heartbeat() / speak() / message_agent().
+miniverse_bridge.py - LOCAL MODE (No external Miniverse)
+
+Miniverse integration disabled - uses local communication only.
+Each agent imports this and heartbeat() / speak() / message_agent() are no-ops.
 
 Usage:
     from miniverse_bridge import MiniverseBridge
     bridge = MiniverseBridge(agent_id="arch")
-    bridge.heartbeat("working", "Planning project tasks")
-    bridge.speak("Starting task decomposition...")
-    bridge.message_agent("byte", "TASK:001 TYPE:code ...")
+    bridge.heartbeat("working", "Planning project tasks")  # No-op
+    bridge.speak("Starting task decomposition...")  # No-op
+    bridge.message_agent("byte", "TASK:001 TYPE:code ...")  # Logs only
 """
 
 import os
 import time
 import json
 import threading
-import requests
 from typing import Literal
+from pathlib import Path
 
-MINIVERSE_URL = os.getenv(
-    "MINIVERSE_URL",
-    "https://miniverse-public-production.up.railway.app"   # public world
-    # OR use local: "http://localhost:4321" after `npx create-miniverse`
-)
+# Local mode - no external URL
+MINIVERSE_URL = "local"
+MINIVERSE_ENABLED = os.getenv("MINIVERSE_ENABLED", "false").lower() == "true"
 
 AgentState = Literal["working", "thinking", "speaking", "idle", "sleeping", "error", "offline"]
 
@@ -32,8 +31,17 @@ AGENT_META = {
     "pixel": {"display": "PIXEL 🎨", "role": "Designer"},
 }
 
+# Local log directory for messages
+LOG_DIR = Path("/var/www/openclaw-multi-agents/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
 
 class MiniverseBridge:
+    """
+    Local-only Miniverse bridge.
+    All network calls are replaced with local logging.
+    """
+    
     def __init__(self, agent_id: str, interval: int = 30):
         self.agent_id = agent_id
         self.interval = interval
@@ -41,108 +49,91 @@ class MiniverseBridge:
         self._task = "Standing by"
         self._thread: threading.Thread | None = None
         self._running = False
-
-    # ── Public API ───────────────────────────────────────────────────────────
-
+        
     def start(self):
-        """Start background heartbeat thread."""
+        """Start background heartbeat (local logging only)."""
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        print(f"[miniverse] {self.agent_id} heartbeat started → {MINIVERSE_URL}")
-
+        print(f"[miniverse-local] {self.agent_id} started (local mode)")
+        
     def stop(self):
+        """Stop heartbeat."""
         self._running = False
-        self.heartbeat("offline", "Shutting down")
-
+        self._log("offline", "Shutting down")
+        
     def heartbeat(self, state: AgentState, task: str):
-        """Send a single heartbeat (also updates internal state)."""
+        """Update state locally (no network call)."""
         self._state = state
         self._task = task
-        payload = {
+        self._log(state, task)
+        
+    def speak(self, message: str):
+        """Log speak message locally."""
+        self._log("speaking", message[:80])
+        
+    def message_agent(self, to: str, message: str, from_route: str | None = None, to_route: str | None = None):
+        """Log message to another agent locally."""
+        log_entry = {
+            "timestamp": time.time(),
+            "from": self.agent_id,
+            "to": to,
+            "message": message,
+            "from_route": from_route,
+            "to_route": to_route
+        }
+        self._write_log(f"message_to_{to}", log_entry)
+        print(f"[miniverse-local] {self.agent_id} -> {to}: {message[:50]}...")
+        
+    def _log(self, state: str, task: str):
+        """Write heartbeat to local log."""
+        log_entry = {
+            "timestamp": time.time(),
             "agent": self.agent_id,
             "state": state,
-            "task": task,
+            "task": task
         }
-        self._post("/api/heartbeat", payload)
-
-    def speak(self, message: str):
-        """Show a speech bubble (visible in world, not delivered to inboxes)."""
-        self.heartbeat("speaking", message[:80])
-        payload = {
-            "agent": self.agent_id,
-            "action": {"type": "speak", "message": message},
-        }
-        self._post("/api/act", payload)
-
-    def message_agent(self, to: str, message: str, from_route: str | None = None, to_route: str | None = None):
-        """Send a direct message to another agent (delivered to inbox) with optional hierarchical routing."""
-        payload = {
-            "agent": self.agent_id,
-            "action": {
-                "type": "message", 
-                "to": to, 
-                "message": message,
-                "from_route": from_route or f"/root/worker/{self.agent_id}",
-                "to_route": to_route or f"/root/worker/{to}"
-            },
-        }
-        self._post("/api/act", payload)
-
-    def check_inbox(self) -> list[dict]:
-        """Drain and return messages from this agent's inbox."""
+        self._write_log("heartbeat", log_entry)
+        
+    def _write_log(self, log_type: str, data: dict):
+        """Write to local JSONL log file."""
+        log_file = LOG_DIR / f"{self.agent_id}_local.jsonl"
         try:
-            r = requests.get(
-                f"{MINIVERSE_URL}/api/inbox",
-                params={"agent": self.agent_id},
-                timeout=5,
-            )
-            r.raise_for_status()
-            return r.json().get("messages", [])
+            with open(log_file, "a") as f:
+                f.write(json.dumps(data) + "\n")
         except Exception as e:
-            print(f"[miniverse] inbox error: {e}")
-            return []
-
-    def list_agents(self) -> list[dict]:
-        """Return list of all online agents in the world."""
+            print(f"[miniverse-local] Log error: {e}")
+            
+    def get_inbox(self) -> list:
+        """Check local inbox (no network call)."""
+        inbox_file = LOG_DIR / f"{self.agent_id}_inbox.jsonl"
+        messages = []
         try:
-            r = requests.get(f"{MINIVERSE_URL}/api/agents", timeout=5)
-            r.raise_for_status()
-            return r.json().get("agents", [])
+            if inbox_file.exists():
+                with open(inbox_file, "r") as f:
+                    for line in f:
+                        if line.strip():
+                            messages.append(json.loads(line))
+                # Clear inbox after reading
+                inbox_file.unlink(missing_ok=True)
         except Exception as e:
-            print(f"[miniverse] list_agents error: {e}")
-            return []
+            print(f"[miniverse-local] Inbox error: {e}")
+        return messages
 
-    # ── Internal ─────────────────────────────────────────────────────────────
+    def check_inbox(self) -> list:
+        """Alias for get_inbox() for compatibility with orchestrator."""
+        return self.get_inbox()
 
-    def _loop(self):
-        while self._running:
-            self._post("/api/heartbeat", {
-                "agent": self.agent_id,
-                "state": self._state,
-                "task": self._task,
-            })
-            time.sleep(self.interval)
-
-    def _post(self, path: str, payload: dict):
-        try:
-            r = requests.post(
-                f"{MINIVERSE_URL}{path}",
-                json=payload,
-                timeout=5,
-            )
-            r.raise_for_status()
-        except Exception as e:
-            print(f"[miniverse] POST {path} error: {e}")
-
-
-# ── Convenience singleton factory ─────────────────────────────────────────────
-
-_bridges: dict[str, MiniverseBridge] = {}
 
 def get_bridge(agent_id: str) -> MiniverseBridge:
-    if agent_id not in _bridges:
-        b = MiniverseBridge(agent_id)
-        b.start()
-        _bridges[agent_id] = b
-    return _bridges[agent_id]
+    """Get a MiniverseBridge instance for the given agent."""
+    return MiniverseBridge(agent_id)
+
+
+# Convenience functions for direct import
+_bridge_cache: dict[str, MiniverseBridge] = {}
+
+
+def get_bridge_cached(agent_id: str) -> MiniverseBridge:
+    """Get or create a cached MiniverseBridge instance."""
+    if agent_id not in _bridge_cache:
+        _bridge_cache[agent_id] = MiniverseBridge(agent_id)
+    return _bridge_cache[agent_id]

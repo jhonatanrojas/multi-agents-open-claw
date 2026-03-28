@@ -8,13 +8,15 @@ agents:
     - id: "arch"
       name: "ARCH - Coordinator"
       workspace: "./workspaces/coordinator"
-      model: "nvidia/z-ai/glm5"          # override: ARCH_MODEL env var
+      model: "nvidia/z-ai/glm5"
+      # override: ARCH_MODEL env var
       agentDir: "~/.openclaw/agents/arch"
 
     - id: "byte"
       name: "BYTE - Programmer"
       workspace: "./workspaces/programmer"
-      model: "nvidia/moonshotai/kimi-k2.5"   # fallback: deepseek/deepseek-chat
+      model: "nvidia/moonshotai/kimi-k2.5"
+      # fallback: deepseek/deepseek-chat
       agentDir: "~/.openclaw/agents/byte"
 
     - id: "pixel"
@@ -22,6 +24,13 @@ agents:
       workspace: "./workspaces/designer"
       model: "deepseek/deepseek-chat"
       agentDir: "~/.openclaw/agents/pixel"
+
+    - id: "judge"
+      name: "JUDGE - Reviewer"
+      workspace: "./workspaces/reviewer"
+      model: "deepseek/deepseek-chat"
+      # JUDGE is read-only, spawned for quality review
+      agentDir: "~/.openclaw/agents/judge"
 
 ## Shared memory - all agents mount the same directory
 sharedMemory:

@@ -1,57 +1,126 @@
 # Dev Squad — Multi-Agent Programming Team with OpenClaw + Miniverse
 
-> **ARCH** (Coordinator) → **BYTE** (Programmer) + **PIXEL** (Designer)
-> Tres agentes especializados comparten una memoria, ejecutan proyectos completos y se visualizan en el mundo pixel de Miniverse.
+> **ARCH** (Coordinator) → **BYTE** (Programmer) + **PIXEL** (Designer) + **JUDGE** (Reviewer)
+> Cuatro agentes especializados comparten una memoria, ejecutan proyectos completos y se visualizan en el mundo pixel de Miniverse.
 
 **OpenClaw versión soportada:** `2026.3.23-2`
+
+---
+
+## 🆕 Architecture v2 — Nuevas Características
+
+La versión 2 del architecture introduce mejoras significativas en coordinación, calidad y control humano:
+
+### 1. Contexto Narrativo Compartido
+Todos los agentes leen `shared/CONTEXT.md` y `shared/CONTRACTS.md` antes de iniciar cualquier tarea. Si una interfaz no está definida, el agente se detiene y notifica a ARCH.
+
+### 2. Análisis de Zonas de Conflicto
+Antes de spawnear tareas en paralelo, ARCH realiza un análisis sistemático de conflictos potenciales:
+- Rutas de archivos
+- Endpoints de API
+- Tipos TypeScript
+- Tokens CSS
+
+Cada tarea tiene `parallel_safe` y `parallel_safe_reason` documentados.
+
+### 3. Detección de Estancamientos
+El heartbeat de ARCH monitorea tareas estancadas (>90 segundos sin actualización):
+- 90-180s: Envía mensaje steer con pista
+- >180s: Mata y re-spawnea con descomposición
+
+### 4. Memoria Institucional por Agente
+BYTE y PIXEL mantienen archivos `MEMORY.md` con conocimiento acumulado:
+- **BYTE**: Patrones Arquitectónicos, Errores Conocidos, Preferencias de Stack
+- **PIXEL**: Sistema de Diseño, Patrones de Accesibilidad, Biblioteca de Componentes
+
+### 5. Planes Adaptativos Versionados
+`MEMORY.json` ahora rastrea:
+- `plan_version`: Incrementado en cada cambio de alcance
+- `plan_history`: Auditoría completa de cambios
+- `scope_change_reason`: Documentación por tarea
+
+### 6. Agente JUDGE (Revisor de Calidad)
+Separación de autoridad entre planificación y aprobación:
+- Acceso solo lectura, nunca escribe código
+- Veredicto binario: `APPROVED` o `REJECTED: <razón>`
+- Evalúa: criterios de aceptación, consistencia, contratos, defectos obvios
+
+### 7. Controles de Intervención Humana
+Dashboard API para control activo del operador:
+- `POST /api/agents/{agent_id}/steer` — Envía guía a agente activo
+- `POST /api/tasks/{task_id}/pause` — Pausa tarea para revisión
+- `PATCH /api/context` — Actualiza contexto compartido con versionado
 
 ---
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                      orchestrator.py                      │
-│   asyncio pipeline · lockfile · recovery · gateway check  │
-└────────┬───────────────────┬──────────────────────────────┘
-         │                   │
-    ┌────▼─────┐        ┌────▼────────┐
-    │   ARCH   │        │ Dashboard   │
-    │ GLM-5    │        │   API       │
-    └────┬─────┘        └──┬──────────┘
-         │ assign          │ SSE / WebSocket
-    ┌────▼─────┐   ┌───────▼──────────┐
-    │   BYTE   │   │      PIXEL       │
-    │ Kimi-K2.5│   │  DeepSeek Chat   │
-    └────┬─────┘   └──────┬───────────┘
-         │                │
-    ┌────▼────────────────▼───────┐
-    │       shared/MEMORY.json    │  ← bus de estado compartido
-    │  file-locked · truncating   │
-    └────────────────────────────-┘
-         │                │
-    ┌────▼────────────────▼───────┐
-    │    Miniverse Pixel World    │  ← visualización en tiempo real
-    └─────────────────────────────┘
+                    ┌─────────────────────────────────────┐
+                    │         HUMAN OPERATOR              │
+                    │    (Dashboard Intervention UI)      │
+                    └──────────────┬──────────────────────┘
+                                   │
+                                   │ steer / pause / context
+                                   ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                          ARCH (Coordinator)                       │
+│  - Pre-Spawn Conflict Analysis                                     │
+│  - Task State Tracking with last_updated                          │
+│  - Phase Retrospective Protocol                                   │
+│  - Mandatory Review Gate                                          │
+│  - Heartbeat Stall Detection                                      │
+└────────┬─────────────────────────────────────────┬───────────────┘
+         │                                         │
+         │ spawn                                   │ spawn
+         ▼                                         ▼
+┌────────────────────────┐               ┌────────────────────────┐
+│   BYTE (Programmer)    │               │   PIXEL (Designer)     │
+│ - Pre-Task Protocol    │               │ - Pre-Task Protocol    │
+│ - Long-Term Memory     │◄─────────────►│ - Long-Term Memory     │
+│ - Progress tracking    │  collaborate  │ - WCAG compliance      │
+└────────────────────────┘               └────────────────────────┘
+         │                                         │
+         │ done                                    │ done
+         ▼                                         ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    JUDGE (Reviewer)                               │
+│  - Read-only evaluation                                          │
+│  - Binary verdict: APPROVED / REJECTED                          │
+│  - 4 dimensions: criteria, consistency, contracts, defects      │
+└──────────────────────────────────────────────────────────────────┘
+         │
+         │ APPROVED
+         ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    MEMORY.json                                    │
+│  - plan_version, plan_history                                    │
+│  - Task status: pending → in_progress → done                     │
+│  - blockers[], messages[], milestones[]                          │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Modelos por agente
 
-| Agente | Rol         | Modelo primario               | Fallback               |
+| Agente | Rol | Modelo primario | Fallback |
 |--------|-------------|-------------------------------|------------------------|
-| ARCH   | Coordinator | `nvidia/z-ai/glm5`            | —                      |
-| BYTE   | Programmer  | `nvidia/moonshotai/kimi-k2.5` | `deepseek/deepseek-chat` |
-| PIXEL  | Designer    | `deepseek/deepseek-chat`      | —                      |
+| ARCH | Coordinator | `nvidia/z-ai/glm5` | — |
+| BYTE | Programmer | `nvidia/moonshotai/kimi-k2.5` | `deepseek/deepseek-chat` |
+| PIXEL | Designer | `deepseek/deepseek-chat` | — |
+| JUDGE | Reviewer | `deepseek/deepseek-chat` | — |
 
 Cambia los modelos sin reiniciar el código con `PUT /api/models` o editando `models_config.json`.
 
+---
+
 ## Arquitectura Híbrida
 
-El orquestador (`orchestrator.py`) ahora opera en un esquema híbrido apoyándose 100% en el **OpenClaw SDK**, lo que ha permitido delegar responsabilidades y mantener un núcleo ágil (≤ 1800 líneas):
-- **Gestión Nativa de Sesiones**: Se utilizan `session_id`, delegando al SDK la persistencia y proveyendo mecanismos nativos como `failure_kind` para la gestión de errores (Network, Blocked, Format, etc.).
-- **Workspace Aislado (Fase 3)**: Antes de integrar o hacer commits, el output de los agentes se filtra a través de `validate_project_structure()`, previniendo escrituras maliciosas o desordenadas fuera del directorio canónico.
+El orquestador (`orchestrator.py`) opera en un esquema híbrido apoyándose 100% en el **OpenClaw SDK**:
+
+- **Gestión Nativa de Sesiones**: Se utilizan `session_id`, delegando al SDK la persistencia y proveyendo mecanismos nativos como `failure_kind` para la gestión de errores.
+- **Workspace Aislado**: Antes de integrar o hacer commits, el output de los agentes se filtra a través de `validate_project_structure()`, previniendo escrituras maliciosas.
 - [Análisis y bitácora del Refactor Híbrido](docs/hybrid-openclaw-architecture-phases.md)
 
 ---
@@ -62,6 +131,7 @@ El orquestador (`orchestrator.py`) ahora opera en un esquema híbrido apoyándos
 ```bash
 # macOS / Linux
 curl -fsSL https://get.openclaw.ai | sh
+
 # o via npm:
 npm install -g openclaw
 openclaw onboard
@@ -80,22 +150,22 @@ mkdir -p logs output
 ```bash
 cp .env.example .env
 # Editar .env con tus valores reales
-source .env   # o usa un gestor como direnv
+source .env
 ```
 
 Variables clave:
 
-| Variable              | Valor ejemplo                  | Descripción                        |
+| Variable | Valor ejemplo | Descripción |
 |-----------------------|--------------------------------|------------------------------------|
-| `DASHBOARD_API_KEY`   | `dev-squad-api-key-2026`       | Protege todos los endpoints del API |
-| `TELEGRAM_BOT_TOKEN`  | `123456:ABC-...`               | Notificaciones (opcional)          |
-| `TELEGRAM_CHAT_ID`    | `-100123456789`                | Chat destino de Telegram           |
-| `MINIVERSE_URL`       | `http://localhost:4321`        | Mundo pixel local o público        |
-| `GIT_AUTHOR_NAME`     | `OpenClaw`                     | Identidad para git commits         |
-| `GIT_AUTHOR_EMAIL`    | `openclaw@example.com`         | Email para git commits             |
-| `ARCH_MODEL`          | `nvidia/z-ai/glm5`             | Override de modelo ARCH            |
-| `BYTE_MODEL`          | `nvidia/moonshotai/kimi-k2.5`  | Override de modelo BYTE            |
-| `PIXEL_MODEL`         | `deepseek/deepseek-chat`       | Override de modelo PIXEL           |
+| `DASHBOARD_API_KEY` | `dev-squad-api-key-2026` | Protege todos los endpoints del API |
+| `TELEGRAM_BOT_TOKEN` | `123456:ABC-...` | Notificaciones (opcional) |
+| `TELEGRAM_CHAT_ID` | `-100123456789` | Chat destino de Telegram |
+| `MINIVERSE_URL` | `http://localhost:4321` | Mundo pixel local o público |
+| `GIT_AUTHOR_NAME` | `OpenClaw` | Identidad para git commits |
+| `GIT_AUTHOR_EMAIL` | `openclaw@example.com` | Email para git commits |
+| `ARCH_MODEL` | `nvidia/z-ai/glm5` | Override de modelo ARCH |
+| `BYTE_MODEL` | `nvidia/moonshotai/kimi-k2.5` | Override de modelo BYTE |
+| `PIXEL_MODEL` | `deepseek/deepseek-chat` | Override de modelo PIXEL |
 
 ### 4. Configurar el Gateway de OpenClaw
 ```bash
@@ -104,7 +174,7 @@ cp config/gateway.yml ~/.openclaw/gateway.yml
 openclaw start
 ```
 
-### 5. Miniverse (opcional — o usar el mundo público)
+### 5. Miniverse (opcional)
 ```bash
 npx create-miniverse
 cd my-miniverse && npm run dev
@@ -123,105 +193,51 @@ python orchestrator.py --allow-init-repo \
   "Construye una app de clima con frontend React y backend FastAPI"
 ```
 
-Con opciones avanzadas:
-```bash
-python orchestrator.py \
-  --repo-url https://github.com/tu-usuario/repo.git \
-  --branch codex/feature \
-  --max-parallel-byte 2 \
-  --max-parallel-pixel 1 \
-  --webhook-url https://ci.ejemplo.com/hooks/devsquad \
-  "Descripción del proyecto..."
-```
-
 ---
 
 ## CLI — Referencia de argumentos
 
-| Argumento              | Default  | Descripción                                              |
+| Argumento | Default | Descripción |
 |------------------------|----------|----------------------------------------------------------|
-| `brief`                | —        | Descripción del proyecto (posicional, requerido)        |
-| `--repo-url`           | —        | URL de repositorio a clonar                              |
-| `--repo-name`          | —        | Nombre del repo local                                    |
-| `--branch`             | auto     | Rama a crear o usar                                      |
-| `--allow-init-repo`    | false    | Inicializar git local si no hay URL                     |
-| `--dry-run`            | false    | Probar orquestación sin llamar a OpenClaw               |
-| `--task-timeout-sec`   | 1800     | Timeout por tarea (segundos)                            |
-| `--phase-timeout-sec`  | 7200     | Timeout por fase (segundos)                             |
-| `--retry-attempts`     | 3        | Reintentos por agente                                   |
-| `--retry-delay-sec`    | 2.0      | Delay inicial entre reintentos                          |
-| `--max-parallel-byte`  | 1        | Tareas BYTE en paralelo por ronda                       |
-| `--max-parallel-pixel` | 1        | Tareas PIXEL en paralelo por ronda                      |
-| `--webhook-url`        | —        | URL que recibe POST JSON al entregar el proyecto        |
+| `brief` | — | Descripción del proyecto (posicional, requerido) |
+| `--repo-url` | — | URL de repositorio a clonar |
+| `--repo-name` | — | Nombre del repo local |
+| `--branch` | auto | Rama a crear o usar |
+| `--allow-init-repo` | false | Inicializar git local si no hay URL |
+| `--dry-run` | false | Probar orquestación sin llamar a OpenClaw |
+| `--task-timeout-sec` | 1800 | Timeout por tarea (segundos) |
+| `--phase-timeout-sec` | 7200 | Timeout por fase (segundos) |
+| `--retry-attempts` | 3 | Reintentos por agente |
+| `--retry-delay-sec` | 2.0 | Delay inicial entre reintentos |
+| `--max-parallel-byte` | 1 | Tareas BYTE en paralelo por ronda |
+| `--max-parallel-pixel` | 1 | Tareas PIXEL en paralelo por ronda |
+| `--webhook-url` | — | URL que recibe POST JSON al entregar el proyecto |
 
 ---
 
 ## Dashboard API — Endpoints
 
-El dashboard API escucha en `http://127.0.0.1:8001`.
-Todos los endpoints excepto `/health` y `/api/health` requieren el header:
+El dashboard API escucha en `http://127.0.0.1:8001`. Todos los endpoints excepto `/health` y `/api/health` requieren el header:
 
 ```
 X-API-Key: <valor de DASHBOARD_API_KEY>
 ```
 
-| Método | Ruta                | Descripción                                         |
+| Método | Ruta | Descripción |
 |--------|---------------------|-----------------------------------------------------|
-| GET    | `/health`           | Health check público (no requiere auth)             |
-| GET    | `/api/health`       | Alias de `/health`                                  |
-| GET    | `/api/state`        | Snapshot completo de `MEMORY.json`                  |
-| GET    | `/api/stream`       | SSE — actualizaciones cada 2 s con keepalive        |
-| WS     | `/ws/state`         | WebSocket — push a ~1 s (preferido sobre SSE)       |
-| GET    | `/api/logs`         | Últimas 100 entradas de log (memoria + JSONL)       |
-| GET    | `/api/agents/world` | Proxy al listado de agentes en Miniverse            |
-| POST   | `/api/project/start`| Lanzar nuevo proyecto (spawnea orchestrator)        |
-| GET    | `/api/models`       | Ver configuración de modelos actual                 |
-| PUT    | `/api/models`       | Actualizar modelo de un agente (sin reiniciar)      |
-
-### Ejemplo: lanzar proyecto vía API
-```bash
-curl -X POST http://127.0.0.1:8001/api/project/start \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-squad-api-key-2026" \
-  -d '{
-    "brief": "Construye una API REST de tareas con FastAPI y SQLite",
-    "allow_init_repo": true,
-    "max_parallel_byte": 2,
-    "dry_run": false
-  }'
-```
-
-### Ejemplo: cambiar modelo de BYTE
-```bash
-curl -X PUT http://127.0.0.1:8001/api/models \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-squad-api-key-2026" \
-  -d '{"byte": "deepseek/deepseek-chat"}'
-```
-
----
-
-## Producción con systemd
-
-El repo incluye servicios listos para VPS en `deploy/systemd/`:
-
-```bash
-sudo bash scripts/install_systemd.sh /var/www/openclaw-multi-agents
-sudo systemctl start openclaw-multiagent
-sudo systemctl start openclaw-dashboard
-sudo systemctl status openclaw-multiagent --no-pager
-sudo systemctl status openclaw-dashboard --no-pager
-```
-
-El archivo de entorno compartido es `/etc/default/openclaw-multiagent`.
-Agrega ahí `DASHBOARD_API_KEY`, `TELEGRAM_BOT_TOKEN`, etc.
-
-Health check desde CLI:
-```bash
-python scripts/check_health.py --url http://127.0.0.1:8001/health
-journalctl -u openclaw-multiagent -f
-journalctl -u openclaw-dashboard -f
-```
+| GET | `/health` | Health check público (no requiere auth) |
+| GET | `/api/health` | Alias de `/health` |
+| GET | `/api/state` | Snapshot completo de `MEMORY.json` |
+| GET | `/api/stream` | SSE — actualizaciones cada 2 s con keepalive |
+| WS | `/ws/state` | WebSocket — push a ~1 s (preferido sobre SSE) |
+| GET | `/api/logs` | Últimas 100 entradas de log |
+| GET | `/api/agents/world` | Proxy al listado de agentes en Miniverse |
+| POST | `/api/project/start`| Lanzar nuevo proyecto |
+| GET | `/api/models` | Ver configuración de modelos actual |
+| PUT | `/api/models` | Actualizar modelo de un agente |
+| POST | `/api/agents/{id}/steer` | 🆕 Enviar guía a agente activo |
+| POST | `/api/tasks/{id}/pause` | 🆕 Pausar tarea para revisión |
+| PATCH | `/api/context` | 🆕 Actualizar contexto compartido |
 
 ---
 
@@ -229,31 +245,45 @@ journalctl -u openclaw-dashboard -f
 
 ```
 dev-squad/
-├── orchestrator.py            ← Punto de entrada principal
-├── coordination.py            ← Bootstrap de repos, skills, git commit
-├── shared_state.py            ← Memoria compartida (file-locked, truncante)
-├── dashboard_api.py           ← FastAPI: SSE + WebSocket + REST
-├── miniverse_bridge.py        ← Bridge HTTP a Miniverse
-├── DevSquadDashboard.jsx      ← Dashboard React (SSE + WebSocket)
-├── gateway.yml                ← Config OpenClaw (raíz)
-├── models_config.json         ← Modelos por agente (editable en runtime)
-├── .env.example               ← Variables de entorno documentadas
+├── orchestrator.py              ← Punto de entrada principal
+├── coordination.py              ← Bootstrap de repos, skills, git commit
+├── shared_state.py              ← Memoria compartida (file-locked)
+├── dashboard_api.py             ← FastAPI: SSE + WebSocket + REST
+├── miniverse_bridge.py          ← Bridge HTTP a Miniverse
+├── DevSquadDashboard.jsx        ← Dashboard React
+├── gateway.yml                  ← Config OpenClaw (raíz)
+├── models_config.json           ← Modelos por agente
+├── .env.example                 ← Variables de entorno documentadas
 ├── requirements.txt
 │
 ├── workspaces/
-│   ├── coordinator/SOUL.md    ← Identidad e instrucciones de ARCH
-│   ├── programmer/SOUL.md     ← Identidad e instrucciones de BYTE
-│   └── designer/SOUL.md       ← Identidad e instrucciones de PIXEL
+│   ├── coordinator/
+│   │   ├── SOUL.md              ← Identidad de ARCH
+│   │   └── HEARTBEAT.md         ← 🆕 Stall detection standing order
+│   ├── programmer/
+│   │   ├── SOUL.md              ← Identidad de BYTE
+│   │   └── MEMORY.md            ← 🆕 Long-term knowledge store
+│   ├── designer/
+│   │   ├── SOUL.md              ← Identidad de PIXEL
+│   │   └── MEMORY.md            ← 🆕 Long-term knowledge store
+│   └── reviewer/
+│       └── SOUL.md              ← 🆕 Identidad de JUDGE
 │
 ├── skills/
-│   ├── miniverse-bridge/      ← Skill de heartbeat Miniverse
-│   └── stack-router/          ← Skill de routing por stack tecnológico
+│   ├── miniverse-bridge/        ← Skill de heartbeat Miniverse
+│   └── stack-router/            ← Skill de routing por stack
 │
 ├── config/
-│   └── gateway.yml            ← Config OpenClaw (copia para ~/.openclaw/)
+│   └── gateway.yml              ← Config OpenClaw
 │
 ├── shared/
-│   └── MEMORY.json            ← Estado compartido (todos los agentes)
+│   ├── MEMORY.json              ← Estado compartido
+│   ├── CONTEXT.md               ← 🆕 Project context for all agents
+│   └── CONTRACTS.md             ← 🆕 Interface contracts and schemas
+│
+├── dashboard/
+│   ├── dashboard_api.py         ← 🆕 Human intervention API
+│   └── UI_SPEC.md               ← 🆕 UI component specifications
 │
 ├── deploy/
 │   ├── systemd/
@@ -263,16 +293,13 @@ dev-squad/
 │       └── openclaw-dashboard.conf
 │
 ├── scripts/
-│   ├── check_health.py        ← Health check CLI
-│   └── install_systemd.sh     ← Instalador de servicios systemd
+│   ├── check_health.py          ← Health check CLI
+│   └── install_systemd.sh       ← Instalador de servicios systemd
 │
-├── prompts/
-│   └── orchestrator-systemd-phases.md  ← Guía de despliegue en VPS
-│
-├── output/                    ← Código y archivos generados
+├── output/                      ← Código y archivos generados
 └── logs/
-    ├── orchestrator.log       ← Stdout del orquestador
-    └── orchestrator.jsonl     ← Logs estructurados (JSON Lines)
+    ├── orchestrator.log         ← Stdout del orquestador
+    └── orchestrator.jsonl       ← Logs estructurados (JSON Lines)
 ```
 
 ---
@@ -281,22 +308,37 @@ dev-squad/
 
 ```
 main()
- ├── acquire_run_lock()          ← previene instancias duplicadas
- ├── task recovery               ← resetea in_progress → pending al arrancar
- ├── _check_gateway_health()     ← verifica gateway antes de consumir tokens
- ├── Phase 1: plan_project()
- │     └── ARCH genera plan JSON con fases y tareas
- ├── bootstrap_repository()      ← clona, inicializa o usa repo existente
- ├── Phase 2: execution loop
- │     ├── relay_team_messages() ← drena inboxes Miniverse (dedup)
- │     ├── asyncio.gather(N×BYTE + M×PIXEL)  ← ejecuta tareas en paralelo
- │     │     ├── agent.execute(session_id)   ← OpenClaw SDK nativo (con failure_kind)
- │     │     └── validate_project_structure()← previene escapes de rutas
- │     └── commit_task_output()  ← git add -A + git commit por tarea
- └── Phase 3: final_review()
-       ├── ARCH genera DELIVERY.md
-       ├── Telegram notification
-       └── POST webhook-url (si configurado)
+├── acquire_run_lock()           ← previene instancias duplicadas
+├── task recovery                ← resetea in_progress → pending
+├── _check_gateway_health()      ← verifica gateway
+│
+├── Phase 1: plan_project()
+│   └── ARCH genera plan JSON con fases y tareas
+│
+├── bootstrap_repository()       ← clona o inicializa repo
+│
+├── Phase 2: execution loop
+│   ├── relay_team_messages()    ← drena inboxes Miniverse
+│   ├── asyncio.gather(N×BYTE + M×PIXEL)
+│   │   ├── agent.execute(session_id)
+│   │   └── validate_project_structure()
+│   ├── 🆕 Pre-Spawn Conflict Check
+│   ├── 🆕 Task state tracking with last_updated
+│   └── commit_task_output()     ← git add -A + git commit
+│
+├── 🆕 Phase Retrospective
+│   ├── Read all produced files
+│   ├── Compare against original tasks
+│   ├── Identify discoveries affecting pending tasks
+│   └── Update plan_version if needed
+│
+├── 🆕 Mandatory Review Gate
+│   └── Spawn JUDGE for quality review
+│
+└── Phase 3: final_review()
+    ├── ARCH genera DELIVERY.md
+    ├── Telegram notification
+    └── POST webhook-url
 ```
 
 ---
@@ -305,40 +347,26 @@ main()
 
 Cada agente envía heartbeats cada 30 segundos:
 
-| Agente | Estado      | Comportamiento en Miniverse |
+| Agente | Estado | Comportamiento en Miniverse |
 |--------|------------|------------------------------|
-| ARCH   | `thinking` | Burbuja de pensamiento 💭    |
-| ARCH   | `working`  | Camina al escritorio y teclea |
-| BYTE   | `working`  | Camina al escritorio y teclea |
-| PIXEL  | `working`  | Camina al escritorio y teclea |
-| Any    | `speaking` | Burbuja de diálogo 💬        |
-| Any    | `idle`     | Deambula                     |
-| Any    | `error`    | Indicador rojo               |
-
-Los agentes también se envían **mensajes directos** a través de `/api/act` (type: `message`). Los mensajes duplicados se descartan automáticamente.
-
----
-
-## Comunicación Bidireccional y Control del Agente Principal
-
-El agente por defecto de OpenClaw (el trabajador *worker*) cuenta con una herramienta integrada en `scripts/default_agent_tools.py` que le permite interactuar directamente con la red de multiagentes (ARCH, BYTE, PIXEL) y supervisar la salud del coordinador. Las funciones principales incluyen:
-
-- **Monitoreo de Estado (`check_orchestrator_state()`)**: Permite consultar qué está haciendo el orquestador en tiempo real.
-- **Enrutamiento Jerárquico (`message_coordinator(content)`)**: El agente local de OpenClaw puede emitir mensajes directos dictando rutas de origen y destino explícitas (ej. `from_route: /root/openclaw/main`, `to_route: /root/worker/arch`). Esto se procesa directamente en la bandeja de entrada (*inbox*) del coordinador para poder recibir instrucciones o contexto de vuelta.
-- **Reporte de Fallos Autónomo (`report_multiagent_failure_telegram(message)`)**: Si los subagentes fallan catastróficamente, el trabajador primario está habilitado para alertar al desarrollador humano vía Telegram despachando un POST a `/api/alerts/telegram`.
-- **Reinicio Activo (`force_restart_processes()`)**: En caso de colapso por archivos `.lock` obsoletos o bloqueos, el agente trabajador puede limpiar todo y forzar la reanudación del proceso orquestador.
-
-Esta integración le otorga nivel de control al agente primario (trabajador principal) como un supervisor externo que tiene su propia línea de vida independiente.
+| ARCH | `thinking` | Burbuja de pensamiento 💭 |
+| ARCH | `working` | Camina al escritorio y teclea |
+| BYTE | `working` | Camina al escritorio y teclea |
+| PIXEL | `working` | Camina al escritorio y teclea |
+| Any | `speaking` | Burbuja de diálogo 💬 |
+| Any | `idle` | Deambula |
+| Any | `error` | Indicador rojo |
 
 ---
 
 ## Seguridad
 
-- **Auth API Key**: todos los endpoints (excepto `/health`) requieren `X-API-Key`.
-  Clave de ejemplo para desarrollo: `dev-squad-api-key-2026`.
-- **Validación de brief**: longitud 10–2000 chars; caracteres de control eliminados.
-- **CORS**: configurado en `allow_origins=["*"]` — restringir en producción si el dashboard se publica.
-- **File locking**: `fcntl.flock(LOCK_EX)` en cada escritura a `MEMORY.json` previene corrupción entre procesos.
+- **Auth API Key**: todos los endpoints (excepto `/health`) requieren `X-API-Key`
+- **Validación de brief**: longitud 10–2000 chars; caracteres de control eliminados
+- **CORS**: configurado en `allow_origins=["*"]` — restringir en producción
+- **File locking**: `fcntl.flock(LOCK_EX)` en cada escritura a `MEMORY.json`
+- 🆕 **Pre-Task Protocol**: agentes leen CONTEXT.md y CONTRACTS.md antes de ejecutar
+- 🆕 **Conflict Zone Analysis**: ARCH analiza conflictos antes de spawn paralelo
 
 ---
 
@@ -346,15 +374,16 @@ Esta integración le otorga nivel de control al agente primario (trabajador prin
 
 **Gateway no responde al arrancar**
 ```
-RuntimeError: Gateway OpenClaw no responde. Verifica que openclaw-gateway esté activo...
+RuntimeError: Gateway OpenClaw no responde...
 ```
 → Ejecutar `openclaw start` y verificar `~/.openclaw/gateway.yml`.
 
 **Tarea bloqueada en `in_progress`**
 → Al reiniciar el orquestador se resetea automáticamente a `pending`.
+→ 🆕 ARCH detecta stalls >90s y envía steer o re-spawnea.
 
 **MEMORY.json crece demasiado**
-→ Truncación automática: `log` ≤ 500, `messages` ≤ 200, `blockers` ≤ 100 entradas.
+→ Truncación automática: `log` ≤ 500, `messages` ≤ 200, `blockers` ≤ 100.
 
 **Dry-run para validar sin gastar tokens**
 ```bash
@@ -363,26 +392,32 @@ python orchestrator.py --dry-run "Mi proyecto de prueba"
 
 ---
 
-## Example Session
+## Changelog
 
-```
-Dev Squad iniciando - Proyecto: Build a TODO app...
+### v2.0.0 — 2026-03-28
+- ✨ Added shared CONTEXT.md and CONTRACTS.md for narrative alignment
+- ✨ Added Pre-Spawn Conflict Zone Analysis
+- ✨ Added ARCH heartbeat stall detection (>90s threshold)
+- ✨ Added per-agent MEMORY.md for long-term knowledge
+- ✨ Added plan_version and plan_history for adaptive versioning
+- ✨ Added JUDGE agent for quality review separation
+- ✨ Added human intervention API endpoints (steer, pause, context)
+- 📝 Updated all SOUL.md files with Pre-Task Protocol
+- 📝 Added HEARTBEAT.md for coordinator standing orders
+- 📝 Added UPGRADE_SUMMARY.md with full documentation
 
-Fase 1: Planificación...
-[miniverse] arch heartbeat started → https://miniverse-public-production.up.railway.app
-[ARCH speaks] "Plan listo. 8 tareas en 3 fases."
+### v1.0.0 — 2026-03-25
+- Initial release with ARCH, BYTE, PIXEL agents
+- Miniverse integration with heartbeats
+- Dashboard API with SSE and WebSocket
+- Systemd deployment support
 
-Fase 2: Ejecutando tareas...
-[recovery] 0 tarea(s) reseteadas a pending.
-[BYTE speaks]  "Iniciando T-001: FastAPI project scaffold"
-[PIXEL speaks] "Iniciando T-002: Design system tokens"
-[BYTE speaks]  "Completada T-001: se escribieron 4 archivo(s)."
-[git] Commit creado: [byte] T-001: FastAPI project scaffold
-...
+---
 
-Fase 3: Revisión final...
-[ARCH speaks] "Proyecto entregado. Revisa DELIVERY.md"
-[webhook] POST https://ci.ejemplo.com/hooks/devsquad → 200
+## Licencia
 
-Dev Squad finalizado. Revisa ./output/ para ver todos los archivos.
-```
+MIT License — ver [LICENSE](LICENSE) para detalles.
+
+---
+
+**Construido con ❤️ usando OpenClaw**
