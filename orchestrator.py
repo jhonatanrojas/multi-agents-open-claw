@@ -96,7 +96,7 @@ DEFAULT_RETRY_DELAY_SEC = 2.0
 
 # Prevención de overflow de contexto
 AGENTS_SESSION_DIR = Path("/root/.openclaw/agents")
-MAX_SESSION_SIZE_KB = 100  # Máximo 100KB por sesión para evitar overflow
+MAX_SESSION_SIZE_KB = 50  # Máximo 50KB por sesión para evitar overflow de tokens
 MAX_PROMPT_CHARS = 50000  # Máximo 50k chars para prompts (≈12k tokens)
 
 
@@ -1398,7 +1398,7 @@ async def plan_project(
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
         
         # VALIDACIÓN: Limpiar sesiones oversize antes de ejecutar (prevención de overflow)
-        cleaned = clean_oversized_sessions("arch")
+        cleaned = clean_oversized_sessions()
         if cleaned > 0:
             log_event(f"Sesiones oversize limpiadas antes de planificación: {cleaned}", "system")
         
@@ -1955,6 +1955,11 @@ async def execute_task(
     else:
         if client is None:
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
+        # Limpiar sesiones del agente antes de ejecutar para prevenir overflow de tokens
+        cleaned = clean_oversized_sessions(agent_id)
+        if cleaned > 0:
+            log_event(f"Sesiones oversize limpiadas para {agent_id} antes de {task_id}: {cleaned}", "system", level="warning")
+        
         agent = client.get_agent(agent_id)
         task_progress_cb = make_progress_callback(notify_telegram=True, telegram_throttle_sec=30.0)
         try:
@@ -2152,7 +2157,7 @@ async def final_review(
             raise RuntimeError("Se requiere un cliente OpenClaw fuera del modo dry-run")
         
         # VALIDACIÓN: Limpiar sesiones oversize antes de ejecutar (prevención de overflow)
-        cleaned = clean_oversized_sessions("arch")
+        cleaned = clean_oversized_sessions()
         if cleaned > 0:
             log_event(f"Sesiones oversize limpiadas antes de planificación: {cleaned}", "system")
         

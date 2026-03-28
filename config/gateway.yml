@@ -1,35 +1,44 @@
 ## gateway.yml — Dev Squad Multi-Agent Config
 ## Place at: ~/.openclaw/gateway.yml
-## Model overrides: set ARCH_MODEL / BYTE_MODEL / PIXEL_MODEL env vars,
-## or use PUT /api/models on the dashboard to update models_config.json.
+##
+## ⚠️ NOTA IMPORTANTE: Los modelos se gestionan DINÁMICAMENTE via Dashboard API
+## - Use PUT /api/models/agent para cambiar modelos
+## - Los cambios persisten en ~/.openclaw/openclaw.json
+## - Este archivo es SOLO de referencia para configuración de workspaces
+##
+## Modelos actuales (pueden diferir de la config dinámica):
+## - ARCH: configurado dinámicamente
+## - BYTE: configurado dinámicamente
+## - PIXEL: configurado dinámicamente
+## - JUDGE: configurado dinámicamente
+##
+## Para ver modelos actuales: GET /api/models
+## Para cambiar: PUT /api/models/agent {"agent_id": "byte", "model": "xiaomi/mimo-v2-pro"}
 
 agents:
   list:
     - id: "arch"
       name: "ARCH - Coordinator"
       workspace: "./workspaces/coordinator"
-      model: "nvidia/z-ai/glm5"
-      # override: ARCH_MODEL env var
+      # Model managed dynamically via Dashboard API
       agentDir: "~/.openclaw/agents/arch"
 
     - id: "byte"
       name: "BYTE - Programmer"
       workspace: "./workspaces/programmer"
-      model: "nvidia/moonshotai/kimi-k2.5"
-      # fallback: deepseek/deepseek-chat
+      # Model managed dynamically via Dashboard API
       agentDir: "~/.openclaw/agents/byte"
 
     - id: "pixel"
       name: "PIXEL - Designer"
       workspace: "./workspaces/designer"
-      model: "deepseek/deepseek-chat"
+      # Model managed dynamically via Dashboard API
       agentDir: "~/.openclaw/agents/pixel"
 
     - id: "judge"
       name: "JUDGE - Reviewer"
       workspace: "./workspaces/reviewer"
-      model: "deepseek/deepseek-chat"
-      # JUDGE is read-only, spawned for quality review
+      # Model managed dynamically via Dashboard API
       agentDir: "~/.openclaw/agents/judge"
 
 ## Shared memory - all agents mount the same directory
@@ -46,7 +55,8 @@ skills:
     - path: "./skills/stack-router"
     - path: "./skills/miniverse-bridge"
 
-## Channels (optional)
-# channels:
-#   slack:
-#     token: "${SLACK_BOT_TOKEN}"
+## Environment variable overrides (optional)
+## These can override dynamic settings if needed:
+# - ARCH_MODEL=nvidia/z-ai/glm5
+# - BYTE_MODEL=xiaomi/mimo-v2-pro
+# - PIXEL_MODEL=deepseek/deepseek-chat

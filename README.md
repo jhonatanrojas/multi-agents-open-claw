@@ -102,16 +102,35 @@ Dashboard API para control activo del operador:
 
 ---
 
-## Modelos por agente
+## Modelos por agente (Gestión Dinámica)
 
-| Agente | Rol | Modelo primario | Fallback |
-|--------|-------------|-------------------------------|------------------------|
-| ARCH | Coordinator | `nvidia/z-ai/glm5` | — |
-| BYTE | Programmer | `nvidia/moonshotai/kimi-k2.5` | `deepseek/deepseek-chat` |
-| PIXEL | Designer | `deepseek/deepseek-chat` | — |
-| JUDGE | Reviewer | `deepseek/deepseek-chat` | — |
+Los modelos se gestionan **dinámicamente** via Dashboard API, no están hardcodeados.
 
-Cambia los modelos sin reiniciar el código con `PUT /api/models` o editando `models_config.json`.
+| Agente | Rol | Configuración |
+|--------|-----|---------------|
+| ARCH | Coordinator | Dinámico via API |
+| BYTE | Programmer | Dinámico via API |
+| PIXEL | Designer | Dinámico via API |
+| JUDGE | Reviewer | Dinámico via API |
+
+### Cambiar modelos dinámicamente
+
+```bash
+# Ver modelos actuales
+curl http://127.0.0.1:8001/api/models
+
+# Cambiar modelo de un agente
+curl -X PUT http://127.0.0.1:8001/api/models/agent \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "byte", "model": "xiaomi/mimo-v2-pro"}'
+
+# Cambiar múltiples agentes
+curl -X PUT http://127.0.0.1:8001/api/models \
+  -H "Content-Type: application/json" \
+  -d '{"byte": "xiaomi/mimo-v2-pro", "pixel": "nvidia/mistral-large-3"}'
+```
+
+Los cambios persisten en `~/.openclaw/openclaw.json` y surten efecto inmediatamente (no requieren reinicio).
 
 ---
 

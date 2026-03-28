@@ -1,6 +1,6 @@
 {
   "arch": "nvidia/z-ai/glm5",
-  "byte": "nvidia/moonshotai/kimi-k2.5",
+  "byte": "xiaomi/mimo-v2-pro",
   "byte_fallback": "deepseek/deepseek-chat",
   "pixel": "nvidia/mistralai/mistral-large-3-675b-instruct-2512",
   "available": [
@@ -11,6 +11,7 @@
     "anthropic/claude-sonnet-4-6",
     "anthropic/claude-haiku-4-5-20251001",
     "openai/gpt-4o",
-    "google/gemini-2.0-flash"
+    "google/gemini-2.0-flash",
+    "xiaomi/mimo-v2-pro"
   ]
 }
