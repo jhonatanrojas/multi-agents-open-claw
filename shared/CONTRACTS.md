@@ -22,6 +22,18 @@ For frontend tasks, BYTE is responsible for bringing up a short-lived preview an
 - ARCH must tell BYTE to stop the preview after human confirmation
 - JUDGE must verify that a frontend preview exists, is reachable, and is reflected in `MEMORY.json` before approving the task
 
+### Shared Deploy Hosts
+
+These hostnames are shared ingress points. They are reusable across projects and
+must not be treated as project-scoped DNS.
+
+- `preview.deploymatrix.com` serves frontend previews on demand.
+- `preview-backend.deploymatrix.com` serves backend/API previews on demand.
+- The active project is chosen by the current task context and host mapping,
+  not by dedicating the hostname to a single repo.
+- BYTE may use manual deploy commands to refresh the service behind either host
+  when a task requires it.
+
 ### Output Boundary Contract
 
 The system must keep design artifacts and project deliverables separate.

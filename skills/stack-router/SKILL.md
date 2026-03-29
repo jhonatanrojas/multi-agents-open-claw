@@ -14,6 +14,9 @@ agents.
 - If the project mentions `Node`, `Express`, or `Fastify`, route BYTE toward
   `Node.js`, `Express`, `REST APIs`, `middleware`, and `TypeScript` when
   present.
+- If the project asks for a preview, deploy, or manual release, route the
+  task through the `deploy-preview` skill and pick the stack playbook before
+  emitting the work context.
 - If the task is frontend/UI, route PIXEL toward `React`, `TypeScript`,
   accessibility, responsive layout, and component boundaries.
 - If the task is DevOps, route BYTE toward `Bash`, `Apache`, `Nginx`, `cron`,
@@ -31,4 +34,3 @@ agents.
 - Report blockers with `BLOCKER:<task_id> <issue>`.
 - When the stack changes mid-project, refresh the task context files before the
   next task starts.
-
