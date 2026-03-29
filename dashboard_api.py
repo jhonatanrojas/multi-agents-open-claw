@@ -2216,6 +2216,7 @@ async def resume_project(req: ProjectResumeRequest):
     mem = load_memory()
     project = mem.get("project", {}) or {}
     tasks = mem.get("tasks", []) if isinstance(mem.get("tasks", []), list) else []
+    closed_statuses = {"done", "passed", "delivered"}
 
     if not project.get("id"):
         return JSONResponse({"error": "No hay proyecto activo para reanudar"}, status_code=422)
@@ -2262,18 +2263,31 @@ async def resume_project(req: ProjectResumeRequest):
     if req.task_id and not resumed:
         return JSONResponse({"error": f"No se encontró la tarea {req.task_id} para reanudar"}, status_code=404)
 
+    review_only_resume = (
+        not resumed
+        and bool(tasks)
+        and all(isinstance(task, dict) and task.get("status") in closed_statuses for task in tasks)
+        and project.get("status") != "delivered"
+    )
+
     if not resumed:
-        return JSONResponse({"error": "No hay tareas pendientes o fallidas para reanudar"}, status_code=422)
+        if not review_only_resume:
+            return JSONResponse({"error": "No hay tareas pendientes o fallidas para reanudar"}, status_code=422)
 
     mem.setdefault("project", {})
     mem["project"]["status"] = "in_progress"
     mem["project"]["updated_at"] = utc_now()
     mem["project"].setdefault("orchestrator", {})
+    detail = (
+        "Reanudando revisión final"
+        if review_only_resume
+        else f"Reanudando {len(resumed)} tarea(s)"
+    )
     mem["project"]["orchestrator"].update(
         {
             "status": "starting",
             "phase": "execution",
-            "detail": f"Reanudando {len(resumed)} tarea(s)",
+            "detail": detail,
             "task_id": resumed[0] if len(resumed) == 1 else None,
             "updated_at": utc_now(),
         }
@@ -2299,6 +2313,7 @@ async def resume_project(req: ProjectResumeRequest):
         "status": "resumed",
         "message": "Reanudación iniciada correctamente",
         "resumed_tasks": resumed,
+        "review_only": review_only_resume,
         "task_ids": task_ids,
         "ts": utc_now(),
     }

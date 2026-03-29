@@ -103,6 +103,14 @@ def _pid_is_alive(pid: int | None) -> bool:
     """Return True when *pid* appears to be running."""
     if not pid or pid <= 0:
         return False
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        if stat_path.exists():
+            stat_fields = stat_path.read_text(encoding="utf-8").split()
+            if len(stat_fields) >= 3 and stat_fields[2] == "Z":
+                return False
+    except Exception:
+        pass
     try:
         os.kill(pid, 0)
         return True

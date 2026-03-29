@@ -745,13 +745,13 @@ def infer_task_execution_dir(project: dict[str, Any], task: dict[str, Any], repo
     structure = infer_project_structure(project, task)
     structure_kind = str(structure.get("kind") or "")
 
+    if structure_kind == "vanilla-static":
+        return str(repo_root.resolve())
     if any(token in task_text for token in ("fastapi", "sqlalchemy", "pydantic", "sqlite", "backend")):
         return str((repo_root / "backend").resolve())
     if any(token in task_text for token in ("design", "spec", "component", "pixel")):
         return str((repo_root / "design" / task_id).resolve())
     if any(token in task_text for token in ("readme", "documentation", "markdown")):
-        return str(repo_root.resolve())
-    if structure_kind == "vanilla-static":
         return str(repo_root.resolve())
     if structure_kind == "framework-frontend":
         return str((repo_root / "src").resolve())
@@ -762,6 +762,28 @@ def infer_task_execution_dir(project: dict[str, Any], task: dict[str, Any], repo
     if any(token in task_text for token in ("html", "css", "javascript", "localstorage", "vanilla")):
         return str(repo_root.resolve())
     return str(repo_root.resolve())
+
+
+def normalize_task_execution_dir(
+    project: dict[str, Any],
+    task: dict[str, Any],
+    repo_state: dict[str, Any] | None = None,
+) -> str:
+    """Return a valid execution_dir, correcting stale or forbidden paths when possible."""
+    inferred = infer_task_execution_dir(project, task, repo_state)
+    current = str(task.get("execution_dir") or "").strip()
+    if not current:
+        return inferred
+
+    current_violations = validate_project_structure(current, project, task)
+    if not current_violations:
+        return current
+
+    inferred_violations = validate_project_structure(inferred, project, task)
+    if not inferred_violations:
+        return inferred
+
+    return current
 
 
 def materialize_planned_project(
@@ -814,7 +836,7 @@ def materialize_planned_project(
             task["phase"] = phase.get("id")
             task["status"] = "pending"
             profile = build_task_skill_profile(mem["project"], task)
-            task["execution_dir"] = infer_task_execution_dir(mem["project"], task, repo_state=None)
+            task["execution_dir"] = normalize_task_execution_dir(mem["project"], task, repo_state=None)
             task_files = task.get("files")
             if isinstance(task_files, list):
                 task_files = [
@@ -1817,7 +1839,11 @@ def check_task_content(task: dict[str, Any], project: dict[str, Any]) -> list[st
 
 def has_open_tasks(tasks: list[dict[str, Any]]) -> bool:
     """Return True when at least one task is still pending, running, or blocked."""
-    return any(task.get("status") != "done" for task in tasks if isinstance(task, dict))
+    return any(
+        task.get("status") not in {"done", "passed", "delivered"}
+        for task in tasks
+        if isinstance(task, dict)
+    )
 
 
 def has_tasks_needing_correction(tasks: list[dict[str, Any]]) -> bool:

@@ -52,6 +52,7 @@ from coordination import (
     has_tasks_needing_correction,
     materialize_planned_project,
     infer_task_execution_dir,
+    normalize_task_execution_dir,
     infer_project_structure,
     needs_planning_clarification,
     slugify,
@@ -2065,7 +2066,17 @@ async def execute_task(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     skill_profile = task.get("skill_profile") or build_task_skill_profile(project, task)
-    task.setdefault("execution_dir", infer_task_execution_dir(project, task, repo_state))
+    normalized_execution_dir = normalize_task_execution_dir(project, task, repo_state)
+    if normalized_execution_dir != task.get("execution_dir"):
+        task["execution_dir"] = normalized_execution_dir
+        for persisted_task in mem.get("tasks", []):
+            if persisted_task.get("id") == task_id:
+                persisted_task["execution_dir"] = normalized_execution_dir
+                persisted_task["updated_at"] = utc_now()
+                break
+        save_memory(mem)
+    else:
+        task.setdefault("execution_dir", infer_task_execution_dir(project, task, repo_state))
 
     # ── Fase 0: Validar estructura canónica ─────────────────────────────────
     structure_violations = validate_project_structure(str(task.get("execution_dir") or ""), project, task)
@@ -2095,7 +2106,11 @@ async def execute_task(
         for t in mem.get("tasks", []):
             if t.get("id") == task_id:
                 t.update({
-                    "status": "passed",
+                    # Recovered artifacts mean the task is already satisfied.
+                    # Keep runtime semantics aligned with the scheduler by
+                    # persisting it as done instead of a non-terminal state.
+                    "status": "done",
+                    "files": existing_artifacts,
                     "files_produced": existing_artifacts,
                     "updated_at": utc_now(),
                     "notes": "Completado mediante recuperación de artefactos existentes (Fase 3)."
@@ -2926,9 +2941,12 @@ async def main(args: argparse.Namespace) -> None:
                         await asyncio.sleep(2)
                         mem = load_memory()
                         pending_tasks = [
-                            task for task in mem.get("tasks", []) if task.get("status") not in ("done", "error")
+                            task for task in mem.get("tasks", []) if task.get("status") not in ("done", "passed", "error")
                         ]
-                        completed_ids = {task["id"] for task in mem.get("tasks", []) if task.get("status") == "done"}
+                        completed_ids = {
+                            task["id"] for task in mem.get("tasks", [])
+                            if task.get("status") in ("done", "passed")
+                        }
                         continue
 
                     byte_tasks = [task for task in ready if task["agent"] == "byte"]
@@ -2958,14 +2976,18 @@ async def main(args: argparse.Namespace) -> None:
 
                     mem = load_memory()
                     pending_tasks = [
-                        task for task in mem.get("tasks", []) if task.get("status") not in ("done", "error")
+                        task for task in mem.get("tasks", []) if task.get("status") not in ("done", "passed", "error")
                     ]
                     completed_ids = {
-                        task["id"] for task in mem.get("tasks", []) if task.get("status") == "done"
+                        task["id"] for task in mem.get("tasks", [])
+                        if task.get("status") in ("done", "passed")
                     }
 
                 mem = load_memory()
-                remaining_tasks = [task for task in mem.get("tasks", []) if task.get("status") != "done"]
+                remaining_tasks = [
+                    task for task in mem.get("tasks", [])
+                    if task.get("status") not in ("done", "passed")
+                ]
                 if remaining_tasks:
                     mem.setdefault("project", {})
                     mem["project"]["status"] = "in_progress"
