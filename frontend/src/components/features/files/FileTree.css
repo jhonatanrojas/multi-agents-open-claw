@@ -1,0 +1,127 @@
+.file-tree {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.file-tree-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.file-tree-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.file-tree-loading,
+.file-tree-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-tertiary);
+  text-align: center;
+  padding: 24px;
+}
+
+.file-tree-empty small {
+  margin-top: 8px;
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
+
+/* Tree node */
+.tree-node {
+  user-select: none;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  margin: 1px 4px;
+  transition: background 0.1s;
+  font-size: 0.8rem;
+}
+
+.tree-item:hover {
+  background: var(--bg-hover);
+}
+
+.tree-item.selected {
+  background: var(--bg-active);
+}
+
+.tree-item.new-file {
+  animation: highlight-new 1.5s ease-out;
+}
+
+@keyframes highlight-new {
+  0% { background: #fff3cd; }
+  100% { background: transparent; }
+}
+
+/* Arrow */
+.tree-arrow {
+  font-size: 0.6rem;
+  color: var(--text-tertiary);
+  transition: transform 0.15s;
+  width: 12px;
+  flex-shrink: 0;
+}
+
+.tree-arrow.expanded {
+  transform: rotate(90deg);
+}
+
+/* Spacer for files */
+.tree-spacer {
+  width: 12px;
+  flex-shrink: 0;
+}
+
+/* Icon */
+.tree-icon {
+  font-size: 0.7rem;
+  flex-shrink: 0;
+  width: 24px;
+  text-align: center;
+}
+
+.tree-icon.file-icon {
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+/* Name */
+.tree-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Agent badge */
+.tree-agent {
+  font-size: 0.6rem;
+  background: var(--bg-secondary);
+  color: var(--text-tertiary);
+  padding: 1px 4px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+/* Directory */
+.tree-item.directory .tree-name {
+  font-weight: 500;
+}

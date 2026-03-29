@@ -9,6 +9,9 @@ shared/MEMORY.json
 .openclaw-runtime/
 .claude
 openclaw-portal/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
 .env
 backups/
 *.backup-format-transform

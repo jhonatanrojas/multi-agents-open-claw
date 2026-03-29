@@ -1,0 +1,40 @@
+.log-tab {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.log-list {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.log-entry {
+  display: flex;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 0.5px solid var(--border);
+  align-items: flex-start;
+}
+
+.log-entry:last-child {
+  border-bottom: none;
+}
+
+.log-time {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  min-width: 70px;
+}
+
+.log-agent {
+  flex-shrink: 0;
+}
+
+.log-level {
+  flex-shrink: 0;
+}
+
+.log-message {
+  color: var(--text-secondary);
+  word-break: break-word;
+}

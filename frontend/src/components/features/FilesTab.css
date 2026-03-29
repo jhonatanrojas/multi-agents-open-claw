@@ -1,0 +1,68 @@
+.files-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.file-tree {
+  font-size: 13px;
+}
+
+.file-node {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.file-node:hover {
+  background: var(--bg-secondary);
+}
+
+.file-node.selected {
+  background: #EEEDFE;
+}
+
+.file-node.recent {
+  background: #EAF3DE;
+}
+
+.file-icon {
+  width: 16px;
+  text-align: center;
+}
+
+.file-name {
+  color: var(--text-primary);
+}
+
+.recent-indicator {
+  color: #639922;
+  font-size: 8px;
+  margin-left: auto;
+}
+
+.file-meta {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.file-content {
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  padding: 12px;
+  overflow-x: auto;
+}
+
+.file-content pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

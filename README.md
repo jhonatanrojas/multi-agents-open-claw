@@ -146,6 +146,35 @@ El orquestador (`orchestrator.py`) opera en un esquema híbrido apoyándose 100%
 
 ## Quick Start
 
+### Frontend React
+
+El dashboard principal de Dev Squad vive en `frontend/` y se conecta al backend del multiagente vía `/devsquad/api`.
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Para generar la build de producción:
+
+```bash
+npm run build
+```
+
+Para validar un preview local:
+
+```bash
+npm run preview
+```
+
+Cuando se publique un preview para revisión, el frontend puede apuntar a:
+
+- `https://preview.deploymatrix.com`
+- `https://preview-backend.deploymatrix.com`
+
+Estos hosts se usan bajo demanda y no están atados a un único proyecto.
+
 ### 1. Instalar OpenClaw
 ```bash
 # macOS / Linux

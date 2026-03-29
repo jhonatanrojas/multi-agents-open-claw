@@ -1,0 +1,76 @@
+.quick-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.project-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.project-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.project-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.action-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+.no-project-actions {
+  text-align: center;
+}
+
+.no-project-text {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+/* Steer form */
+.steer-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.steer-select {
+  padding: 8px 10px;
+  border: 0.5px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  background: var(--bg-primary);
+}
+
+.steer-textarea {
+  padding: 10px;
+  border: 0.5px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  resize: vertical;
+  background: var(--bg-primary);
+}
+
+.steer-textarea:focus {
+  outline: none;
+  border-color: var(--arch-color);
+}
+
+.steer-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.full-width {
+  width: 100%;
+}
