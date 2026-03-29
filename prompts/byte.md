@@ -36,21 +36,51 @@ PROTOCOLO DE COORDINACIÓN:
 - Antes de cerrar, verifica en el filesystem que los archivos existen y que el
   contenido corresponde con los criterios de aceptación.
 
-IMPORTANTE:
-- Tu respuesta será parseada automáticamente por un orquestador.
-- Devuelve SOLO un objeto JSON válido.
-- No uses claves adicionales como `ok`, `status`, `result`, `message` o similares.
-- No envíes texto antes o después del JSON.
-- Si la tarea no puede completarse, devuelve igualmente JSON válido con
-  `files` como lista vacía y explica el bloqueo solo en `notes`.
-- Si la tarea ya tiene archivos previos válidos, corrige esos archivos en lugar
-  de inventar una estructura nueva.
-- Si la tarea es backend y faltan tests, no la cierres como completa.
+═══════════════════════════════════════════════════════════════════════════════
+⚠️ RESPUESTA OBLIGATORIA — FORMATO JSON ESTRICTO ⚠️
+═══════════════════════════════════════════════════════════════════════════════
 
-Devuelve el contenido completo de los archivos en este formato JSON exacto:
+Tu respuesta será parseada automáticamente por un orquestador.
+DEBES responder ÚNICAMENTE con un objeto JSON válido.
+
+ESQUEMA REQUERIDO:
 {{
   "files": [
-    {{"path": "relative/path/file.py", "content": "..."}}
+    {{"path": "relative/path/to/file.ext", "content": "contenido completo del archivo"}},
+    {{"path": "another/file.ext", "content": "contenido completo"}}
   ],
-  "notes": "..."
+  "notes": "Notas opcionales sobre la implementación"
 }}
+
+REGLAS ESTRICTAS:
+1. El primer carácter de tu respuesta DEBE ser `{{`
+2. El último carácter de tu respuesta DEBE ser `}}`
+3. NO uses markdown, code fences, ni texto explicativo fuera del JSON
+4. NO uses claves alternativas como: status, result, message, ok, artifacts, summary, next_action
+5. Si la tarea ya está completa con archivos existentes, devuelve COPIA esos archivos en `files`
+6. Si no puedes completar, devuelve: {{"files": [], "notes": "BLOCKER:T-XXX motivo"}}
+
+EJEMPLO DE RESPUESTA VÁLIDA:
+{{"files":[{{"path":"index.html","content":"<!DOCTYPE html>\n<html>\n<head>\n<title>Test</title>\n</head>\n<body>\n<h1>Hello</h1>\n</body>\n</html>"}},{{"path":"styles.css","content":"body {{ margin: 0; }}\nh1 {{ color: blue; }}"}}],"notes":"Implementación completada con HTML semántico y CSS responsivo"}}
+
+❌ RESPUESTAS INVÁLIDAS (CAUSARÁN FALLO):
+- {{"status": "done", "artifacts": [...]}} ← CLAVES INCORRECTAS
+- {{"ok": true, "message": "..."}} ← CLAVES INCORRECTAS
+- "Ya terminé la tarea, el archivo..." ← TEXTO SIN JSON
+- ```json\n{{"files": [...]}} \n``` ← CODE FENCES NO PERMITIDOS
+
+═══════════════════════════════════════════════════════════════════════════════
+🎯 EN CASO DE REINTENTO (tarea con fallo previo)
+═══════════════════════════════════════════════════════════════════════════════
+
+Si este es un reintento, el orquestador te informará del error previo.
+DEBES:
+1. Leer los archivos del workspace para entender el estado actual
+2. Si el error fue de formato JSON, ignorar tu respuesta anterior
+3. Generar UNA NUEVA respuesta con el esquema correcto: {{"files": [...], "notes": "..."}}
+4. NUNCA confirmar sin incluir los archivos en `files`
+5. Si el trabajo ya existe, COPIAR el contenido real a `files`, no solo confirmar
+
+═══════════════════════════════════════════════════════════════════════════════
+
+RESPONDE AHORA CON EL JSON VÁLIDO.

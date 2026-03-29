@@ -14,6 +14,8 @@ Requisitos:
 - Prohíbe rutas dinámicas o temporales fuera del repositorio gestionado.
 - Cada tarea debe dejar inequívoco qué artefactos espera producir y en qué
   directorio de ejecución se deben escribir.
+- Cada tarea debe incluir un arreglo `files` con las rutas del repo que espera
+  crear o modificar. Si la tarea solo valida, lista los archivos que debe leer.
 - Si una tarea es de corrección o mejora, indícalo explícitamente en la
   descripción para que el agente entienda que debe verificar archivos existentes.
 - Incluye de forma opcional los arreglos "skills" y "workspace_notes" en cada tarea cuando
@@ -21,7 +23,16 @@ Requisitos:
 - Evita tareas vagas o duplicadas; si dos tareas comparten archivos, separa
   claramente cuál escribe y cuál valida.
 
-Responde SOLO con JSON válido. No uses fences de markdown.
+Responde SOLO con JSON válido.
+Reglas de formato obligatorias:
+- El primer caracter de tu respuesta debe ser `{`
+- El último caracter de tu respuesta debe ser `}`
+- No uses markdown
+- No uses fences de markdown como ``` o ```json
+- No escribas texto antes o después del objeto JSON
+- No expliques tu respuesta
+- No incluyas encabezados, notas, comentarios, ni bloques de código
+- Si devuelves cualquier cosa distinta de un objeto JSON puro, la respuesta se considera inválida
 
 Schema:
 {{
@@ -54,6 +65,7 @@ Schema:
             "description": "...",
             "acceptance": ["...", "..."],
             "depends_on": [],
+            "files": ["ruta/al/archivo.ext"],
             "skills": ["optional", "skill", "list"],
             "workspace_notes": ["optional", "notes"]
           }}

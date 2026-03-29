@@ -19,7 +19,7 @@ PROJECTS_ROOT = BASE_DIR / "projects"
 WORKSPACES_ROOT = BASE_DIR / "workspaces"
 LOG_DIR = BASE_DIR / "logs"
 OUTPUT_DIR = BASE_DIR / "output"
-OPENCLAW_RUNTIME_HOME = Path(os.getenv("OPENCLAW_RUNTIME_HOME", str(BASE_DIR / ".openclaw-runtime")))
+OPENCLAW_RUNTIME_HOME = Path(os.getenv("OPENCLAW_RUNTIME_HOME", str(Path.home() / ".openclaw-runtime")))
 OPENCLAW_RUNTIME_PROFILE = os.getenv("OPENCLAW_PROFILE", "multi-agents-runtime-v2").strip()
 OPENCLAW_AGENTS_ROOT = OPENCLAW_RUNTIME_HOME / f".openclaw-{OPENCLAW_RUNTIME_PROFILE}" / "agents"
 WORKSPACE_NAMES = {
@@ -171,6 +171,24 @@ def workspace_root_for_agent(agent_id: str, project: dict[str, Any] | None = Non
     if project_key:
         return base / project_key
     return base
+
+
+def _agent_base_workspace_root(agent_id: str) -> Path:
+    """Return the shared, non-namespaced workspace for an agent."""
+    return WORKSPACES_ROOT / WORKSPACE_NAMES.get(agent_id, agent_id)
+
+
+def _safe_write_workspace_file(path: Path, content: str) -> None:
+    """Write workspace helper files even if a stale symlink is present.
+
+    Some older runs left `active_task.md/json` as symlinks to project-scoped
+    workspaces. When that target workspace disappears, writing through the
+    broken symlink raises ENOENT. Replace stale symlinks with real files.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        path.unlink()
+    path.write_text(content, encoding="utf-8")
 
 
 def _project_text(project: dict[str, Any], task: dict[str, Any]) -> str:
@@ -495,6 +513,16 @@ def validate_project_structure(
 
 def collect_task_expected_files(task: dict[str, Any], project: dict[str, Any], execution_dir: str) -> list[str]:
     """Infer files that a task is realistically expected to touch/create based on acceptance criteria."""
+    explicit_files = task.get("files")
+    if isinstance(explicit_files, list):
+        normalized_explicit = [
+            str(item).strip()
+            for item in explicit_files
+            if isinstance(item, str) and str(item).strip()
+        ]
+        if normalized_explicit:
+            return sorted(dict.fromkeys(normalized_explicit))
+
     expected: set[str] = set()
     acceptance = [str(x) for x in task.get("acceptance", []) if isinstance(x, str)]
     
@@ -787,6 +815,18 @@ def materialize_planned_project(
             task["status"] = "pending"
             profile = build_task_skill_profile(mem["project"], task)
             task["execution_dir"] = infer_task_execution_dir(mem["project"], task, repo_state=None)
+            task_files = task.get("files")
+            if isinstance(task_files, list):
+                task_files = [
+                    str(item).strip()
+                    for item in task_files
+                    if isinstance(item, str) and str(item).strip()
+                ]
+            else:
+                task_files = []
+            if not task_files:
+                task_files = collect_task_expected_files(task, mem["project"], task["execution_dir"])
+            task["files"] = list(dict.fromkeys(task_files))
             task["skill_family"] = profile["family"]
             task["skill_profile"] = profile
             task["skills"] = profile["skills"]
@@ -817,11 +857,17 @@ def build_project_context(mem: dict[str, Any], repo_state: dict[str, Any]) -> st
         for task in mem.get("tasks", [])
         if isinstance(task, dict) and task.get("id")
     }
+    task_files_map = {
+        task["id"]: collect_task_expected_files(task, mem.get("project", {}), str(task.get("execution_dir") or ""))
+        for task in mem.get("tasks", [])
+        if isinstance(task, dict) and task.get("id")
+    }
     context = {
         "project": mem.get("project", {}),
         "repo": repo_state,
         "milestones": mem.get("milestones", []),
         "task_skill_map": task_skill_map,
+        "task_files_map": task_files_map,
         "output_dir": mem.get("project", {}).get("output_dir", "./output"),
         "execution_dir_map": {
             task.get("id"): task.get("execution_dir")
@@ -957,6 +1003,7 @@ def refresh_agent_workspace_files(
     """
     task_id = task.get("id", "task")
     workspace_root = workspace_root_for_agent(agent_id, project)
+    base_workspace_root = _agent_base_workspace_root(agent_id)
     progress_root = workspace_root / "progress"
     context_md_path = workspace_root / "active_task.md"
     context_json_path = workspace_root / "active_task.json"
@@ -1000,6 +1047,22 @@ def refresh_agent_workspace_files(
         progress_data["last_arch_reply"] = reply
     progress_data["updated_at"] = datetime.utcnow().isoformat()
     progress_path.write_text(json.dumps(progress_data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if base_workspace_root != workspace_root:
+        base_workspace_root.mkdir(parents=True, exist_ok=True)
+        base_context_md_path = base_workspace_root / "active_task.md"
+        base_context_json_path = base_workspace_root / "active_task.json"
+        base_progress_root = base_workspace_root / "progress"
+        base_progress_root.mkdir(parents=True, exist_ok=True)
+        _safe_write_workspace_file(base_context_md_path, context_md_path.read_text(encoding="utf-8"))
+        _safe_write_workspace_file(
+            base_context_json_path,
+            context_json_path.read_text(encoding="utf-8"),
+        )
+        (base_progress_root / f"{task_id}.json").write_text(
+            progress_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
 
     md_lines = [
         "",
@@ -1168,6 +1231,7 @@ def write_agent_workspace_files(
 ) -> dict[str, Path]:
     """Write task context and initial progress files for an agent workspace."""
     workspace_root = workspace_root_for_agent(agent_id, project)
+    base_workspace_root = _agent_base_workspace_root(agent_id)
     progress_root = workspace_root / "progress"
     workspace_root.mkdir(parents=True, exist_ok=True)
     progress_root.mkdir(parents=True, exist_ok=True)
@@ -1230,6 +1294,20 @@ def write_agent_workspace_files(
         json.dumps(progress_payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+    if base_workspace_root != workspace_root:
+        base_workspace_root.mkdir(parents=True, exist_ok=True)
+        _safe_write_workspace_file(base_workspace_root / "active_task.md", context_md)
+        _safe_write_workspace_file(
+            base_workspace_root / "active_task.json",
+            json.dumps(context_json, indent=2, ensure_ascii=False),
+        )
+        base_progress_root = base_workspace_root / "progress"
+        base_progress_root.mkdir(parents=True, exist_ok=True)
+        (base_progress_root / f"{task_id}.json").write_text(
+            json.dumps(progress_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     return {
         "workspace_root": workspace_root,

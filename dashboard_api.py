@@ -43,7 +43,7 @@ import shutil
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -83,6 +83,8 @@ MINIVERSE_CACHE_TTL_SEC = float(os.getenv("MINIVERSE_CACHE_TTL_SEC", "300"))
 MINIVERSE_MOCK_FILE = BASE_DIR / "data" / "miniverse-mock.json"
 LOCK_FILE = BASE_DIR / "logs" / "orchestrator.lock"
 JSONL_LOG_FILE = BASE_DIR / "logs" / "orchestrator.jsonl"
+OPENCLAW_RUNTIME_HOME = Path(os.getenv("OPENCLAW_RUNTIME_HOME", str(Path.home() / ".openclaw-runtime")))
+OPENCLAW_RUNTIME_PROFILE = os.getenv("OPENCLAW_PROFILE", "multi-agents-runtime-v2").strip()
 _MINIVERSE_CACHE: dict[str, Any] = {
     "signature": None,
     "expires_at": 0.0,
@@ -96,6 +98,58 @@ _API_KEY: str = os.getenv("DASHBOARD_API_KEY", "")
 _AUTH_EXEMPT = {"/health", "/api/health"}
 GATEWAY_EVENT_LIMIT = 300
 GATEWAY_AGENT_RE = re.compile(r"^agent:(arch|byte|pixel):", re.IGNORECASE)
+RESUME_COOLDOWN_DEFAULT_SEC = int(os.getenv("OPENCLAW_RESUME_COOLDOWN_SEC", "60"))
+RESUME_COOLDOWN_PROVIDER_SEC = int(os.getenv("OPENCLAW_PROVIDER_RESUME_COOLDOWN_SEC", "300"))
+_RESUME_PROVIDER_SIGNALS = (
+    "429",
+    "rate limit",
+    "too many requests",
+    "quota exceeded",
+    "insufficient balance",
+    "insufficient account balance",
+    "unauthorized",
+    "forbidden",
+    "invalid api key",
+    "api key",
+    "invalid or expired token",
+)
+
+
+def _resume_cooldown_seconds(task: dict[str, Any]) -> int:
+    """Return the cooldown to apply before resuming a task."""
+    text = " ".join(
+        str(task.get(key) or "")
+        for key in ("failure_kind", "error", "blocked_note", "next_action", "raw_response")
+    ).lower()
+    if any(signal in text for signal in _RESUME_PROVIDER_SIGNALS):
+        return RESUME_COOLDOWN_PROVIDER_SEC
+    failure_kind = str(task.get("failure_kind") or "").lower()
+    if failure_kind in {"format", "parse"} or "json inválido" in text or "json invalid" in text:
+        return max(RESUME_COOLDOWN_DEFAULT_SEC, 90)
+    if failure_kind in {"blocked", "review"}:
+        return RESUME_COOLDOWN_DEFAULT_SEC
+    return RESUME_COOLDOWN_DEFAULT_SEC
+
+
+def _resume_not_before(seconds: int) -> str:
+    return (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=max(0, int(seconds)))
+    ).replace(tzinfo=None).isoformat()
+
+
+def _set_task_resume_cooldown(task: dict[str, Any], seconds: int) -> str:
+    """Set not_before without shortening an existing, later cooldown."""
+    next_not_before = _resume_not_before(seconds)
+    current = task.get("not_before")
+    if isinstance(current, str) and current.strip():
+        try:
+            if datetime.fromisoformat(current) >= datetime.fromisoformat(next_not_before):
+                return current
+        except Exception:
+            pass
+    task["not_before"] = next_not_before
+    return next_not_before
 
 
 # ── WebSocket broadcaster (GAP-9) ─────────────────────────────────────────────
@@ -139,6 +193,7 @@ def _gateway_connection_details() -> dict[str, Any]:
     token = (
         os.getenv("OPENCLAW_GATEWAY_TOKEN")
         or gateway_auth.get("token")
+        or gateway_cfg.get("token")  # También buscar en gateway.token
         or ""
     )
     host = os.getenv("OPENCLAW_GATEWAY_HOST") or gateway_cfg.get("host") or "127.0.0.1"
@@ -149,6 +204,76 @@ def _gateway_connection_details() -> dict[str, Any]:
         "port": port,
         "token": token,
     }
+
+
+def _runtime_profile_root() -> Path | None:
+    profile = OPENCLAW_RUNTIME_PROFILE.strip()
+    if not profile:
+        return None
+    return OPENCLAW_RUNTIME_HOME / f".openclaw-{profile}"
+
+
+def _resolve_provider_secret(cfg: dict[str, Any], provider: str) -> str:
+    """Resolve an API key/token for *provider* from config, env, or runtime auth files."""
+    providers = cfg.get("models", {}).get("providers", {}) if isinstance(cfg, dict) else {}
+    provider_cfg = providers.get(provider, {}) if isinstance(providers, dict) else {}
+
+    def _clean_secret(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        secret = value.strip()
+        if not secret:
+            return ""
+        if secret.startswith("${") and secret.endswith("}"):
+            env_name = secret[2:-1].strip()
+            if env_name:
+                return os.getenv(env_name, "").strip()
+            return ""
+        return secret
+
+    for key_name in ("apiKey", "api_key", "key", "token", "access"):
+        secret = _clean_secret(provider_cfg.get(key_name))
+        if secret:
+            return secret
+
+    auth_profiles = cfg.get("auth", {}).get("profiles", {}) if isinstance(cfg, dict) else {}
+    if isinstance(auth_profiles, dict):
+        for profile_name, profile in auth_profiles.items():
+            if not isinstance(profile, dict):
+                continue
+            if profile.get("provider") != provider:
+                continue
+            for key_name in ("key", "token", "access"):
+                secret = _clean_secret(profile.get(key_name))
+                if secret:
+                    return secret
+
+    runtime_root = _runtime_profile_root()
+    if runtime_root is None:
+        return ""
+
+    agents_dir = runtime_root / "agents"
+    if not agents_dir.exists():
+        return ""
+
+    for auth_file in agents_dir.glob("*/agent/auth-profiles.json"):
+        try:
+            payload = json.loads(auth_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        profiles = payload.get("profiles", {}) if isinstance(payload, dict) else {}
+        if not isinstance(profiles, dict):
+            continue
+        for profile in profiles.values():
+            if not isinstance(profile, dict):
+                continue
+            if profile.get("provider") != provider:
+                continue
+            for key_name in ("key", "token", "access"):
+                secret = _clean_secret(profile.get(key_name))
+                if secret:
+                    return secret
+    return ""
 
 
 def _parse_gateway_frame(raw: Any) -> dict[str, Any] | None:
@@ -358,11 +483,17 @@ def _normalize_gateway_event(frame: dict[str, Any]) -> dict[str, Any] | None:
 
 def _gateway_fingerprint_payload(value: Any) -> Any:
     """Return a normalized payload used only for deduplication."""
+    # Campos que cambian en cada evento pero no afectan el contenido sustancial
+    _EXCLUDE_KEYS = {
+        "timestamp", "ts", "received_at", "_meta", "date",
+        "delta", "seq", "runId", "stateVersion", "state",
+        "sessionKey", "kind", "event", "agent_id"
+    }
     if isinstance(value, dict):
         return {
             key: _gateway_fingerprint_payload(item)
             for key, item in sorted(value.items())
-            if key not in {"timestamp", "ts", "received_at", "_meta", "date"}
+            if key not in _EXCLUDE_KEYS
         }
     if isinstance(value, list):
         return [_gateway_fingerprint_payload(item) for item in value]
@@ -1769,6 +1900,122 @@ def get_providers():
 # ── Model Health (Tarea 2.1) ───────────────────────────────────────────────────
 
 @app.get("/api/health/models")
+
+@app.post("/api/models/test")
+def test_model(payload: dict[str, Any]):
+    """Test model availability by checking config and attempting a minimal API call."""
+    model = payload.get("model") if isinstance(payload, dict) else None
+    if not model:
+        return JSONResponse({"error": "Model is required"}, status_code=400)
+
+    import time
+    start = time.time()
+
+    # First check if model is in available list
+    models_data = get_available_models()
+    available_models = [m.get("qualified") for m in models_data]
+    
+    if model not in available_models:
+        elapsed_ms = int((time.time() - start) * 1000)
+        return {"ok": False, "model": model, "status": "not_in_catalog", "elapsed_ms": elapsed_ms, 
+                "message": f"Model not in available catalog. {len(available_models)} models available."}
+
+    # Get provider info
+    provider = model.split("/")[0] if "/" in model else "unknown"
+    
+    # Try to make a minimal request using httpx to the provider
+    try:
+        import httpx
+        
+        # Get provider config
+        cfg = load_openclaw_config()
+        providers = cfg.get("models", {}).get("providers", {})
+        provider_cfg = providers.get(provider, {})
+        api_key = _resolve_provider_secret(cfg, provider)
+        base_url = (
+            provider_cfg.get("baseURL")
+            or provider_cfg.get("baseUrl")
+            or provider_cfg.get("base_url")
+            or ""
+        )
+        
+        if not api_key:
+            elapsed_ms = int((time.time() - start) * 1000)
+            return {"ok": False, "model": model, "status": "no_api_key", "elapsed_ms": elapsed_ms,
+                    "message": f"No API key configured for provider {provider}"}
+        
+        # Determine endpoint based on provider
+        if base_url:
+            url = f"{base_url.rstrip('/')}/chat/completions"
+        elif provider == "groq":
+            url = "https://api.groq.com/openai/v1/chat/completions"
+        elif provider == "openai":
+            url = "https://api.openai.com/v1/chat/completions"
+        elif provider == "deepseek":
+            url = "https://api.deepseek.com/v1/chat/completions"
+        elif provider == "mistral" or provider == "mistralai":
+            url = "https://api.mistral.ai/v1/chat/completions"
+        elif provider == "nvidia":
+            url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        elif provider == "fireworks":
+            url = "https://api.fireworks.ai/inference/v1/chat/completions"
+        else:
+            url = f"https://api.{provider}.com/v1/chat/completions"
+        
+        # Make minimal test request
+        model_name = model.split("/", 1)[1] if "/" in model else model
+        
+        with httpx.Client(timeout=15.0) as client:
+            r = client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "Say ok"}],
+                    "max_tokens": 3,
+                },
+            )
+        
+        elapsed_ms = int((time.time() - start) * 1000)
+        
+        if r.status_code == 200:
+            return {"ok": True, "model": model, "status": "available", "elapsed_ms": elapsed_ms,
+                    "message": "Model is available and responding"}
+        
+        # Parse error
+        try:
+            err = r.json().get("error", {})
+            err_msg = err.get("message", r.text[:100])
+        except:
+            err_msg = r.text[:100] if r.text else f"HTTP {r.status_code}"
+        
+        err_lower = err_msg.lower()
+        
+        if r.status_code == 402 or "insufficient" in err_lower or "balance" in err_lower:
+            return {"ok": False, "model": model, "status": "insufficient_balance", 
+                    "elapsed_ms": elapsed_ms, "message": "Insufficient account balance"}
+        if r.status_code == 404 or "not found" in err_lower:
+            return {"ok": False, "model": model, "status": "not_found",
+                    "elapsed_ms": elapsed_ms, "message": "Model not found"}
+        if r.status_code == 401 or "unauthorized" in err_lower or "invalid" in err_lower:
+            return {"ok": False, "model": model, "status": "auth_error",
+                    "elapsed_ms": elapsed_ms, "message": "Authentication error"}
+        
+        return {"ok": False, "model": model, "status": "error", "elapsed_ms": elapsed_ms,
+                "error": err_msg, "message": err_msg}
+        
+    except httpx.TimeoutException:
+        elapsed_ms = int((time.time() - start) * 1000)
+        return {"ok": False, "model": model, "status": "timeout", "elapsed_ms": elapsed_ms,
+                "message": "Request timed out"}
+    except Exception as e:
+        elapsed_ms = int((time.time() - start) * 1000)
+        return {"ok": False, "model": model, "status": "error", "elapsed_ms": elapsed_ms,
+                "error": str(e), "message": str(e)}
+
 def get_models_health():
     """
     Return health status of all configured models.
@@ -1988,6 +2235,13 @@ async def resume_project(req: ProjectResumeRequest):
             should_resume = task.get("status") in {"error", "pending", "paused", "in_progress"}
 
         if should_resume:
+            current_status = str(task.get("status") or "")
+            is_healthy_pending = (
+                current_status == "pending"
+                and not task.get("error")
+                and not task.get("failure_kind")
+                and int(task.get("failure_count") or 0) == 0
+            )
             task["status"] = "pending"
             task.pop("error", None)
             task.pop("failure_kind", None)
@@ -1995,6 +2249,13 @@ async def resume_project(req: ProjectResumeRequest):
             task.pop("next_action", None)
             task.pop("raw_response", None)
             task.pop("blocked_note", None)
+            if is_healthy_pending:
+                task.pop("not_before", None)
+                task.pop("resume_cooldown_sec", None)
+            else:
+                cooldown_sec = _resume_cooldown_seconds(task)
+                _set_task_resume_cooldown(task, cooldown_sec)
+                task["resume_cooldown_sec"] = cooldown_sec
             resumed.append(task_id)
         task_ids.append(task_id)
 

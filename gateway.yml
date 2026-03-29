@@ -14,7 +14,7 @@ agents:
     - id: "byte"
       name: "BYTE — Programmer"
       workspace: "./workspaces/programmer"
-      model: "nvidia/moonshotai/kimi-k2.5"   # fallback: deepseek/deepseek-chat
+      model: "deepseek/deepseek-chat"   # fallback: deepseek/deepseek-chat
       agentDir: "~/.openclaw/agents/byte"
 
     - id: "pixel"

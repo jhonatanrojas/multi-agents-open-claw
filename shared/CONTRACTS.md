@@ -9,6 +9,28 @@
 
 This document defines the explicit interface agreements between BYTE (backend) and PIXEL (frontend). Both agents must read this file before producing or consuming any interface.
 
+### Frontend Preview Contract
+
+For frontend tasks, BYTE is responsible for bringing up a short-lived preview and publishing its URL in task memory.
+
+- Preferred preview mechanism: `cloudflared tunnel --url http://localhost:3000`
+- Fallbacks when a public IP is already available: `npx serve` or `npm run dev`
+- BYTE must write the resulting URL to `MEMORY.json.preview_url`
+- BYTE must set `MEMORY.json.preview_status` to `running` while the preview is live
+- ARCH must include the preview URL in the final announce after JUDGE approves the task
+- ARCH must tell BYTE to stop the preview after human confirmation
+- JUDGE must verify that a frontend preview exists and is reachable before approving the task
+
+### Output Boundary Contract
+
+The system must keep design artifacts and project deliverables separate.
+
+- Design artifacts live in the agent workspace under `workspaces/<agent>/<project>/design/` and are used for iteration, review, and handoff.
+- Project deliverables live in the repository path for the project, such as `projects/<repo>/index.html`, `css/*.css`, and `js/*.js`.
+- A task is not `done` unless the files listed for that task exist in the project repository, not only in the agent workspace.
+- Workspace-only files are evidence of work in progress, not final delivery.
+- JUDGE must validate repository paths, not just workspace artifacts, before approving frontend or design tasks.
+
 ---
 
 ## API Endpoint Schemas
@@ -16,6 +38,8 @@ This document defines the explicit interface agreements between BYTE (backend) a
 ### Task Progress API
 
 PIXEL's dashboard components consume this endpoint to display task status.
+
+`artifacts` in this API refers to project deliverables that exist in the repository path, not workspace-only design artifacts.
 
 **Endpoint:** `GET /api/tasks`
 
@@ -28,6 +52,8 @@ PIXEL's dashboard components consume this endpoint to display task status.
       "title": "string",
       "agent": "byte | pixel",
       "status": "pending | in_progress | done | error | needs_revision",
+      "preview_url": "string | null",
+      "preview_status": "running | stopped | not_applicable",
       "priority": "high | medium | low",
       "depends_on": ["string (task_id)"],
       "acceptance_criteria": ["string"],
@@ -118,6 +144,8 @@ interface Task {
   description: string;
   agent: AgentId;
   status: TaskStatus;
+  preview_url: string | null;
+  preview_status: 'running' | 'stopped' | 'not_applicable';
   priority: Priority;
   depends_on: string[];
   acceptance_criteria: string[];

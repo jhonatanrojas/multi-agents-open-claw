@@ -8,6 +8,7 @@ bootstrap, stack-aware skill routing, Telegram notifications, and Miniverse.
 
 from __future__ import annotations
 
+import logging
 import argparse
 import atexit
 import asyncio
@@ -15,6 +16,7 @@ import datetime
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -98,6 +100,7 @@ DEFAULT_RETRY_DELAY_SEC = 2.0
 AGENTS_SESSION_DIR = Path("/root/.openclaw/agents")
 MAX_SESSION_SIZE_KB = 50  # Máximo 50KB por sesión para evitar overflow de tokens
 MAX_PROMPT_CHARS = 50000  # Máximo 50k chars para prompts (≈12k tokens)
+_EXIT_HOOKS_INSTALLED = False
 
 
 def clean_oversized_sessions(agent_id: str = None) -> int:
@@ -162,6 +165,64 @@ class TaskOutputBlocked(Exception):
 class NonRetryableError(Exception):
     """Raised when a task shouldn't be blindly retried (e.g. gateway timeouts, infra issues)."""
     pass
+
+
+_NO_RETRY_PROVIDER_SIGNALS = (
+    "429",
+    "rate limit",
+    "too many requests",
+    "quota exceeded",
+    "insufficient balance",
+    "insufficient account balance",
+    "unauthorized",
+    "forbidden",
+    "invalid api key",
+    "api key",
+    "invalid or expired token",
+)
+
+
+def _provider_retry_guard(exc: BaseException) -> str | None:
+    """Return a human-readable reason when retrying would likely worsen provider pressure."""
+    text = str(exc or "").lower()
+    for signal in _NO_RETRY_PROVIDER_SIGNALS:
+        if signal in text:
+            return signal
+    return None
+
+
+def _task_resume_cooldown_seconds(*, failure_kind: str | None = None, detail: str | None = None) -> int:
+    """Return a conservative cooldown before a task may be resumed again."""
+    text = f"{failure_kind or ''} {detail or ''}".lower()
+    if any(signal in text for signal in _NO_RETRY_PROVIDER_SIGNALS):
+        return 300
+    if failure_kind in {"format", "parse"} or "json inválido" in text or "json invalid" in text:
+        return 90
+    if failure_kind in {"blocked", "review"}:
+        return 60
+    return 60
+
+
+def _cooldown_not_before(seconds: int) -> str:
+    """Return a naive UTC ISO timestamp *seconds* in the future."""
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=max(0, int(seconds)))
+    ).replace(tzinfo=None).isoformat()
+
+
+def _push_task_not_before(task: dict[str, Any], seconds: int) -> str:
+    """Set task.not_before to the later of the existing value and the requested cooldown."""
+    new_not_before = _cooldown_not_before(seconds)
+    current = task.get("not_before")
+    if isinstance(current, str) and current.strip():
+        try:
+            if datetime.datetime.fromisoformat(current) >= datetime.datetime.fromisoformat(new_not_before):
+                return current
+        except Exception:
+            pass
+    task["not_before"] = new_not_before
+    return new_not_before
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +336,38 @@ def ensure_runtime_dirs() -> None:
 
 
 def _normalize_task_output(data: dict[str, Any], *, agent_id: str, task_id: str) -> tuple[list[dict[str, str]], str]:
-    """Validate the JSON returned by a task agent before writing files."""
+    """Validate the JSON returned by a task agent before writing files.
+    
+    Accepts two formats:
+    1. New format: {"files": [...], "notes": "..."}
+    2. Legacy format: {"status": "done", "artifacts": [...], "summary": "..."}
+    
+    Automatically transforms legacy format to new format.
+    """
+    # Handle legacy format: status/artifacts/summary -> files/notes
+    if "files" not in data or data.get("files") is None:
+        # Check for legacy format
+        artifacts = data.get("artifacts")
+        if isinstance(artifacts, list):
+            # Transform: artifacts (paths) -> files (objects with path/content)
+            import logging
+            logging.warning(f"[{agent_id}] Using legacy format (status/artifacts) for {task_id}")
+            
+            # Get summary as notes
+            notes = data.get("summary", data.get("notes", ""))
+            
+            # Convert artifacts paths to files objects
+            # Content will be empty - the files already exist in the repo
+            files = []
+            for artifact in artifacts:
+                if isinstance(artifact, str):
+                    files.append({"path": artifact, "content": ""})  # Empty content = file exists
+                elif isinstance(artifact, dict) and "path" in artifact:
+                    files.append(artifact)
+            
+            if files:
+                data = {"files": files, "notes": notes}
+    
     files = data.get("files")
     if not isinstance(files, list):
         raise ValueError("La respuesta JSON no incluye una lista válida de archivos")
@@ -388,6 +480,49 @@ def _append_jsonl_record(record: dict[str, Any]) -> None:
     JSONL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with JSONL_LOG_FILE.open("a", encoding="utf-8") as log_file:
         log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _install_exit_diagnostics() -> None:
+    """Record graceful process exits and signals that would otherwise look silent."""
+    global _EXIT_HOOKS_INSTALLED
+    if _EXIT_HOOKS_INSTALLED:
+        return
+    _EXIT_HOOKS_INSTALLED = True
+
+    def _snapshot(reason: str, signum: int | None = None) -> None:
+        try:
+            mem = load_memory()
+            project = mem.get("project", {}) or {}
+            orchestrator = project.get("orchestrator", {}) or {}
+            _append_jsonl_record(
+                {
+                    "ts": utc_now(),
+                    "agent": "system",
+                    "level": "warning",
+                    "msg": f"Exit diagnostic: {reason}",
+                    "details": {
+                        "pid": os.getpid(),
+                        "signal": signum,
+                        "project_id": project.get("id"),
+                        "orchestrator_status": orchestrator.get("status"),
+                        "orchestrator_phase": orchestrator.get("phase"),
+                        "orchestrator_detail": orchestrator.get("detail"),
+                    },
+                }
+            )
+        except Exception:
+            pass
+
+    def _handle_signal(signum: int, _frame: Any) -> None:
+        _snapshot(f"received signal {signum}", signum)
+        raise SystemExit(128 + signum)
+
+    atexit.register(lambda: _snapshot("python atexit"))
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handle_signal)
+        except Exception:
+            continue
 
 
 def log_event(
@@ -755,9 +890,18 @@ async def retry_async(
             log_event(f"{label} falló con un error no reintentable: {exc}", agent, level="error")
             raise
         except Exception as exc:
+            provider_guard = _provider_retry_guard(exc)
+            if provider_guard:
+                message = (
+                    f"{label} falló con un error de proveedor no reintentable "
+                    f"({provider_guard}); se cancela el retry automático para evitar presión/rate limit adicional: {exc}"
+                )
+                log_event(message, agent, level="error")
+                raise NonRetryableError(message) from exc
             last_exc = exc
             log_event(
-                f"{label} falló en el intento {attempt}/{max(1, retries)}: {exc}",
+                f"{label} falló en el intento {attempt}/{max(1, retries)}: "
+                f"{type(exc).__name__}: {exc}",
                 agent,
                 level="warning",
                 attempt=attempt,
@@ -1277,6 +1421,80 @@ async def _check_gateway_health(client: "OpenClawClient") -> None:
         ) from exc
 
 
+def _gateway_probe_snapshot() -> dict[str, Any]:
+    """Capture a compact gateway snapshot for planner/runtime diagnostics."""
+    cmd = ["openclaw", "gateway", "probe", "--json"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "cmd": cmd, "error": str(exc)}
+
+    snapshot: dict[str, Any] = {
+        "ok": proc.returncode == 0,
+        "cmd": cmd,
+        "returncode": proc.returncode,
+        "stdout_preview": (proc.stdout or "")[:1200],
+        "stderr_preview": (proc.stderr or "")[:1200],
+    }
+    try:
+        parsed = parse_json_content(proc.stdout or "")
+        if isinstance(parsed, dict):
+            snapshot["parsed_keys"] = sorted(parsed.keys())
+            snapshot["parsed"] = parsed
+    except Exception:
+        pass
+    return snapshot
+
+
+def _persist_planner_diagnostics(
+    *,
+    brief: str,
+    planner_prompt: str,
+    planner_session_id: str,
+    result: Any | None = None,
+    planner_content: str = "",
+    status: str,
+    error: str | None = None,
+) -> Path:
+    """Write a planner diagnostic snapshot for silent failures and bad JSON."""
+    diagnostic_path = LOG_DIR / "planner-diagnostics.json"
+    payload: dict[str, Any] = {
+        "ts": utc_now(),
+        "status": status,
+        "error": error,
+        "brief_preview": brief[:1200],
+        "planner_session_id": planner_session_id,
+        "planner_prompt_chars": len(planner_prompt or ""),
+        "planner_prompt_preview": planner_prompt[:2000],
+        "planner_content_preview": planner_content[:2000],
+        "gateway_probe": _gateway_probe_snapshot(),
+    }
+    if result is not None:
+        payload["result"] = {
+            "elapsed_sec": getattr(result, "elapsed_sec", None),
+            "failure_kind": getattr(result, "failure_kind", None),
+            "session_id": getattr(result, "session_id", None),
+            "returncode": getattr(result, "returncode", None),
+            "stdout_len": getattr(result, "stdout_len", None),
+            "stderr_len": getattr(result, "stderr_len", None),
+            "stderr_tail": getattr(result, "stderr_tail", None),
+            "envelope_keys": getattr(result, "envelope_keys", None),
+            "content_source": getattr(result, "content_source", None),
+            "timing": getattr(result, "timing", None),
+        }
+    diagnostic_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return diagnostic_path
+
+
 # ── Fase 1: Planificación ──────────────────────────────────────────────────────
 
 # (Prompts externalized to prompts/*.md)
@@ -1409,40 +1627,73 @@ async def plan_project(
         secure_brief = truncate_prompt(brief, context="brief")
         planner_prompt = PLANNER_PROMPT.format(project_brief=secure_brief)
         planner_session_id = make_session_id("arch", "planning", secure_brief)
-        result = await retry_async(
-            "Planner execution",
-            lambda: arch.execute(
-                planner_prompt,
-                on_progress=progress_cb,
-                session_id=planner_session_id,
-                thinking="medium",
-            ),
-            timeout_sec=phase_timeout_sec,
-            retries=retry_attempts,
-            delay_sec=retry_delay_sec,
-            agent="arch",
+        log_event(
+            f"Planner dispatch: session_id={planner_session_id} brief_chars={len(secure_brief)} prompt_chars={len(planner_prompt)}",
+            "arch",
+            level="info",
         )
+        try:
+            result = await retry_async(
+                "Planner execution",
+                lambda: arch.execute(
+                    planner_prompt,
+                    on_progress=progress_cb,
+                    session_id=planner_session_id,
+                    thinking="medium",
+                ),
+                timeout_sec=phase_timeout_sec,
+                retries=retry_attempts,
+                delay_sec=retry_delay_sec,
+                agent="arch",
+            )
+        except Exception as exc:
+            diagnostic_path = _persist_planner_diagnostics(
+                brief=secure_brief,
+                planner_prompt=planner_prompt,
+                planner_session_id=planner_session_id,
+                result=None,
+                planner_content="",
+                status="planner_execution_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            log_event(
+                f"Planner execution abortó antes de devolver contenido. diag={diagnostic_path}",
+                "arch",
+                level="error",
+            )
+            raise
         log_event(
             f"ARCH respondió en {result.elapsed_sec:.0f}s "
-            f"(content_len={len(result.content)}, stderr_lines={len(result.stderr_lines)})",
+            f"(content_len={len(result.content)}, stderr_lines={len(result.stderr_lines)}, "
+            f"returncode={result.returncode}, failure_kind={result.failure_kind}, "
+            f"content_source={result.content_source}, envelope_keys={result.envelope_keys})",
             "arch",
         )
         planner_content = result.content or ""
-
-        log_event(
-            f"ARCH respondió en {result.elapsed_sec:.0f}s "
-            f"(content_len={len(result.content)}, stderr_lines={len(result.stderr_lines)})",
-            "arch",
-        )
+        if result.stderr_tail:
+            log_event(
+                f"Planner stderr tail: {' | '.join(result.stderr_tail[-5:])[:900]}",
+                "arch",
+                level="debug",
+            )
 
         try:
             plan_json = parse_json_content(planner_content)
         except (json.JSONDecodeError, ValueError) as exc:
+            diagnostic_path = _persist_planner_diagnostics(
+                brief=secure_brief,
+                planner_prompt=planner_prompt,
+                planner_session_id=planner_session_id,
+                result=result,
+                planner_content=planner_content,
+                status="invalid_json",
+                error=str(exc),
+            )
             _save_planner_message(planner_content, parsed=None, status="invalid_json")
             update_agent_status("arch", "error", "planning_failed")
             log_event(
                 f"El planificador devolvió JSON inválido: {exc} — "
-                f"content[:300]={result.content[:300]}",
+                f"content[:300]={result.content[:300]} diag={diagnostic_path}",
                 "arch",
                 level="error",
             )
@@ -1452,8 +1703,21 @@ async def plan_project(
         planned_tasks = _count_planned_tasks(plan_json)
         _save_planner_message(planner_content, parsed=plan_json, status="ok")
         if planned_tasks == 0:
+            diagnostic_path = _persist_planner_diagnostics(
+                brief=secure_brief,
+                planner_prompt=planner_prompt,
+                planner_session_id=planner_session_id,
+                result=result,
+                planner_content=planner_content,
+                status="empty_plan",
+                error="El planificador devolvió 0 tareas",
+            )
             update_agent_status("arch", "error", "planning_empty")
-            log_event("El planificador devolvió 0 tareas; se cancela la ejecución para revisión.", "arch", level="error")
+            log_event(
+                f"El planificador devolvió 0 tareas; se cancela la ejecución para revisión. diag={diagnostic_path}",
+                "arch",
+                level="error",
+            )
             update_orchestrator_state(
                 "error",
                 phase="planning",
@@ -1611,12 +1875,33 @@ def _write_task_files(
     files_payload: list[dict[str, str]],
     output_dir: Path,
 ) -> list[str]:
-    """Write agent-produced files to disk and return their normalized paths."""
+    """Write agent-produced files to disk and return their normalized paths.
+    
+    If a file has empty content, it means the file already exists and should not
+    be overwritten (legacy format compatibility).
+    """
     files_written: list[str] = []
     for f in files_payload:
         fpath = _safe_workspace_path(output_dir, f["path"])
-        fpath.parent.mkdir(parents=True, exist_ok=True)
-        fpath.write_text(f["content"], encoding="utf-8")
+        content = f.get("content", "")
+        
+        # Legacy format: empty content means file already exists
+        if not content or content.strip() == "":
+            # Check if file exists
+            if fpath.exists():
+                logging.info(f"File already exists, skipping write: {fpath}")
+                files_written.append(normalize_output_path(fpath))
+                continue
+            # File doesn't exist and no content - this is an error
+            logging.warning(f"Empty content for non-existent file: {fpath}")
+            # Create empty file as placeholder
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text("", encoding="utf-8")
+        else:
+            # Normal case: write content to file
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text(content, encoding="utf-8")
+        
         files_written.append(normalize_output_path(fpath))
     return files_written
 
@@ -1648,9 +1933,7 @@ def _handle_task_blocked(
             t["blocked_note"] = detail
             t["failure_count"] = int(t.get("failure_count") or 0) + 1
             t["last_failure_at"] = utc_now()
-            t["not_before"] = (
-                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=60)
-            ).replace(tzinfo=None).isoformat()
+            _push_task_not_before(t, _task_resume_cooldown_seconds(failure_kind="blocked", detail=detail))
             t["raw_response"] = (result.content or "")[:2000]
     _sync_project_status(mem)
     refresh_project_runtime_state(mem)
@@ -1703,6 +1986,7 @@ def _handle_review_result(
             t["next_action"] = "correct_after_review"
             t["review_round"] = review_round
             t["review_issues"] = review_issues
+            _push_task_not_before(t, _task_resume_cooldown_seconds(failure_kind="review", detail="; ".join(review_issues)))
     mem.setdefault("project", {})
     mem["project"]["status"] = "in_progress"
     mem["project"]["updated_at"] = utc_now()
@@ -1848,7 +2132,10 @@ async def execute_task(
     for t in mem.get("tasks", []):
         if t.get("id") == task_id:
             stored = str(t.get("session_id") or "").strip()
-            session_id = stored if is_valid_session_id(stored) else generated_session_id
+            # Si el fallo anterior fue de formato, forzar nuevo session_id para evitar contaminación de contexto
+            prev_failure_kind = t.get("failure_kind")
+            force_new_session = prev_failure_kind == "format" or t.get("failure_count", 0) > 0
+            session_id = generated_session_id if force_new_session else (stored if is_valid_session_id(stored) else generated_session_id)
             t.update({"status": "in_progress", "progress_file": str(progress_path),
                       "workspace_context": str(workspace_files["context_md"]),
                       "skills": skill_profile["skills"], "skill_family": skill_profile["family"],
@@ -1879,10 +2166,32 @@ async def execute_task(
         feedback_str = "\n".join(feedback)
         if not feedback_str.strip():
             feedback_str = "Continúa con la tarea."
+        
+        # Si el fallo fue de formato JSON, incluir instrucciones explícitas del esquema
+        format_failure = task.get("failure_kind") == "format" or "json" in feedback_str.lower() or "formato" in feedback_str.lower()
+        
+        json_schema_reminder = (
+            "\n\n⚠️ OBLIGATORIO — Tu respuesta debe ser SOLO JSON válido con este esquema exacto:\n"
+            "```json\n"
+            "{\n"
+            '  "files": [\n'
+            '    {"path": "archivo.ext", "content": "contenido completo del archivo"}\n'
+            "  ],\n"
+            '  "notes": "descripción breve de lo implementado"\n'
+            "}\n"
+            "```\n"
+            "REGLAS:\n"
+            "1. El primer carácter debe ser `{`\n"
+            "2. El último carácter debe ser `}`\n"
+            "3. NO uses claves como: status, artifacts, summary, ok, result\n"
+            "4. NO añadas texto explicativo fuera del JSON\n"
+            "5. Si el trabajo ya existe, COPIA el contenido real a `files`\n"
+        ) if format_failure else ""
             
         prompt = (
             f"El orquestador requiere que continúes o corrijas la tarea '{task_id}'.\n"
-            f"Notas, bloqueos resueltos o feedback del intento anterior:\n---\n{feedback_str}\n---\n\n"
+            f"Notas, bloqueos resueltos o feedback del intento anterior:\n---\n{feedback_str}\n---"
+            f"{json_schema_reminder}\n"
             f"Revisa tu workspace local y devuelve el output final actualizado en el formato JSON estricto esperado."
         )
     else:
@@ -1911,6 +2220,7 @@ async def execute_task(
         raw_response: str | None = None,
         failure_kind: str | None = None,
     ) -> None:
+        cooldown_sec = _task_resume_cooldown_seconds(failure_kind=failure_kind, detail=detail)
         append_progress_event(progress_path, "error", progress_message, status="error",
                               failure_kind=failure_kind,
                               raw_response=(raw_response[:1000] if isinstance(raw_response, str) else None))
@@ -1924,6 +2234,7 @@ async def execute_task(
                           "retryable": retryable, "failure_count": failure_count,
                           "last_failure_at": utc_now(),
                           "next_action": "review" if not retryable else "retry_or_reassign"})
+                _push_task_not_before(t, cooldown_sec)
                 if raw_response:
                     dump_file = OUTPUT_DIR / f"{task_id}_{agent_id}_failure.log"
                     try:
@@ -1936,6 +2247,7 @@ async def execute_task(
                     t.update({"previous_agent": agent_id, "agent": fallback_agent,
                               "status": "pending", "next_action": f"reassigned_to_{fallback_agent}",
                               "suggested_agent": fallback_agent, "reassigned_at": utc_now()})
+                    _push_task_not_before(t, cooldown_sec)
         _sync_project_status(mem)
         refresh_project_runtime_state(mem)
         save_memory(mem)
@@ -2362,6 +2674,7 @@ async def main(args: argparse.Namespace) -> None:
 
     ensure_runtime_dirs()
     ensure_memory_file()
+    _install_exit_diagnostics()
     success = False
 
     try:

@@ -41,7 +41,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # Default path to the base OpenClaw config file.
 OPENCLAW_CONFIG_PATH = Path(os.getenv("OPENCLAW_CONFIG", Path.home() / ".openclaw" / "openclaw.json"))
 OPENCLAW_RUNTIME_PROFILE = os.getenv("OPENCLAW_PROFILE", "multi-agents-runtime-v2").strip()
-OPENCLAW_RUNTIME_HOME = Path(os.getenv("OPENCLAW_RUNTIME_HOME", str(BASE_DIR / ".openclaw-runtime")))
+OPENCLAW_RUNTIME_HOME = Path(os.getenv("OPENCLAW_RUNTIME_HOME", str(Path.home() / ".openclaw-runtime")))
 _BASE_OPENCLAW_ROOT = OPENCLAW_CONFIG_PATH.parent
 
 # Minimum seconds between Telegram-bound progress updates (avoid spam).
@@ -283,6 +283,32 @@ def _find_json_document(text: str) -> Any:
     return None
 
 
+def _strip_markdown_json_fences(text: str) -> str:
+    """Normalize fenced markdown that wraps a JSON payload.
+
+    Handles both multiline fences:
+        ```json
+        {...}
+        ```
+
+    and inline fences:
+        ```json {...} ```
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    fenced_match = re.match(r"^```(?:json|JSON)?\s*(.*?)\s*```$", text, flags=re.DOTALL)
+    if fenced_match:
+        return fenced_match.group(1).strip()
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json|JSON)?\s*", "", text, count=1, flags=re.DOTALL)
+        text = re.sub(r"\s*```$", "", text, count=1, flags=re.DOTALL)
+
+    return text.strip()
+
+
 def parse_json_content(content: str) -> Any:
     """Public helper: parse JSON from plain text, fenced markdown, or mixed output.
 
@@ -292,16 +318,7 @@ def parse_json_content(content: str) -> Any:
     Returns the decoded Python object, or raises ``ValueError`` if no valid
     JSON document is found.
     """
-    text = (content or "").strip()
-
-    # Strip leading code fence (```json or ```)
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
+    text = _strip_markdown_json_fences(content)
 
     result = _find_json_document(text)
     if result is None:
@@ -381,6 +398,30 @@ def _extract_content(envelope: dict[str, Any]) -> str:
 
     log.warning("Could not extract content from envelope keys=%s", sorted(envelope.keys()))
     return ""
+
+
+def _detect_content_source(envelope: dict[str, Any]) -> str:
+    """Return the envelope path that produced content, for diagnostics."""
+    payloads = envelope.get("payloads")
+    if isinstance(payloads, list) and payloads:
+        first = payloads[0]
+        if isinstance(first, dict) and "text" in first:
+            return "payloads[0].text"
+        if isinstance(first, str):
+            return "payloads[0]"
+
+    result = envelope.get("result")
+    if isinstance(result, dict):
+        nested = _detect_content_source(result)
+        if nested != "unknown":
+            return f"result.{nested}"
+
+    for key in ("content", "message"):
+        val = envelope.get(key)
+        if isinstance(val, str) and val:
+            return key
+
+    return "unknown"
 
 
 def _extract_timing(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -576,6 +617,12 @@ class AgentResult:
     failure_kind: FailureKind | None = None
     session_id: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    returncode: int = 0
+    stdout_len: int = 0
+    stderr_len: int = 0
+    stderr_tail: list[str] = field(default_factory=list)
+    envelope_keys: list[str] = field(default_factory=list)
+    content_source: str = "unknown"
 
 
 class Agent:
@@ -620,12 +667,14 @@ class Agent:
             self.agent_id,
         ])
         
+        effective_session_id = session_id
         if session_id:
             cmd.extend(["--session-id", session_id])
         else:
             fallback = f"auto-{int(time.monotonic())}"
             cmd.extend(["--session-id", fallback])
             log.warning("No session_id passed. Used fallback: %s", fallback)
+            effective_session_id = fallback
             
         if thinking:
             cmd.extend(["--thinking", thinking])
@@ -654,6 +703,12 @@ class Agent:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+        )
+        log.info(
+            "Spawned openclaw process pid=%s for agent=%s session_id=%s",
+            proc.pid,
+            self.agent_id,
+            effective_session_id,
         )
 
         # Stream stderr in real-time while stdout is buffered.
@@ -703,18 +758,32 @@ class Agent:
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         elapsed = time.monotonic() - t0
+        stderr_joined = "\n".join(stderr_lines)
 
         if proc.returncode != 0:
             log.error(
-                "openclaw agent exited %d for agent=%s (%.1fs); last stderr=%s",
+                "openclaw agent exited %d for agent=%s pid=%s (%.1fs); stdout=%d bytes stderr=%d lines last stderr=%s",
                 proc.returncode,
                 self.agent_id,
+                proc.pid,
                 elapsed,
+                len(stdout_bytes),
+                len(stderr_lines),
                 stderr_lines[-1][:200] if stderr_lines else "N/A",
             )
+        else:
+            log.info(
+                "openclaw agent completed rc=0 for agent=%s pid=%s (%.1fs); stdout=%d bytes stderr=%d lines",
+                self.agent_id,
+                proc.pid,
+                elapsed,
+                len(stdout_bytes),
+                len(stderr_lines),
+            )
 
-        envelope = _extract_cli_payload(stdout, "\n".join(stderr_lines))
+        envelope = _extract_cli_payload(stdout, stderr_joined)
         content = _extract_content(envelope)
+        content_source = _detect_content_source(envelope)
         timing = _extract_timing(envelope)
 
         if not content:
@@ -768,8 +837,14 @@ class Agent:
                 stderr_lines=stderr_lines,
                 returncode=proc.returncode or 0,
             ),
-            session_id=session_id,
+            session_id=effective_session_id,
             events=_parse_stderr_events(stderr_lines, self.agent_id, t0),
+            returncode=proc.returncode or 0,
+            stdout_len=len(stdout_bytes),
+            stderr_len=len(stderr_joined),
+            stderr_tail=stderr_lines[-10:],
+            envelope_keys=sorted(envelope.keys()) if envelope else [],
+            content_source=content_source,
         )
 
     async def get_session_status(self, session_id: str) -> dict[str, Any] | None:

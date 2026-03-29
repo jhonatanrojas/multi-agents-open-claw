@@ -28,6 +28,12 @@ agents:
       workspace: "./workspaces/programmer"
       # Model managed dynamically via Dashboard API
       agentDir: "~/.openclaw/agents/byte"
+      tools:
+        exec:
+          allow:
+            - "cloudflared tunnel --url"
+            - "npx serve"
+            - "npm run dev"
 
     - id: "pixel"
       name: "PIXEL - Designer"
