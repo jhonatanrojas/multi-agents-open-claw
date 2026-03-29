@@ -853,6 +853,8 @@ def materialize_planned_project(
             task["skill_profile"] = profile
             task["skills"] = profile["skills"]
             task["workspace_notes"] = profile["instructions"]
+            task.setdefault("preview_url", None)
+            task.setdefault("preview_status", "not_applicable")
             task_skill_summary[task["id"]] = profile["skills"]
             all_tasks.append(task)
 

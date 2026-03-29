@@ -743,6 +743,8 @@ def approve_proposal(proposal_id: str) -> dict[str, Any] | None:
         "skill_family": profile.get("family", "general"),
         "skill_profile": profile,
         "execution_dir": proposal.get("execution_dir") or infer_task_execution_dir(project, proposal, mem.get("repo_state") or {}),
+        "preview_url": None,
+        "preview_status": "not_applicable",
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "source_proposal_id": proposal_id,

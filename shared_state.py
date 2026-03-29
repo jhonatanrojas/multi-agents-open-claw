@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 MAX_LOG_ENTRIES = 500
 MAX_MESSAGES = 200
 MAX_BLOCKERS = 100
+TASK_PREVIEW_STATUSES = {"running", "stopped", "not_applicable"}
 
 def utc_now() -> str:
     """Return an ISO-8601 UTC timestamp without tzinfo (database compatible)."""
@@ -138,6 +139,24 @@ def _deep_merge(base: Any, incoming: Any) -> Any:
     return incoming
 
 
+def _normalize_task_preview_fields(mem: dict[str, Any]) -> None:
+    """Ensure task preview fields always exist and use a valid status."""
+    tasks = mem.get("tasks")
+    if not isinstance(tasks, list):
+        return
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        if "preview_url" not in task:
+            task["preview_url"] = None
+        elif task["preview_url"] is not None and not isinstance(task["preview_url"], str):
+            task["preview_url"] = str(task["preview_url"])
+
+        preview_status = str(task.get("preview_status") or "").strip().lower()
+        if preview_status not in TASK_PREVIEW_STATUSES:
+            task["preview_status"] = "not_applicable"
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -232,6 +251,7 @@ def load_memory() -> dict[str, Any]:
             source = default_memory()
 
         merged = _deep_merge(DEFAULT_MEMORY, source)
+        _normalize_task_preview_fields(merged)
         if source_path != PRIMARY_MEMORY or merged != source:
             # Migrate / normalise – go through save_memory for truncation.
             save_memory(merged)
@@ -252,6 +272,7 @@ def save_memory(data: dict[str, Any]) -> dict[str, Any]:
             payload["messages"] = payload["messages"][-MAX_MESSAGES:]
         if len(payload.get("blockers", [])) > MAX_BLOCKERS:
             payload["blockers"] = payload["blockers"][-MAX_BLOCKERS:]
+        _normalize_task_preview_fields(payload)
         _write_atomic(PRIMARY_MEMORY, payload)
         return payload
 

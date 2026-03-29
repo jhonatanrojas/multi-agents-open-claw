@@ -15,11 +15,12 @@ For frontend tasks, BYTE is responsible for bringing up a short-lived preview an
 
 - Preferred preview mechanism: `cloudflared tunnel --url http://localhost:3000`
 - Fallbacks when a public IP is already available: `npx serve` or `npm run dev`
-- BYTE must write the resulting URL to `MEMORY.json.preview_url`
+- BYTE must write the resulting URL to the task entry in `MEMORY.json.preview_url`
 - BYTE must set `MEMORY.json.preview_status` to `running` while the preview is live
+- BYTE must set `MEMORY.json.preview_status` to `stopped` after ARCH confirms human receipt of the preview
 - ARCH must include the preview URL in the final announce after JUDGE approves the task
 - ARCH must tell BYTE to stop the preview after human confirmation
-- JUDGE must verify that a frontend preview exists and is reachable before approving the task
+- JUDGE must verify that a frontend preview exists, is reachable, and is reflected in `MEMORY.json` before approving the task
 
 ### Output Boundary Contract
 

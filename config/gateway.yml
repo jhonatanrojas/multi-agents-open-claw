@@ -30,7 +30,10 @@ agents:
       agentDir: "~/.openclaw/agents/byte"
       tools:
         exec:
+          # Preview lifecycle allowlist for frontend delivery
           allow:
+            - "cloudflared tunnel --url http://localhost:3000"
+            - "cloudflared tunnel --url http://127.0.0.1:3000"
             - "cloudflared tunnel --url"
             - "npx serve"
             - "npm run dev"
