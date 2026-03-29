@@ -9,3 +9,7 @@ shared/MEMORY.json
 .openclaw-runtime/
 .claude
 openclaw-portal/
+.env
+backups/
+*.backup-format-transform
+shared/MEMORY.json.backup-format-fix
