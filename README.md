@@ -51,6 +51,35 @@ Dashboard API para control activo del operador:
 - `POST /api/tasks/{task_id}/pause` — Pausa tarea para revisión
 - `PATCH /api/context` — Actualiza contexto compartido con versionado
 
+### 8. Extensión Sobre Proyectos Existentes
+El dashboard ya permite agregar nuevas características o ajustes sobre un proyecto activo o entregado sin crear uno nuevo:
+- `POST /api/project/extend` encola una extensión sobre el mismo `project_id`
+- `auto_resume` permite reanudar el mismo proyecto si no hay un orquestador vivo
+- la UI expone el formulario de extensión en `ProjectBar`
+
+### 9. Visibilidad Operativa del Runtime
+El panel de ejecuciones ya muestra la ejecución activa real del proyecto:
+- PID primario, estado, fase y tarea actual del orquestador
+- detección de duplicados y limpieza de runtime obsoleto
+- refresco manual para inspección rápida
+
+### 10. Archivos, Tareas y Previews Históricos
+La vista de proyecto ahora sincroniza mejor su estado entre tabs:
+- al cambiar de proyecto, Tareas y Archivos se recargan siempre
+- los archivos archivados pueden abrir preview aunque ya no existan en disco
+- la sección histórica del dashboard muestra fases cerradas, incluida la fase 5 de despliegue
+
+### 11. Modelos con Proveedor y Test de Disponibilidad
+El selector de modelos ya muestra el proveedor junto al nombre del modelo y permite probar disponibilidad:
+- detecta `rate limit`, `saldo insuficiente`, `auth error`, `timeout` y otros fallos comunes
+- el frontend persiste cambios reales en el backend y rehidrata la configuración al recargar
+
+### 12. Planificación Inteligente con Aclaraciones
+ARCH ya no bloquea por preguntas genéricas:
+- un verificador LLM decide si realmente hace falta aclaración antes de planificar
+- las preguntas se ajustan por tipo de proyecto: backend-service, frontend, laravel y documentation
+- si el brief ya es suficiente, el flujo sigue sin intervención humana
+
 ---
 
 ## Architecture
