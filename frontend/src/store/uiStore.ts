@@ -3,6 +3,10 @@ import { persist } from 'zustand/middleware';
 import type { TabId } from '@/components/shared/Tabs';
 
 interface UIState {
+  // Project view mode
+  projectViewMode: 'new' | 'view';
+  setProjectViewMode: (mode: 'new' | 'view') => void;
+  
   // Tabs
   activeTab: TabId;
   setActiveTab: (tab: TabId) => void;
@@ -30,6 +34,7 @@ interface UIState {
 }
 
 const initialState = {
+  projectViewMode: 'new' as 'new' | 'view',
   activeTab: 'tasks' as TabId,
   selectedFilePath: null,
   filesScope: 'running' as 'running' | 'finished' | 'all',
@@ -43,6 +48,9 @@ export const useUIStore = create<UIState>()(
     (set) => ({
       // Initial state
       ...initialState,
+      
+      // Project mode actions
+      setProjectViewMode: (mode) => set({ projectViewMode: mode }),
       
       // Tab actions
       setActiveTab: (tab) => set({ activeTab: tab }),

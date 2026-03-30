@@ -62,6 +62,8 @@ export function useDevSquadInit() {
         useFilesStore.getState().setSnapshot(snapshot);
       } catch (e) {
         useFilesStore.getState().setError(String(e));
+      } finally {
+        useFilesStore.getState().setLoading(false);
       }
     };
     

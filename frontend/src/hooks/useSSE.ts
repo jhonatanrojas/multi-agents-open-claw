@@ -1,9 +1,10 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useMemoryStore } from '@/store';
+import { API_BASE } from '@/constants';
 import type { Memory } from '@/types';
 
-// SSE stream endpoint (relative to the domain, proxied by Apache)
-const SSE_URL = '/devsquad/stream';
+// SSE stream endpoint follows the same API base used by the rest of the app.
+const SSE_URL = API_BASE.replace(/\/$/, '') + '/stream';
 
 interface UseSSEOptions {
   enabled?: boolean;

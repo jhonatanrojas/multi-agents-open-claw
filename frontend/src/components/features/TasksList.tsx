@@ -54,6 +54,9 @@ export function TasksList() {
         <Panel>
           <EmptyState>
             Este proyecto aún no tiene tareas.
+            {project.status === 'delivered' && (
+              <><br/>El proyecto fue marcado como entregado sin tareas persistidas en memoria.</>
+            )}
             {project.status === 'blocked' && (
               <><br/>El proyecto está esperando clarificación para continuar.</>
             )}

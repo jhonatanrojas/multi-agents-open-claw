@@ -3,6 +3,7 @@ import type { Agent } from '@/types';
 import { StatusBadge } from './Badge';
 import { AGENT_META } from '@/constants';
 import { sendSteer } from '@/api/client';
+import { useModelsStore } from '@/store';
 import './AgentCard.css';
 
 interface AgentCardProps {
@@ -20,6 +21,7 @@ interface AgentCardProps {
 
 export function AgentCard({ agentId, agent, latestChat, logs }: AgentCardProps) {
   const meta = AGENT_META[agentId as keyof typeof AGENT_META];
+  const modelConfig = useModelsStore((state) => state.config);
   if (!meta) return null;
   
   const status = agent.status || 'offline';
@@ -31,6 +33,9 @@ export function AgentCard({ agentId, agent, latestChat, logs }: AgentCardProps) 
   
   const MAX_CHARS = 140;
   const remaining = MAX_CHARS - steerMessage.length;
+  const selectedModelId = modelConfig?.agents?.[agentId]?.model || meta.model;
+  const selectedModel = modelConfig?.available?.find((model) => model.qualified === selectedModelId);
+  const provider = selectedModel?.provider || 'desconocido';
   
   const handleSend = async () => {
     if (!steerMessage.trim()) return;
@@ -73,7 +78,8 @@ export function AgentCard({ agentId, agent, latestChat, logs }: AgentCardProps) 
       
       {/* Model */}
       <div className="agent-model">
-        <code>{meta.model}</code>
+        <code>{selectedModelId}</code>
+        <span className="agent-model-provider">· {provider}</span>
       </div>
       
       {/* Latest chat */}

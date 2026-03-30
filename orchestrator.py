@@ -58,6 +58,7 @@ from coordination import (
     slugify,
     record_task_review,
     format_telegram_blocker_message,
+    _task_preview_profile,
     send_telegram_message,
     apply_session_diagnostics_to_workspace,
     finalize_repo_after_task,
@@ -241,6 +242,7 @@ def load_prompt(name: str) -> str:
 
 
 PLANNER_PROMPT = load_prompt("planner.md")
+CLARIFICATION_CHECK_PROMPT = load_prompt("clarification-check.md")
 COORDINATION_PROMPT = load_prompt("coordination.md")
 BYTE_TASK_PROMPT = load_prompt("byte.md")
 PIXEL_TASK_PROMPT = load_prompt("pixel.md")
@@ -436,6 +438,33 @@ def _task_files_for_manifest(task: dict[str, Any]) -> list[str]:
         and raw_path.strip()
         and (candidate := _resolve_task_artifact_path(raw_path, project)) is not None
     ]
+
+
+def _project_has_active_work(mem: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Return active agents and open progress files that still indicate work in flight."""
+    active_agents: list[str] = []
+    agents = mem.get("agents") if isinstance(mem.get("agents"), dict) else {}
+    for agent_id, agent_state in agents.items():
+        if not isinstance(agent_state, dict):
+            continue
+        status = str(agent_state.get("status") or "").lower()
+        current_task = str(agent_state.get("current_task") or "").strip()
+        if status in {"working", "thinking"} or (status and current_task and status not in {"idle", "offline"}):
+            active_agents.append(agent_id)
+
+    open_progress_files: list[str] = []
+    for raw_path in mem.get("progress_files", []) if isinstance(mem.get("progress_files"), list) else []:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        progress_path = Path(raw_path)
+        if not progress_path.exists():
+            continue
+        progress = load_progress(progress_path)
+        progress_status = str(progress.get("status") or "").lower()
+        if progress_status not in {"done", "passed", "delivered"}:
+            open_progress_files.append(raw_path)
+
+    return active_agents, open_progress_files
 
 
 def load_progress(progress_path: Path) -> dict[str, Any]:
@@ -745,6 +774,9 @@ def approve_proposal(proposal_id: str) -> dict[str, Any] | None:
         "status": "pending",
         "skill_family": profile.get("family", "general"),
         "skill_profile": profile,
+        "preview_required": bool(profile.get("preview_required")),
+        "preview_host": profile.get("preview_host"),
+        "preview_mechanism": profile.get("preview_mechanism"),
         "execution_dir": proposal.get("execution_dir") or infer_task_execution_dir(project, proposal, mem.get("repo_state") or {}),
         "preview_url": None,
         "preview_status": "not_applicable",
@@ -1065,6 +1097,169 @@ def _save_planner_message(raw_content: str, parsed: dict[str, Any] | None, statu
         }
     )
     save_memory(mem)
+
+
+def _brief_requests_deployment(brief: str) -> bool:
+    text = (brief or "").lower()
+    return any(
+        token in text
+        for token in (
+            "deploy",
+            "deployment",
+            "preview",
+            "publicar",
+            "publicación",
+            "publicacion",
+            "release",
+        )
+    )
+
+
+def _task_mentions_deployment(task: dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or ""),
+            " ".join(str(item) for item in (task.get("acceptance") or []) if isinstance(item, str)),
+        ]
+    ).lower()
+    return any(
+        token in text
+        for token in (
+            "deploy",
+            "deployment",
+            "preview",
+            "publicar",
+            "publicación",
+            "publicacion",
+            "release",
+            "despliegue",
+        )
+    )
+
+
+def _plan_has_explicit_deploy_task(plan_json: dict[str, Any]) -> bool:
+    plan = plan_json.get("plan", {}) if isinstance(plan_json, dict) else {}
+    phases = plan.get("phases", []) if isinstance(plan, dict) else []
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        for task in phase.get("tasks", []) or []:
+            if isinstance(task, dict) and _task_mentions_deployment(task):
+                return True
+    return False
+
+
+def _ensure_deploy_task_in_plan(plan_json: dict[str, Any], brief: str) -> tuple[dict[str, Any], str | None]:
+    """Inject a final deploy task when the brief explicitly asks for deployment."""
+    if not _brief_requests_deployment(brief):
+        return plan_json, None
+
+    plan = plan_json if isinstance(plan_json, dict) else {}
+    if _plan_has_explicit_deploy_task(plan):
+        return plan, None
+
+    project = plan.get("project", {}) if isinstance(plan.get("project", {}), dict) else {}
+    project_structure = project.get("project_structure") or infer_project_structure(project, {})
+    normalized_project = dict(project)
+    normalized_project["project_structure"] = project_structure
+
+    synthetic_task = {
+        "agent": "byte",
+        "title": "Publicar preview final",
+        "description": brief,
+        "acceptance": [
+            "Publicar una URL temporal accesible para revisión",
+            "Registrar preview_url en MEMORY.json",
+            "Mantener preview_status en running mientras el preview esté vivo",
+        ],
+    }
+    preview_profile = _task_preview_profile(normalized_project, synthetic_task, agent_id="byte")
+    preview_host = str(preview_profile.get("host") or "").strip()
+    preview_mechanism = str(preview_profile.get("mechanism") or "").strip()
+
+    phases = plan.setdefault("plan", {}).setdefault("phases", [])
+    if not isinstance(phases, list):
+        phases = []
+        plan["plan"]["phases"] = phases
+
+    existing_tasks: list[dict[str, Any]] = []
+    existing_ids: set[str] = set()
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        for task in phase.get("tasks", []) or []:
+            if not isinstance(task, dict):
+                continue
+            existing_tasks.append(task)
+            task_id = str(task.get("id") or "").strip()
+            if task_id:
+                existing_ids.add(task_id)
+
+    next_num = 1
+    while f"T-{next_num:03d}" in existing_ids:
+        next_num += 1
+    task_id = f"T-{next_num:03d}"
+
+    all_depends = [task.get("id") for task in existing_tasks if isinstance(task.get("id"), str) and task.get("id")]
+    all_files: list[str] = []
+    for task in existing_tasks:
+        for path in task.get("files", []) or []:
+            if isinstance(path, str) and path.strip():
+                all_files.append(path.strip())
+    if not all_files:
+        all_files = ["index.js"]
+    all_files = list(dict.fromkeys(all_files))
+
+    phase_id = f"phase-{len(phases) + 1}"
+    phase_name = "Despliegue y verificación"
+    if preview_host == "preview.deploymatrix.com":
+        phase_name = "Despliegue de frontend"
+    elif preview_host == "preview-backend.deploymatrix.com":
+        phase_name = "Despliegue de backend/API"
+
+    deploy_task = {
+        "id": task_id,
+        "agent": "byte",
+        "title": (
+            f"Publicar preview en {preview_host}"
+            if preview_host
+            else "Publicar preview temporal"
+        ),
+        "description": (
+            f"Levantar el servicio y exponerlo en {preview_host} usando cloudflared tunnel."
+            if preview_host
+            else "Levantar el servicio y exponerlo como preview temporal usando cloudflared tunnel."
+        ),
+        "acceptance": [
+            f"La URL pública responde en https://{preview_host}/" if preview_host else "La URL pública responde",
+            "preview_url queda registrado en MEMORY.json",
+            "preview_status queda en running mientras el preview esté vivo",
+            "La publicación de preview queda separada de las tareas de implementación",
+        ],
+        "depends_on": all_depends,
+        "files": all_files,
+        "skills": ["Deployment", "Cloudflare Tunnel", "Health Checks"],
+        "workspace_notes": [
+            "No confundas esta tarea con las tareas de implementación funcional.",
+            "Publica solo cuando el servicio ya esté estable y verificado.",
+        ],
+        "preview_required": True,
+        "preview_host": preview_host,
+        "preview_mechanism": preview_mechanism,
+    }
+
+    phases.append(
+        {
+            "id": phase_id,
+            "name": phase_name,
+            "tasks": [deploy_task],
+        }
+    )
+    plan.setdefault("milestones", [])
+    if isinstance(plan["milestones"], list):
+        plan["milestones"].append("Preview/deploy final publicado")
+    return plan, task_id
 
 
 def _telegram_orchestrator_state(mem: dict[str, Any]) -> dict[str, Any]:
@@ -1522,17 +1717,122 @@ def _persist_planner_diagnostics(
 # (Prompts externalized to prompts/*.md)
 
 
+async def _verify_planning_clarification_with_llm(
+    client: OpenClawClient,
+    brief: str,
+    candidate_questions: list[str],
+) -> dict[str, Any]:
+    """Ask ARCH to verify whether the brief truly needs clarification."""
+    if not candidate_questions:
+        return {
+            "needs_clarification": False,
+            "questions": [],
+            "reason": "No hay ambigüedad suficiente para justificar aclaración.",
+        }
+
+    secure_brief = truncate_prompt(brief, context="brief")
+    tech_stack = infer_tech_stack_from_brief(brief)
+    project_preview = {
+        "name": secure_brief[:60].strip() or "Project",
+        "description": brief,
+        "tech_stack": tech_stack,
+        "repo_path": str((BASE_DIR / ".clarification-check").resolve()),
+    }
+    project_structure = infer_project_structure(project_preview, {})
+    project_kind = str(project_structure.get("kind") or "general")
+    arch = client.get_agent("arch")
+    verifier_prompt = CLARIFICATION_CHECK_PROMPT.format(
+        project_brief=secure_brief,
+        tech_stack=json.dumps(tech_stack, ensure_ascii=False),
+        project_structure=json.dumps(project_structure, ensure_ascii=False),
+        project_kind=project_kind,
+        candidate_questions=json.dumps(candidate_questions, ensure_ascii=False),
+    )
+    verifier_session_id = make_session_id("arch", "clarification", secure_brief)
+
+    result = await retry_async(
+        "Planning clarification verification",
+        lambda: arch.execute(
+            verifier_prompt,
+            session_id=verifier_session_id,
+            thinking="low",
+        ),
+        timeout_sec=180,
+        retries=2,
+        delay_sec=1.5,
+        agent="arch",
+    )
+
+    try:
+        parsed = parse_json_content(result.content or "")
+    except Exception:
+        return {
+            "needs_clarification": True,
+            "questions": candidate_questions,
+            "reason": "El verificador LLM devolvió JSON inválido.",
+        }
+
+    if not isinstance(parsed, dict):
+        return {
+            "needs_clarification": True,
+            "questions": candidate_questions,
+            "reason": "El verificador LLM devolvió una estructura no válida.",
+        }
+
+    needs_clarification = bool(parsed.get("needs_clarification"))
+    questions = [
+        str(question).strip()
+        for question in (parsed.get("questions") or [])
+        if isinstance(question, str) and question.strip()
+    ]
+    if needs_clarification and not questions:
+        questions = candidate_questions
+
+    return {
+        "needs_clarification": needs_clarification,
+        "questions": questions,
+        "reason": str(parsed.get("reason") or "").strip(),
+        "raw": parsed,
+    }
+
+
 def _format_planning_clarification_message(brief: str, questions: list[str], structure: dict[str, Any]) -> str:
     layout_kind = structure.get("kind") or "n/a"
+    if layout_kind == "backend-service":
+        detail = (
+            "Se detectó un servicio backend Node/Express para una API CRUD. "
+            "Faltan decisiones sobre persistencia, autenticación y entrega final."
+        )
+        reply_hint = "Indica la base de datos y si la API tendrá autenticación o será pública."
+        next_action = "ARCH reanudará la planificación cuando esas decisiones queden claras."
+    elif layout_kind == "framework-frontend":
+        detail = (
+            "Se detectó un frontend con framework. "
+            "Falta cerrar el alcance funcional antes de desglosar tareas."
+        )
+        reply_hint = "Confirma si el alcance es sobre un proyecto existente o uno nuevo."
+        next_action = "ARCH reanudará la planificación cuando el alcance esté definido."
+    elif layout_kind == "vanilla-static":
+        detail = (
+            "Se detectó un sitio estático en HTML/CSS/JS. "
+            "Falta decidir si será sólo contenido o también interacción con datos."
+        )
+        reply_hint = "Indica si será estático puro o si necesita interacción y datos."
+        next_action = "ARCH reanudará la planificación cuando el alcance esté cerrado."
+    else:
+        detail = f"Se requiere aclaración antes de planificar. Tipo detectado: {layout_kind}."
+        reply_hint = "Responde con una aclaración concreta por Telegram o desde DevSquad."
+        next_action = "ARCH reanudará la planificación cuando llegue tu respuesta."
+
     return format_telegram_blocker_message(
         "Bloqueo de planificación",
         source="ARCH",
         status="needs_clarification",
-        detail=f"Se requiere aclaración antes de planificar. Tipo detectado: {layout_kind}.",
+        detail=detail,
         brief=brief,
         questions=questions,
-        reply_hint="Responde con una aclaración concreta por Telegram o desde DevSquad.",
-        next_action="ARCH reanudará la planificación cuando llegue tu respuesta.",
+        reply_hint=reply_hint,
+        next_action=next_action,
     )
 
 
@@ -1565,6 +1865,27 @@ async def plan_project(
             )
 
         clarification_questions = needs_planning_clarification(brief)
+        if clarification_questions and client is not None:
+            llm_verdict = await _verify_planning_clarification_with_llm(
+                client,
+                brief,
+                clarification_questions,
+            )
+            if llm_verdict.get("needs_clarification") is False:
+                log_event(
+                    f"[Fase 1] El verificador LLM descartó la aclaración. reason={llm_verdict.get('reason') or 'n/a'}",
+                    "arch",
+                    level="info",
+                )
+                clarification_questions = []
+            else:
+                clarification_questions = llm_verdict.get("questions") or clarification_questions
+                log_event(
+                    f"[Fase 1] El verificador LLM confirmó aclaración. questions={len(clarification_questions)} reason={llm_verdict.get('reason') or 'n/a'}",
+                    "arch",
+                    level="info",
+                )
+
         if clarification_questions:
             existing_clarification = _clarification_pending(mem_pre)
             already_sent = (
@@ -1723,6 +2044,14 @@ async def plan_project(
             )
             update_orchestrator_state("error", phase="planning", detail="El planificador devolvió JSON inválido", dry_run=dry_run)
             raise RuntimeError("El planificador devolvió JSON inválido") from exc
+
+        plan_json, injected_deploy_task_id = _ensure_deploy_task_in_plan(plan_json, brief)
+        if injected_deploy_task_id:
+            log_event(
+                f"[Fase 1] Se añadió una tarea separada de deploy: {injected_deploy_task_id}",
+                "arch",
+                level="info",
+            )
 
         planned_tasks = _count_planned_tasks(plan_json)
         _save_planner_message(planner_content, parsed=plan_json, status="ok")
@@ -2302,29 +2631,34 @@ async def execute_task(
                     _push_task_not_before(t, cooldown_sec)
         _sync_project_status(mem)
         refresh_project_runtime_state(mem)
-    save_memory(mem)
-    record_blocker(f"Tarea {task_id} ({agent_id}) falló [{failure_kind or 'unknown'}]: {detail}",
-                   source=agent_id, task_id=task_id, agent_id=agent_id, retryable=retryable)
-    try:
-        send_telegram_message(
-            format_telegram_blocker_message(
-                "Tarea fallida",
-                source=agent_id.upper(),
-                status="blocked",
-                task_id=task_id,
-                detail=detail,
-                reply_hint="Revisa el error en DevSquad o reintenta la tarea con corrección.",
-                next_action="ARCH decidirá el siguiente paso tras la revisión.",
-            )
+        save_memory(mem)
+        record_blocker(
+            f"Tarea {task_id} ({agent_id}) falló [{failure_kind or 'unknown'}]: {detail}",
+            source=agent_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            retryable=retryable,
         )
-    except Exception as exc:
-        log_event(f"Falló la notificación de tarea fallida por Telegram: {exc}", "system", level="warning")
-    if fallback_agent and retryable and failure_count >= RESUME_FAILURE_THRESHOLD:
-        log_event(f"Tarea {task_id} reasignada a {fallback_agent} tras {failure_count} fallos", "system", level="warning")
-        bridge.heartbeat("error", f"Error en {task_id}")
-        update_agent_status(agent_id, "error", task_id)
-        update_orchestrator_state("blocked", phase="execution", task_id=task_id, detail=detail, dry_run=dry_run)
-        log_event(f"La tarea {task_id} FALLÓ [{failure_kind or 'unknown'}]: {detail}", agent_id, level="error")
+        try:
+            send_telegram_message(
+                format_telegram_blocker_message(
+                    "Tarea fallida",
+                    source=agent_id.upper(),
+                    status="blocked",
+                    task_id=task_id,
+                    detail=detail,
+                    reply_hint="Revisa el error en DevSquad o reintenta la tarea con corrección.",
+                    next_action="ARCH decidirá el siguiente paso tras la revisión.",
+                )
+            )
+        except Exception as exc:
+            log_event(f"Falló la notificación de tarea fallida por Telegram: {exc}", "system", level="warning")
+        if fallback_agent and retryable and failure_count >= RESUME_FAILURE_THRESHOLD:
+            log_event(f"Tarea {task_id} reasignada a {fallback_agent} tras {failure_count} fallos", "system", level="warning")
+            bridge.heartbeat("error", f"Error en {task_id}")
+            update_agent_status(agent_id, "error", task_id)
+            update_orchestrator_state("blocked", phase="execution", task_id=task_id, detail=detail, dry_run=dry_run)
+            log_event(f"La tarea {task_id} FALLÓ [{failure_kind or 'unknown'}]: {detail}", agent_id, level="error")
 
     # ── Ejecución del agente ────────────────────────────────────────────────
     result = None
@@ -2609,6 +2943,34 @@ async def final_review(
             "system",
             level="warning",
         )
+        return
+
+    active_agents, open_progress_files = _project_has_active_work(mem)
+    if active_agents or open_progress_files:
+        mem = load_memory()
+        mem.setdefault("project", {})
+        mem["project"]["status"] = "blocked"
+        mem["project"]["blocked_reason"] = "Todavía hay agentes o progreso de tareas en curso"
+        mem["project"]["updated_at"] = utc_now()
+        refresh_project_runtime_state(mem)
+        save_memory(mem)
+        update_orchestrator_state(
+            "blocked",
+            phase="review",
+            detail="Revisión detenida: hay trabajo en curso fuera de tasks[]",
+            dry_run=dry_run,
+        )
+        log_event(
+            "La revisión final detectó agentes o progreso activo; no se marcará como entregado",
+            "system",
+            level="warning",
+            active_agents=active_agents,
+            open_progress_files=open_progress_files,
+        )
+        try:
+            send_telegram_message(_telegram_project_summary(mem))
+        except Exception as exc:
+            log_event(f"Falló el resumen de proyecto por Telegram: {exc}", "system")
         return
 
     project_output_dir = resolve_path(mem.get("project", {}).get("output_dir"), OUTPUT_DIR)

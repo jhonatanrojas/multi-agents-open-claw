@@ -2,7 +2,7 @@ import { useMemoryStore } from '@/store';
 import './ProjectSelector.css';
 
 interface ProjectSelectorProps {
-  selectedProjectId: string | null;
+  selectedProjectId?: string | null;
   onSelect: (projectId: string | null) => void;
 }
 
@@ -10,9 +10,14 @@ export function ProjectSelector({ selectedProjectId, onSelect }: ProjectSelector
   const projects = useMemoryStore((s) => s.projects);
   const activeProject = useMemoryStore((s) => s.project);
   
-  // Use selected or active project
-  const currentId = selectedProjectId || activeProject?.id || null;
-  const currentProject = projects.find(p => p.id === currentId);
+  // Filter out deleted projects
+  const visibleProjects = projects.filter(p => 
+    p.status !== 'deleted' && p.status !== 'archived'
+  );
+  
+  // Use the explicitly selected project when provided.
+  const currentId = selectedProjectId !== undefined ? selectedProjectId : activeProject?.id || null;
+  const currentProject = visibleProjects.find(p => p.id === currentId);
   
   return (
     <div className="project-selector">
@@ -20,14 +25,14 @@ export function ProjectSelector({ selectedProjectId, onSelect }: ProjectSelector
         <span className="selector-title">Proyecto activo</span>
         {currentProject && (
           <span className="selector-status">
-            {currentProject.status === 'running' ? '🟢' : '⚪'} {currentProject.status}
+            {currentProject.status === 'running' ? '🟢' : currentProject.status === 'blocked' ? '🟡' : '⚪'} {currentProject.status}
           </span>
         )}
       </div>
       
       <div className="selector-actions">
         {/* Project dropdown */}
-        {projects.length > 0 && (
+        {visibleProjects.length > 0 && (
           <select 
             className="project-dropdown"
             value={currentId || ''}
@@ -37,7 +42,7 @@ export function ProjectSelector({ selectedProjectId, onSelect }: ProjectSelector
             }}
           >
             <option value="">-- Nuevo Proyecto --</option>
-            {projects.map(p => (
+            {visibleProjects.map(p => (
               <option key={p.id} value={p.id}>
                 {p.name} ({p.status})
               </option>

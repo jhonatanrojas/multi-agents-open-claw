@@ -1,6 +1,6 @@
 import type { GatewayEvent } from '@/types';
 import { AGENT_META } from '@/constants';
-import { truncate } from '@/utils';
+import { extractGatewayText, truncate } from '@/utils';
 
 interface GatewayChatCardProps {
   event: GatewayEvent;
@@ -15,26 +15,8 @@ export function GatewayChatCard({ event, compact = false }: GatewayChatCardProps
 
   // Extract message content from payload
   const getMessageContent = () => {
-    const payload = event.payload as Record<string, unknown>;
-    if (typeof payload.content === 'string') {
-      return payload.content;
-    }
-    if (typeof payload.text === 'string') {
-      return payload.text;
-    }
-    if (Array.isArray(payload.content)) {
-      // Handle array of content blocks
-      return payload.content
-        .filter((block): block is Record<string, unknown> => typeof block === 'object' && block !== null)
-        .map((block) => {
-          if (block.type === 'text' && typeof block.text === 'string') {
-            return block.text;
-          }
-          return '';
-        })
-        .join('');
-    }
-    return null;
+    const text = extractGatewayText(event.payload);
+    return text || event.summary || null;
   };
 
   const content = getMessageContent();

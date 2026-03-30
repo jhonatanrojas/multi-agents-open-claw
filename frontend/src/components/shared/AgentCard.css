@@ -39,13 +39,22 @@
   background: var(--bg-secondary);
   padding: 1px 6px;
   border-radius: 4px;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   margin: 6px 0;
+  flex-wrap: wrap;
 }
 
 .agent-model code {
   background: none;
   padding: 0;
+}
+
+.agent-model-provider {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-transform: lowercase;
 }
 
 .agent-chat {

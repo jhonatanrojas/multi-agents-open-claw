@@ -88,8 +88,41 @@ export interface StartProjectParams {
   allow_init_repo?: boolean;
 }
 
+export interface ExtendProjectParams {
+  brief: string;
+  project_id?: string | null;
+  auto_resume?: boolean;
+  source?: string;
+}
+
+export interface ExtendProjectResponse {
+  ok: boolean;
+  project_id: string;
+  task_id: string;
+  task_title: string;
+  agent: string;
+  project_status: string;
+  auto_resumed: boolean;
+  message: string;
+  timestamp: string;
+}
+
 export async function startProject(params: StartProjectParams): Promise<{ message: string }> {
   return apiCall('/project/start', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export async function loadProject(projectId: string): Promise<{ status: string; message: string; ts: string }> {
+  return apiCall('/project/load', {
+    method: 'POST',
+    body: JSON.stringify({ project_id: projectId }),
+  });
+}
+
+export async function extendProject(params: ExtendProjectParams): Promise<ExtendProjectResponse> {
+  return apiCall<ExtendProjectResponse>('/project/extend', {
     method: 'POST',
     body: JSON.stringify(params),
   });
@@ -120,6 +153,17 @@ export async function resumeProject(params?: {
   return apiCall('/project/resume', {
     method: 'POST',
     body: JSON.stringify(params || { resume_all_failed: true }),
+  });
+}
+
+export async function retryPlanning(): Promise<{
+  status: string;
+  message: string;
+  project_id: string;
+  timestamp: string;
+}> {
+  return apiCall('/project/retry-planning', {
+    method: 'POST',
   });
 }
 
@@ -205,7 +249,8 @@ export async function fetchMiniverse(force = false): Promise<MiniverseSnapshot> 
 // ============ RUNTIME ============
 
 export async function fetchRuntime(): Promise<{ runtime: RuntimeSnapshot }> {
-  return apiCall<{ runtime: RuntimeSnapshot }>('/runtime/orchestrators');
+  const runtime = await apiCall<RuntimeSnapshot>('/runtime/orchestrators');
+  return { runtime };
 }
 
 export async function cleanupRuntime(mode = 'duplicates'): Promise<{ message: string }> {

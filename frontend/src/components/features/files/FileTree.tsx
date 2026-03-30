@@ -117,14 +117,21 @@ function TreeNode({ node, depth, defaultExpanded = false }: TreeNodeProps) {
     } else {
       setSelectedFilePath(node.path);
       // Fetch file content for preview
-      useFilesStore.getState().setPreviewLoading(true);
-      fetchFileView(node.path).then((res) => {
-        useFilesStore.getState().setPreviewContent(res.file?.content || '');
-        useFilesStore.getState().setPreviewLoading(false);
-      }).catch(() => {
-        useFilesStore.getState().setPreviewContent(`Error loading ${node.path}`);
-        useFilesStore.getState().setPreviewLoading(false);
-      });
+      const filesStore = useFilesStore.getState();
+      filesStore.setPreviewError(null);
+      filesStore.setPreviewContent(null);
+      filesStore.setPreviewLoading(true);
+      fetchFileView(node.path)
+        .then((res) => {
+          filesStore.setPreviewContent(res.file?.content || '');
+          filesStore.setPreviewLoading(false);
+        })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : `Error loading ${node.path}`;
+          filesStore.setPreviewContent(null);
+          filesStore.setPreviewError(message);
+          filesStore.setPreviewLoading(false);
+        });
     }
   };
   
@@ -166,6 +173,7 @@ function TreeNode({ node, depth, defaultExpanded = false }: TreeNodeProps) {
 export function FileTree() {
   const snapshot = useFilesStore((s) => s.snapshot);
   const isLoading = useFilesStore((s) => s.isLoading);
+  const error = useFilesStore((s) => s.error);
   
   // Get all files from snapshot
   const allFiles = useMemo(() => {
@@ -194,6 +202,15 @@ export function FileTree() {
   
   if (isLoading) {
     return <div className="file-tree-loading">Cargando archivos...</div>;
+  }
+
+  if (error) {
+    return (
+      <div className="file-tree-empty">
+        <p>No se pudieron cargar los archivos.</p>
+        <small>{error}</small>
+      </div>
+    );
   }
   
   if (allFiles.length === 0) {

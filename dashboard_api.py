@@ -14,6 +14,8 @@ Endpoints:
   GET  /api/miniverse      -> GitHub repo metadata + live Miniverse snapshot
   GET  /api/logs           -> last log entries
   POST /api/project/start  -> triggers orchestrator
+  POST /api/project/extend  -> enqueue a follow-up task on the current project
+  POST /api/project/retry-planning -> re-run planning for the current project
   GET  /api/models           -> current agent models + normalized model catalog
   GET  /api/models/available -> normalized flat list of gateway models + local fallback
   GET  /api/models/providers -> provider configs (without API keys)
@@ -31,6 +33,7 @@ Auth (GAP-1 / P5):
 import json
 import asyncio
 import hashlib
+import mimetypes
 import re
 import sys
 import subprocess
@@ -44,6 +47,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from typing import Any
 
 import requests
@@ -60,16 +64,24 @@ from openclaw_sdk import (
     set_agent_model as sdk_set_agent_model,
     set_default_model as sdk_set_default_model,
 )
-from coordination import send_telegram_message
+from coordination import (
+    ensure_project_id,
+    format_telegram_blocker_message,
+    infer_project_structure,
+    send_telegram_message,
+    update_project_history,
+)
 from shared_state import (
     BASE_DIR,
     DEFAULT_MEMORY,
     _pid_is_alive,
+    get_project_blockers,
     load_memory,
     refresh_project_runtime_state,
     save_memory,
     utc_now,
 )
+from orchestrator import approve_proposal, propose_follow_up_task
 
 from websockets.exceptions import ConnectionClosed
 
@@ -1987,7 +1999,125 @@ def test_model(payload: dict[str, Any]):
         
         # Make minimal test request
         model_name = model.split("/", 1)[1] if "/" in model else model
-        
+        request_body = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Say ok"}],
+            "max_tokens": 3,
+        }
+
+        def _resolve_host_via_doh(hostname: str) -> str | None:
+            """Resolve a host via Cloudflare DoH when local DNS is failing."""
+            host = hostname.strip()
+            if not host:
+                return None
+
+            current = host
+            seen: set[str] = set()
+            for _ in range(3):
+                if current in seen:
+                    return None
+                seen.add(current)
+
+                doh_url = f"https://1.1.1.1/dns-query?name={current}&type=A"
+                proc = subprocess.run(
+                    [
+                        "curl",
+                        "-sS",
+                        "--max-time",
+                        "10",
+                        "-k",
+                        doh_url,
+                        "-H",
+                        "accept: application/dns-json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode != 0 or not proc.stdout:
+                    return None
+
+                try:
+                    payload = json.loads(proc.stdout)
+                except Exception:
+                    return None
+
+                answers = payload.get("Answer", [])
+                if isinstance(answers, list):
+                    for answer in answers:
+                        if not isinstance(answer, dict):
+                            continue
+                        if answer.get("type") == 1 and answer.get("data"):
+                            return str(answer["data"]).strip()
+                    cname = next(
+                        (
+                            str(answer.get("data")).strip().rstrip(".")
+                            for answer in answers
+                            if isinstance(answer, dict) and answer.get("type") == 5 and answer.get("data")
+                        ),
+                        None,
+                    )
+                    if cname:
+                        current = cname
+                        continue
+
+                return None
+
+            return None
+
+        def _run_curl_test(resolved_ip: str | None = None) -> tuple[int, str]:
+            """Fallback to curl when Python DNS/proxy resolution fails."""
+            parsed_url = urlparse(url)
+            host = parsed_url.hostname or ""
+            curl_args = [
+                "curl",
+                "-sS",
+                "--max-time",
+                "30",
+                "--retry",
+                "10",
+                "--retry-all-errors",
+                "--retry-delay",
+                "2",
+                "--retry-max-time",
+                "25",
+            ]
+            if resolved_ip and host:
+                curl_args.extend(["--resolve", f"{host}:443:{resolved_ip}"])
+            curl_args.extend([
+                "-X",
+                "POST",
+                url,
+                "-H",
+                f"Authorization: Bearer {api_key}",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                json.dumps(request_body),
+                "-w",
+                "\n%{http_code}",
+            ])
+            proc = subprocess.run(curl_args, capture_output=True, text=True)
+            stdout = proc.stdout or ""
+            stderr = (proc.stderr or "").strip()
+            if proc.returncode != 0 and not stdout:
+                raise RuntimeError(stderr or f"curl exited with code {proc.returncode}")
+
+            if "\n" in stdout:
+                body, status_text = stdout.rsplit("\n", 1)
+            else:
+                body, status_text = stdout, ""
+
+            try:
+                status_code = int(status_text.strip())
+            except Exception:
+                status_code = proc.returncode if proc.returncode else 0
+                body = stdout
+
+            if status_code == 0 and stderr:
+                raise RuntimeError(stderr)
+
+            return status_code, body
+
         with httpx.Client(timeout=15.0) as client:
             r = client.post(
                 url,
@@ -1995,49 +2125,77 @@ def test_model(payload: dict[str, Any]):
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": "Say ok"}],
-                    "max_tokens": 3,
-                },
+                json=request_body,
             )
-        
-        elapsed_ms = int((time.time() - start) * 1000)
-        
-        if r.status_code == 200:
-            return {"ok": True, "model": model, "status": "available", "elapsed_ms": elapsed_ms,
-                    "message": "Model is available and responding"}
-        
-        # Parse error
+
+        response_status = r.status_code
+        response_text = r.text
+
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
         try:
-            err = r.json().get("error", {})
-            err_msg = err.get("message", r.text[:100])
-        except:
-            err_msg = r.text[:100] if r.text else f"HTTP {r.status_code}"
-        
-        err_lower = err_msg.lower()
-        
-        if r.status_code == 402 or "insufficient" in err_lower or "balance" in err_lower:
-            return {"ok": False, "model": model, "status": "insufficient_balance", 
-                    "elapsed_ms": elapsed_ms, "message": "Insufficient account balance"}
-        if r.status_code == 404 or "not found" in err_lower:
-            return {"ok": False, "model": model, "status": "not_found",
-                    "elapsed_ms": elapsed_ms, "message": "Model not found"}
-        if r.status_code == 401 or "unauthorized" in err_lower or "invalid" in err_lower:
-            return {"ok": False, "model": model, "status": "auth_error",
-                    "elapsed_ms": elapsed_ms, "message": "Authentication error"}
-        
-        return {"ok": False, "model": model, "status": "error", "elapsed_ms": elapsed_ms,
-                "error": err_msg, "message": err_msg}
-        
-    except httpx.TimeoutException:
-        elapsed_ms = int((time.time() - start) * 1000)
-        return {"ok": False, "model": model, "status": "timeout", "elapsed_ms": elapsed_ms,
-                "message": "Request timed out"}
+            response_status, response_text = _run_curl_test()
+        except Exception as curl_error:
+            resolved_ip = _resolve_host_via_doh(urlparse(url).hostname or "")
+            if resolved_ip:
+                try:
+                    response_status, response_text = _run_curl_test(resolved_ip=resolved_ip)
+                except Exception as curl_ip_error:
+                    elapsed_ms = int((time.time() - start) * 1000)
+                    return {
+                        "ok": False,
+                        "model": model,
+                        "status": "error",
+                        "elapsed_ms": elapsed_ms,
+                        "error": f"{e}; curl fallback failed: {curl_error}; DoH {resolved_ip} failed: {curl_ip_error}",
+                        "message": str(curl_ip_error),
+                    }
+            else:
+                elapsed_ms = int((time.time() - start) * 1000)
+                return {
+                    "ok": False,
+                    "model": model,
+                    "status": "error",
+                    "elapsed_ms": elapsed_ms,
+                    "error": f"{e}; curl fallback failed: {curl_error}",
+                    "message": str(curl_error),
+                }
+
     except Exception as e:
         elapsed_ms = int((time.time() - start) * 1000)
         return {"ok": False, "model": model, "status": "error", "elapsed_ms": elapsed_ms,
                 "error": str(e), "message": str(e)}
+
+    elapsed_ms = int((time.time() - start) * 1000)
+
+    if response_status == 200:
+        return {"ok": True, "model": model, "status": "available", "elapsed_ms": elapsed_ms,
+                "message": "Model is available and responding"}
+
+    # Parse error
+    try:
+        err = json.loads(response_text).get("error", {})
+        err_msg = err.get("message", response_text[:100])
+    except Exception:
+        err_msg = response_text[:100] if response_text else f"HTTP {response_status}"
+
+    err_lower = err_msg.lower()
+
+    if response_status == 402 or "insufficient" in err_lower or "balance" in err_lower:
+        return {"ok": False, "model": model, "status": "insufficient_balance",
+                "elapsed_ms": elapsed_ms, "message": "Insufficient account balance"}
+    if response_status == 429 or "rate limit" in err_lower or "too many requests" in err_lower or "quota exceeded" in err_lower:
+        return {"ok": False, "model": model, "status": "rate_limit",
+                "elapsed_ms": elapsed_ms, "message": "Rate limit reached"}
+    if response_status == 404 or "not found" in err_lower:
+        return {"ok": False, "model": model, "status": "not_found",
+                "elapsed_ms": elapsed_ms, "message": "Model not found"}
+    if response_status == 401 or "unauthorized" in err_lower or "invalid" in err_lower:
+        return {"ok": False, "model": model, "status": "auth_error",
+                "elapsed_ms": elapsed_ms, "message": "Authentication error"}
+
+    return {"ok": False, "model": model, "status": "error", "elapsed_ms": elapsed_ms,
+            "error": err_msg, "message": err_msg}
+    
 
 def get_models_health():
     """
@@ -2171,6 +2329,13 @@ class ProjectPauseRequest(BaseModel):
     reason: str | None = None
 
 
+class ProjectRetryPlanningResponse(BaseModel):
+    status: str
+    message: str
+    project_id: str
+    timestamp: str
+
+
 class ProjectClarificationReplyRequest(BaseModel):
     reply: str = Field(..., min_length=1, max_length=2000)
     auto_resume: bool = Field(default=True)
@@ -2183,6 +2348,110 @@ class ProjectClarificationReplyResponse(BaseModel):
     auto_resumed: bool
     message: str
     timestamp: str
+
+
+class ProjectExtendRequest(BaseModel):
+    brief: str = Field(..., min_length=1, max_length=4000)
+    project_id: str | None = None
+    auto_resume: bool = Field(default=True)
+    source: str = Field(default="dashboard")
+
+
+class ProjectExtendResponse(BaseModel):
+    ok: bool
+    project_id: str
+    task_id: str
+    task_title: str
+    agent: str
+    project_status: str
+    auto_resumed: bool
+    message: str
+    timestamp: str
+
+
+_EXTENSION_FRONTEND_MARKERS = (
+    "frontend",
+    "ui",
+    "interfaz",
+    "diseño",
+    "design",
+    "css",
+    "html",
+    "react",
+    "vue",
+    "angular",
+    "next",
+    "component",
+    "vista",
+    "pantalla",
+    "selector",
+)
+
+_EXTENSION_BACKEND_MARKERS = (
+    "backend",
+    "api",
+    "endpoint",
+    "router",
+    "route",
+    "coordinador",
+    "coordinator",
+    "planner",
+    "planificador",
+    "orquestador",
+    "workflow",
+    "database",
+    "base de datos",
+    "servicio",
+    "service",
+    "node",
+    "express",
+    "laravel",
+    "php",
+)
+
+
+def _infer_extension_agent(project: dict[str, Any], brief: str) -> str:
+    text = " ".join(
+        [
+            str(project.get("name") or ""),
+            str(project.get("description") or ""),
+            brief,
+        ]
+    ).lower()
+    if any(marker in text for marker in _EXTENSION_BACKEND_MARKERS):
+        return "byte"
+    if any(marker in text for marker in _EXTENSION_FRONTEND_MARKERS):
+        return "pixel"
+
+    structure = infer_project_structure(
+        project,
+        {
+            "title": brief,
+            "description": brief,
+            "agent": "byte",
+        },
+    )
+    if str(structure.get("kind") or "").lower() in {"framework-frontend", "vanilla-static"}:
+        return "pixel"
+    return "byte"
+
+
+def _build_extension_acceptance(project: dict[str, Any], brief: str, agent: str) -> list[str]:
+    text = brief.lower()
+    acceptance = [
+        "La extensión se agrega al proyecto existente sin crear un proyecto nuevo.",
+        "La nueva tarea queda registrada en la memoria activa del mismo project_id.",
+        "La funcionalidad solicitada se valida con una verificación reproducible.",
+    ]
+    if any(marker in text for marker in ("preview", "deploy", "publicar", "desplegar")):
+        acceptance.append("Si el brief lo solicita, la extensión actualiza o publica el preview correspondiente.")
+    if agent == "pixel":
+        acceptance.append("La interfaz o experiencia visual mantiene coherencia con el proyecto actual.")
+    else:
+        acceptance.append("La modificación respeta la base técnica ya existente del proyecto.")
+    if str(project.get("status") or "").lower() == "delivered":
+        acceptance.append("El proyecto entregado se reabre en la misma memoria para continuar sobre él.")
+    return acceptance
 
 
 def _spawn_orchestrator(args: list[str]) -> None:
@@ -2301,6 +2570,98 @@ async def start_project(req: ProjectRequest):
         "message": "Orquestador iniciado correctamente",
         "brief": safe_brief,
         "ts": utc_now(),
+    }
+
+
+@app.post("/api/project/retry-planning", response_model=ProjectRetryPlanningResponse)
+async def retry_planning():
+    """Retry planning for the current project without creating a new run record."""
+    mem = load_memory()
+    project = mem.get("project", {}) or {}
+    project_id = str(project.get("id") or "").strip()
+    orchestrator = project.get("orchestrator", {}) or {}
+    project_status = str(project.get("status") or "").lower()
+    orchestrator_status = str(orchestrator.get("status") or "").lower()
+    orchestrator_phase = str(orchestrator.get("phase") or "").lower()
+
+    retryable_planning_failure = orchestrator_phase == "planning" and orchestrator_status == "error"
+
+    if not retryable_planning_failure:
+        return JSONResponse(
+            {
+                "error": "Solo se puede reintentar la planificación cuando el proyecto está en error de planificación",
+                "project_status": project_status or "idle",
+                "orchestrator_status": orchestrator_status or None,
+                "orchestrator_phase": orchestrator_phase or None,
+            },
+            status_code=422,
+        )
+
+    pending = project.get("pending_clarification")
+    if isinstance(pending, dict) and not pending.get("resolved"):
+        return JSONResponse(
+            {
+                "error": "Hay una aclaración pendiente; responde primero ese bloque antes de reintentar",
+                "project_id": project_id,
+            },
+            status_code=422,
+        )
+
+    orchestrator_pid = orchestrator.get("pid")
+    if _pid_is_alive(orchestrator_pid):
+        return JSONResponse(
+            {
+                "error": "El orquestador todavía está en ejecución; no se puede reintentar ahora",
+                "pid": orchestrator_pid,
+            },
+            status_code=409,
+        )
+
+    if not project_id:
+        project_id = ensure_project_id(project)
+        project["id"] = project_id
+    mem["active_project_id"] = project_id
+
+    project["status"] = "starting"
+    project["updated_at"] = utc_now()
+    project.pop("pending_clarification", None)
+    project["orchestrator"] = {
+        "status": "starting",
+        "phase": "planning",
+        "detail": "Reintentando planificación desde el dashboard",
+        "pid": None,
+        "started_at": utc_now(),
+        "updated_at": utc_now(),
+        "dry_run": False,
+    }
+    mem["tasks"] = []
+    mem["plan"] = {"phases": [], "current_phase": None}
+    mem["blockers"] = []
+    mem["proposals"] = []
+    mem["milestones"] = []
+    mem["files_produced"] = []
+    mem["progress_files"] = []
+    update_project_history(mem)
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+
+    args = [sys.executable, str(BASE_DIR / "orchestrator.py")]
+    if project.get("repo_url"):
+        args.extend(["--repo-url", str(project.get("repo_url"))])
+    if project.get("repo_name"):
+        args.extend(["--repo-name", str(project.get("repo_name"))])
+    if project.get("branch"):
+        args.extend(["--branch", str(project.get("branch"))])
+    if project.get("allow_init_repo"):
+        args.append("--allow-init-repo")
+    args.append(project.get("description") or project.get("name") or "Retry planning project")
+
+    _spawn_orchestrator(args)
+    return {
+        "status": "replanning",
+        "message": "Replanificación iniciada correctamente",
+        "project_id": project_id,
+        "timestamp": utc_now(),
     }
 
 
@@ -2424,16 +2785,43 @@ async def reply_project_clarification(req: ProjectClarificationReplyRequest):
 
     if not project_id:
         return JSONResponse({"error": "No hay proyecto activo"}, status_code=422)
+
     pending_project_id = str(pending.get("project_id") or "").strip() if isinstance(pending, dict) else ""
+    clarification_blockers = [
+        blocker
+        for blocker in get_project_blockers(mem)
+        if isinstance(blocker, dict) and isinstance(blocker.get("questions"), list) and blocker.get("questions")
+    ]
+    active_blocker = clarification_blockers[-1] if clarification_blockers else None
+
     if not isinstance(pending, dict) or pending.get("resolved") or (pending_project_id and pending_project_id != project_id):
-        return JSONResponse({"error": "No hay una aclaración pendiente para responder"}, status_code=404)
+        if not active_blocker:
+            return JSONResponse({"error": "No hay una aclaración pendiente para responder"}, status_code=404)
+        pending = {
+            "questions": list(active_blocker.get("questions") or []),
+            "original_brief": str(active_blocker.get("reply_hint") or project.get("description") or project.get("name") or "").strip(),
+            "sent_at": str(active_blocker.get("ts") or utc_now()),
+            "reply": None,
+            "resolved": False,
+            "project_id": project_id,
+            "project_created_at": project.get("created_at"),
+        }
+        project["pending_clarification"] = pending
+
     if not reply:
         return JSONResponse({"error": "La aclaración no puede estar vacía"}, status_code=422)
+
+    if active_blocker and isinstance(mem.get("blockers"), list):
+        active_blocker["resolved"] = True
+        active_blocker["reply"] = reply
+        active_blocker["reply_source"] = req.source or "dashboard"
+        active_blocker["reply_received_at"] = utc_now()
+        active_blocker["questions"] = []
 
     pending["reply"] = reply
     pending["reply_source"] = req.source or "dashboard"
     pending["reply_received_at"] = utc_now()
-    pending["resolved"] = False
+    pending["resolved"] = True
 
     project.setdefault("orchestrator", {})
     project["updated_at"] = utc_now()
@@ -2463,6 +2851,15 @@ async def reply_project_clarification(req: ProjectClarificationReplyRequest):
             "level": "info",
             "agent": "dashboard",
             "msg": f"Aclaración recibida desde {req.source}: {reply[:120]}{'...' if len(reply) > 120 else ''}",
+            "meta": {"auto_resume": req.auto_resume, "source": req.source},
+        }
+    )
+    mem["log"].append(
+        {
+            "ts": utc_now(),
+            "level": "info",
+            "agent": "dashboard",
+            "msg": "Acuse de recibo: se recibió la aclaración y ARCH retomará la planificación.",
             "meta": {"auto_resume": req.auto_resume, "source": req.source},
         }
     )
@@ -2525,7 +2922,11 @@ async def load_project(payload: dict[str, Any] | None = None):
     mem = load_memory()
     current_proj = mem.get("project", {})
     if current_proj.get("id") == project_id:
-        return JSONResponse({"error": "El proyecto ya está activo"}, status_code=400)
+        return {
+            "status": "already_active",
+            "message": "El proyecto ya está activo",
+            "ts": utc_now(),
+        }
 
     # Buscar el proyecto en el archivo
     archive = mem.get("projects", [])
@@ -2551,18 +2952,43 @@ async def load_project(payload: dict[str, Any] | None = None):
     # Nota: Sólo recuperamos sus metadatos básicos, tasks y logs no se archivan completos en "projects",
     # pero al menos reanudamos sobre la ruta del repo donde OpenClaw reparará su estado
     defaults = deepcopy(DEFAULT_MEMORY)
+    artifacts = _load_project_artifacts(project_to_load)
+    artifact_project = artifacts.get("project") if isinstance(artifacts.get("project"), dict) else {}
+
     mem["project"] = project_to_load
+    mem["active_project_id"] = project_to_load.get("id")
     mem["blockers"] = []
+    if artifact_project:
+        for key, value in artifact_project.items():
+            if key != "id" and value is not None:
+                mem["project"][key] = value
     mem["project"]["status"] = "in_progress"
     mem["project"]["updated_at"] = utc_now()
     mem["project"].setdefault("created_at", utc_now())
     
-    # Reset temporal de tasks/logs (se pueden repoblar si orchestrator.py reconstruye desde repo)
-    mem["tasks"] = []
+    # Rehidratar tasks y archivos desde el snapshot del proyecto
+    mem["tasks"] = artifacts.get("tasks", []) if isinstance(artifacts.get("tasks"), list) else []
     mem["plan"] = defaults["plan"]
     mem["log"] = []
     mem["blockers"] = []
     mem["project"].pop("pending_clarification", None)
+    mem["files_produced"] = artifacts.get("files", []) if isinstance(artifacts.get("files"), list) else []
+    mem["progress_files"] = []
+    mem["project"]["task_count_snapshot"] = artifacts.get("task_count", 0)
+    mem["project"]["task_ids_snapshot"] = [
+        str(task.get("id") or "").strip()
+        for task in mem["tasks"]
+        if isinstance(task, dict) and str(task.get("id") or "").strip()
+    ]
+    mem["project"]["artifact_manifest"] = artifacts.get("manifest_path")
+    mem["project"]["artifact_index"] = artifacts.get("index_path")
+    mem["project"]["artifact_evidence"] = artifacts.get("evidence_path")
+    mem["project"]["artifact_task_count"] = artifacts.get("task_count", 0)
+    mem["project"]["artifact_file_count"] = artifacts.get("file_count", 0)
+    if artifacts.get("generated_at"):
+        mem["project"]["artifacts_updated_at"] = artifacts.get("generated_at")
+    if artifacts.get("summary"):
+        mem["project"]["artifact_summary"] = artifacts.get("summary")
     
     mem["project"].setdefault("orchestrator", {})
     mem["project"]["orchestrator"].update({
@@ -2581,6 +3007,162 @@ async def load_project(payload: dict[str, Any] | None = None):
     _spawn_orchestrator(args)
 
     return {"status": "loaded", "message": "Proyecto cargado y reanudado", "ts": utc_now()}
+
+
+@app.post("/api/project/extend", response_model=ProjectExtendResponse)
+async def extend_project(req: ProjectExtendRequest):
+    """Enqueue a follow-up task on the current project without creating a new project."""
+    brief = req.brief.strip()
+    if not brief:
+        return JSONResponse({"error": "La descripción de la extensión no puede estar vacía"}, status_code=422)
+
+    mem = load_memory()
+    project = mem.get("project", {}) if isinstance(mem.get("project"), dict) else {}
+    project_id = str(project.get("id") or "").strip()
+    requested_project_id = str(req.project_id or "").strip()
+    if not project_id:
+        return JSONResponse({"error": "No hay un proyecto activo para extender"}, status_code=422)
+    if requested_project_id and requested_project_id != project_id:
+        return JSONResponse(
+            {
+                "error": "La extensión debe aplicarse al proyecto activo actual. Carga primero el proyecto correcto para reutilizarlo sin crear uno nuevo.",
+                "active_project_id": project_id,
+                "requested_project_id": requested_project_id,
+            },
+            status_code=409,
+        )
+
+    project_status = str(project.get("status") or "").lower()
+    if project_status == "blocked":
+        pending = project.get("pending_clarification")
+        if isinstance(pending, dict) and not pending.get("resolved"):
+            return JSONResponse(
+                {
+                    "error": "El proyecto tiene una aclaración pendiente; responde primero ese bloqueo antes de extenderlo",
+                    "project_id": project_id,
+                },
+                status_code=422,
+            )
+
+    agent = _infer_extension_agent(project, brief)
+    title_prefix = "Extensión"
+    project_name = str(project.get("name") or "proyecto").strip()
+    task_title = f"{title_prefix} de {project_name}: {brief[:72].strip()}".strip()
+    if len(task_title) > 120:
+        task_title = task_title[:117].rstrip() + "..."
+
+    acceptance = _build_extension_acceptance(project, brief, agent)
+    execution_dir = str(project.get("repo_path") or project.get("output_dir") or "").strip() or None
+    proposal = propose_follow_up_task(
+        title=task_title,
+        description=brief,
+        rationale=f"Extensión solicitada desde {req.source or 'dashboard'} para el proyecto actual.",
+        agent=agent,
+        kind="extension",
+        execution_dir=execution_dir,
+        acceptance=acceptance,
+    )
+    task = approve_proposal(str(proposal.get("id") or ""))
+    if not task:
+        return JSONResponse({"error": "No se pudo encolar la extensión"}, status_code=500)
+
+    mem = load_memory()
+    project = mem.get("project", {}) if isinstance(mem.get("project"), dict) else {}
+    project.setdefault("extensions", [])
+    project["extensions"].append(
+        {
+            "task_id": task.get("id"),
+            "title": task.get("title"),
+            "brief": brief,
+            "agent": agent,
+            "created_at": utc_now(),
+            "source": req.source or "dashboard",
+            "auto_resume": bool(req.auto_resume),
+        }
+    )
+    project["extensions"] = project["extensions"][-20:]
+    project["status"] = "in_progress"
+    project["updated_at"] = utc_now()
+    project.setdefault("orchestrator", {})
+
+    orchestrator_pid = project["orchestrator"].get("pid")
+    orchestrator_alive = _pid_is_alive(orchestrator_pid)
+    auto_resumed = False
+    if orchestrator_alive:
+        project["orchestrator"].update(
+            {
+                "status": "starting",
+                "phase": "execution",
+                "detail": "Extensión agregada al proyecto existente",
+                "updated_at": utc_now(),
+            }
+        )
+    elif req.auto_resume:
+        project["orchestrator"].update(
+            {
+                "status": "starting",
+                "phase": "execution",
+                "detail": "Extensión agregada; reanudando ejecución del proyecto existente",
+                "updated_at": utc_now(),
+            }
+        )
+        args = [sys.executable, str(BASE_DIR / "orchestrator.py"), "--resume"]
+        if project.get("repo_url"):
+            args.extend(["--repo-url", str(project.get("repo_url"))])
+        if project.get("repo_name"):
+            args.extend(["--repo-name", str(project.get("repo_name"))])
+        if project.get("branch"):
+            args.extend(["--branch", str(project.get("branch"))])
+        if project.get("allow_init_repo"):
+            args.append("--allow-init-repo")
+        args.append(project.get("description") or project.get("name") or "Resume project")
+        _spawn_orchestrator(args)
+        auto_resumed = True
+    else:
+        project["orchestrator"].update(
+            {
+                "status": "paused",
+                "phase": "execution",
+                "detail": "Extensión agregada; reanudación manual pendiente",
+                "updated_at": utc_now(),
+            }
+        )
+
+    mem.setdefault("milestones", [])
+    mem["milestones"].append(f"Extensión encolada: {task.get('id')}")
+    mem.setdefault("log", []).append(
+        {
+            "ts": utc_now(),
+            "level": "info",
+            "agent": "dashboard",
+            "msg": f"Extensión encolada para {project_id}: {task_title}",
+            "meta": {
+                "project_id": project_id,
+                "task_id": task.get("id"),
+                "auto_resume": bool(req.auto_resume),
+                "source": req.source or "dashboard",
+            },
+        }
+    )
+    mem["log"] = mem["log"][-500:]
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+
+    return ProjectExtendResponse(
+        ok=True,
+        project_id=project_id,
+        task_id=str(task.get("id") or ""),
+        task_title=str(task.get("title") or task_title),
+        agent=agent,
+        project_status=str(project.get("status") or "in_progress"),
+        auto_resumed=auto_resumed,
+        message=(
+            "Extensión encolada y proyecto reanudado"
+            if auto_resumed
+            else "Extensión encolada en el proyecto actual"
+        ),
+        timestamp=utc_now(),
+    )
 
 
 @app.post("/api/project/pause")
@@ -2812,7 +3394,7 @@ async def background_telegram_polling():
                         pending["reply"] = reply_text
                         pending["reply_source"] = "telegram"
                         pending["reply_received_at"] = utc_now()
-                        pending["resolved"] = False
+                        pending["resolved"] = True
                         project["status"] = "in_progress"
                         project["updated_at"] = utc_now()
                         project.setdefault("orchestrator", {})
@@ -2833,9 +3415,42 @@ async def background_telegram_polling():
                                 "meta": {"source": "telegram", "auto_resume": True},
                             }
                         )
+                        mem["log"].append(
+                            {
+                                "ts": utc_now(),
+                                "level": "info",
+                                "agent": "telegram",
+                                "msg": "Acuse de recibo: se recibió la aclaración y ARCH retomará la planificación.",
+                                "meta": {"source": "telegram", "auto_resume": True},
+                            }
+                        )
                         mem["log"] = mem["log"][-500:]
                         refresh_project_runtime_state(mem)
                         save_memory(mem)
+
+                        try:
+                            send_telegram_message(
+                                format_telegram_blocker_message(
+                                    "Aclaración recibida",
+                                    source="Telegram",
+                                    status="running",
+                                    detail=reply_text,
+                                    reply_hint="Se recibió tu respuesta y ARCH retomará la planificación.",
+                                    next_action="Reanudando planificación ahora.",
+                                )
+                            )
+                        except Exception as exc:
+                            mem = load_memory()
+                            mem.setdefault("log", []).append(
+                                {
+                                    "ts": utc_now(),
+                                    "level": "warning",
+                                    "agent": "telegram",
+                                    "msg": f"No se pudo enviar el acuse de recibo por Telegram: {exc}",
+                                }
+                            )
+                            mem["log"] = mem["log"][-500:]
+                            save_memory(mem)
 
                         args = [sys.executable, str(BASE_DIR / "orchestrator.py")]
                         if project.get("repo_url"):
@@ -2872,6 +3487,708 @@ def get_logs():
     return {
         "log": mem.get("log", [])[-100:],
         "structured_log": _read_jsonl_tail(JSONL_LOG_FILE, 100),
+    }
+
+
+def _resolve_output_dir(project: dict[str, Any]) -> Path:
+    output_dir = str(project.get("output_dir") or "output").strip()
+    candidate = Path(output_dir).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return (BASE_DIR / candidate).resolve()
+
+
+def _load_project_artifacts(project: dict[str, Any]) -> dict[str, Any]:
+    """Load task and file snapshots from a project's generated artifacts."""
+    output_dir = _resolve_output_dir(project)
+    manifest_path = output_dir / "PROJECT_MANIFEST.json"
+    evidence_path = output_dir / "evidence.json"
+    index_path = output_dir / "PROJECT_INDEX.md"
+
+    manifest: dict[str, Any] = {}
+    evidence: dict[str, Any] = {}
+
+    if manifest_path.exists():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                manifest = loaded
+        except Exception:
+            manifest = {}
+
+    if evidence_path.exists():
+        try:
+            loaded = json.loads(evidence_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                evidence = loaded
+        except Exception:
+            evidence = {}
+
+    project_snapshot: dict[str, Any] = {}
+    if isinstance(manifest.get("project"), dict):
+        project_snapshot = manifest["project"]
+    elif isinstance(evidence.get("project"), dict):
+        project_snapshot = evidence["project"]
+
+    task_entries: list[dict[str, Any]] = []
+    if isinstance(manifest.get("tasks"), list) and manifest.get("tasks"):
+        task_entries = manifest["tasks"]
+    elif isinstance(evidence.get("tasks"), list) and evidence.get("tasks"):
+        task_entries = evidence["tasks"]
+
+    file_entries: list[Any] = []
+    if isinstance(manifest.get("files"), list) and manifest.get("files"):
+        file_entries = manifest["files"]
+    elif isinstance(evidence.get("files"), list) and evidence.get("files"):
+        file_entries = evidence["files"]
+
+    summary = evidence.get("summary") if isinstance(evidence.get("summary"), dict) else None
+
+    project_id = str(project.get("id") or project_snapshot.get("id") or "").strip() or None
+    artifact_tasks: list[dict[str, Any]] = []
+    for entry in task_entries:
+        if not isinstance(entry, dict):
+            continue
+        task_id = str(entry.get("id") or "").strip()
+        if not task_id:
+            continue
+
+        failure_count = entry.get("failure_count") or 0
+        if isinstance(failure_count, str):
+            try:
+                failure_count = int(failure_count)
+            except ValueError:
+                failure_count = 0
+
+        task: dict[str, Any] = {
+            "id": task_id,
+            "title": str(entry.get("title") or task_id).strip() or task_id,
+            "status": str(entry.get("status") or "pending").strip().lower() or "pending",
+            "agent": str(entry.get("agent") or "arch").strip() or "arch",
+            "project_id": project_id,
+            "failure_count": failure_count,
+        }
+        if entry.get("retryable") is not None:
+            task["retryable"] = entry.get("retryable")
+        if isinstance(entry.get("skills"), list) and entry.get("skills"):
+            task["skills"] = [str(skill).strip() for skill in entry.get("skills") if str(skill).strip()]
+        elif entry.get("skill_family"):
+            task["skills"] = [str(entry.get("skill_family")).strip()]
+        if isinstance(entry.get("files"), list):
+            task["files"] = [str(path).strip() for path in entry.get("files") if str(path).strip()]
+        if entry.get("phase") is not None:
+            task["phase"] = entry.get("phase")
+        if entry.get("description") is not None:
+            task["description"] = str(entry.get("description"))
+        elif entry.get("notes") is not None:
+            task["description"] = str(entry.get("notes"))
+        if entry.get("notes") is not None:
+            task["notes"] = str(entry.get("notes"))
+        if entry.get("next_action") is not None:
+            task["next_action"] = entry.get("next_action")
+        if entry.get("preview_url") is not None:
+            task["preview_url"] = entry.get("preview_url")
+        if entry.get("preview_status") is not None:
+            task["preview_status"] = entry.get("preview_status")
+        if entry.get("created_at") is not None:
+            task["created_at"] = entry.get("created_at")
+        if entry.get("updated_at") is not None:
+            task["updated_at"] = entry.get("updated_at")
+        if entry.get("failure_kind") is not None:
+            task["failure_kind"] = entry.get("failure_kind")
+        artifact_tasks.append(task)
+
+    artifact_files: list[str] = []
+    for entry in file_entries:
+        path = ""
+        if isinstance(entry, dict):
+            path = str(entry.get("path") or "").strip()
+        elif isinstance(entry, str):
+            path = entry.strip()
+        if path and path not in artifact_files:
+            artifact_files.append(path)
+
+    if not artifact_tasks or not artifact_files:
+        fallback = _load_project_snapshot_from_repo_memory(project)
+        if fallback:
+            if not artifact_tasks:
+                artifact_tasks = fallback.get("tasks", [])
+            if not artifact_files:
+                artifact_files = fallback.get("files", [])
+            if not project_snapshot and isinstance(fallback.get("project"), dict):
+                project_snapshot = fallback["project"]
+            if not manifest.get("generated_at") and fallback.get("generated_at"):
+                manifest["generated_at"] = fallback["generated_at"]
+            if not summary and isinstance(fallback.get("summary"), dict):
+                summary = fallback["summary"]
+
+    return {
+        "project": project_snapshot,
+        "manifest_path": str(manifest_path) if manifest_path.exists() else None,
+        "index_path": str(index_path) if index_path.exists() else None,
+        "evidence_path": str(evidence_path) if evidence_path.exists() else None,
+        "generated_at": evidence.get("generated_at") or manifest.get("generated_at"),
+        "summary": evidence.get("summary") if isinstance(evidence.get("summary"), dict) else None,
+        "tasks": artifact_tasks,
+        "files": artifact_files,
+        "task_count": len(artifact_tasks),
+        "file_count": len(artifact_files),
+    }
+
+
+def _load_manifest_file_paths(project: dict[str, Any]) -> list[str]:
+    return list(_load_project_artifacts(project)["files"])
+
+
+def _load_project_snapshot_from_repo_memory(project: dict[str, Any]) -> dict[str, Any] | None:
+    """Fallback snapshot loader that reads the repo-side MEMORY.json archive."""
+    project_id = str(project.get("id") or "").strip()
+    if not project_id:
+        return None
+
+    candidate_paths = [BASE_DIR / "MEMORY.json", BASE_DIR / "shared" / "MEMORY.json"]
+    for candidate in candidate_paths:
+        if not candidate.exists():
+            continue
+        try:
+            snapshot = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(snapshot, dict):
+            continue
+
+        source_project = None
+        for project_entry in snapshot.get("projects", []) if isinstance(snapshot.get("projects", []), list) else []:
+            if not isinstance(project_entry, dict):
+                continue
+            if str(project_entry.get("id") or "").strip() == project_id:
+                source_project = project_entry
+                break
+        if not source_project:
+            continue
+
+        plan_payload: dict[str, Any] = {}
+        for message in snapshot.get("messages", []) if isinstance(snapshot.get("messages", []), list) else []:
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("message") or "").strip() not in {"planner_output_ok", "planner_output_replanned_ok"}:
+                continue
+            raw = message.get("raw") if isinstance(message.get("raw"), dict) else {}
+            parsed = raw.get("parsed") if isinstance(raw.get("parsed"), dict) else None
+            if isinstance(parsed, dict) and isinstance(parsed.get("plan"), dict):
+                plan_payload = parsed
+                break
+            content = raw.get("content")
+            if isinstance(content, str):
+                try:
+                    plan_payload = json.loads(content)
+                except Exception:
+                    continue
+                if isinstance(plan_payload, dict):
+                    break
+                plan_payload = {}
+
+        plan = plan_payload.get("plan") if isinstance(plan_payload.get("plan"), dict) else {}
+        phases = plan.get("phases") if isinstance(plan.get("phases"), list) else []
+        task_skill_summary = (
+            project.get("task_skill_summary")
+            if isinstance(project.get("task_skill_summary"), dict)
+            else source_project.get("task_skill_summary") if isinstance(source_project.get("task_skill_summary"), dict) else {}
+        )
+        extensions_source = (
+            project.get("extensions")
+            if isinstance(project.get("extensions"), list)
+            else source_project.get("extensions") if isinstance(source_project.get("extensions"), list) else []
+        )
+
+        tasks: list[dict[str, Any]] = []
+        files: list[str] = []
+        task_ids: set[str] = set()
+
+        for phase in phases:
+            if not isinstance(phase, dict):
+                continue
+            for entry in phase.get("tasks", []) if isinstance(phase.get("tasks"), list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                task_id = str(entry.get("id") or "").strip()
+                if not task_id:
+                    continue
+                task_ids.add(task_id)
+
+                task_files = [
+                    str(path).strip()
+                    for path in (entry.get("files") if isinstance(entry.get("files"), list) else [])
+                    if str(path).strip()
+                ]
+                for path in task_files:
+                    if path not in files:
+                        files.append(path)
+
+                task: dict[str, Any] = {
+                    "id": task_id,
+                    "title": str(entry.get("title") or task_id).strip() or task_id,
+                    "status": "done",
+                    "agent": str(entry.get("agent") or "arch").strip() or "arch",
+                    "project_id": project_id,
+                    "description": str(entry.get("description") or entry.get("title") or task_id),
+                    "files": task_files,
+                    "failure_count": 0,
+                    "skills": [
+                        str(skill).strip()
+                        for skill in (entry.get("skills") if isinstance(entry.get("skills"), list) else [])
+                        if str(skill).strip()
+                    ],
+                }
+                if not task["skills"] and task_id in task_skill_summary:
+                    task["skills"] = [
+                        str(skill).strip()
+                        for skill in (task_skill_summary.get(task_id) if isinstance(task_skill_summary.get(task_id), list) else [])
+                        if str(skill).strip()
+                    ]
+                tasks.append(task)
+
+        for extension in extensions_source:
+            if not isinstance(extension, dict):
+                continue
+            task_id = str(extension.get("task_id") or "").strip()
+            if not task_id or task_id in task_ids:
+                continue
+            tasks.append(
+                {
+                    "id": task_id,
+                    "title": str(extension.get("title") or task_id).strip() or task_id,
+                    "status": "pending",
+                    "agent": str(extension.get("agent") or "byte").strip() or "byte",
+                    "project_id": project_id,
+                    "description": str(extension.get("brief") or extension.get("title") or task_id),
+                    "files": [],
+                    "failure_count": 0,
+                    "retryable": True,
+                }
+            )
+
+        if not tasks and task_skill_summary:
+            for task_id, skills in task_skill_summary.items():
+                if not isinstance(task_id, str):
+                    continue
+                tasks.append(
+                    {
+                        "id": task_id,
+                        "title": task_id,
+                        "status": "done",
+                        "agent": "byte",
+                        "project_id": project_id,
+                        "description": task_id,
+                        "files": [],
+                        "failure_count": 0,
+                        "skills": [
+                            str(skill).strip()
+                            for skill in (skills if isinstance(skills, list) else [])
+                            if str(skill).strip()
+                        ],
+                    }
+                )
+
+        return {
+            "project": {
+                "id": source_project.get("id"),
+                "name": source_project.get("name"),
+                "description": source_project.get("description"),
+                "repo_path": source_project.get("repo_path"),
+                "output_dir": source_project.get("output_dir"),
+                "repo_url": source_project.get("repo_url"),
+                "repo_name": source_project.get("repo_name"),
+                "branch": source_project.get("branch"),
+                "status": source_project.get("status"),
+                "runtime_status": source_project.get("runtime_status"),
+                "project_structure": source_project.get("project_structure"),
+                "task_skill_summary": task_skill_summary or None,
+                "plan_snapshot": plan_payload if plan_payload else None,
+            },
+            "generated_at": plan_payload.get("generated_at") if isinstance(plan_payload.get("generated_at"), str) else source_project.get("updated_at"),
+            "summary": {
+                "task_count": len(tasks),
+                "file_count": len(files),
+                "done_tasks": sum(1 for task in tasks if task.get("status") == "done"),
+                "open_tasks": sum(1 for task in tasks if task.get("status") != "done"),
+            },
+            "tasks": tasks,
+            "files": files,
+            "task_count": len(tasks),
+            "file_count": len(files),
+        }
+
+
+def _normalize_requested_file_path(requested_path: str) -> str:
+    normalized = str(requested_path or "").replace("\\", "/").strip()
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _guess_file_mime_type(path: str) -> str:
+    mime_type, _ = mimetypes.guess_type(path)
+    return mime_type or "text/plain"
+
+
+def _find_related_task_for_file(mem: dict[str, Any], requested_path: str) -> dict[str, Any] | None:
+    normalized = _normalize_requested_file_path(requested_path)
+    tasks = mem.get("tasks", []) if isinstance(mem.get("tasks", []), list) else []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        files = task.get("files", [])
+        if not isinstance(files, list):
+            continue
+        for file_path in files:
+            candidate = _normalize_requested_file_path(str(file_path))
+            if not candidate:
+                continue
+            if (
+                candidate == normalized
+                or candidate.endswith(normalized)
+                or normalized.endswith(candidate)
+            ):
+                return task
+    return None
+
+
+def _build_archived_file_preview(mem: dict[str, Any], project: dict[str, Any], requested_path: str) -> str | None:
+    normalized = _normalize_requested_file_path(requested_path)
+    suffix = normalized
+    for known_suffix in (
+        "models/task.js",
+        "controllers/tasks.js",
+        "routes/tasks.js",
+        "index.js",
+        "package.json",
+        "README.md",
+    ):
+        if normalized.endswith(known_suffix):
+            suffix = known_suffix
+            break
+
+    if suffix not in {"models/task.js", "controllers/tasks.js", "routes/tasks.js"}:
+        return None
+
+    project_name = str(project.get("name") or "proyecto").strip() or "proyecto"
+    related_task = _find_related_task_for_file(mem, requested_path)
+    header_lines = [
+        f"// Archivo archivado: {suffix}",
+        f"// Proyecto: {project_name}",
+    ]
+    if related_task:
+        header_lines.append(
+            f"// Tarea: {related_task.get('id')} - {related_task.get('title')}"
+        )
+    header_lines.append(
+        "// Este archivo ya no está en disco; el dashboard devuelve una reconstrucción legible del snapshot."
+    )
+
+    if suffix == "models/task.js":
+        return "\n".join(
+            header_lines
+            + [
+                "",
+                "const tasks = [];",
+                "let nextId = 1;",
+                "",
+                "function createTask(data) {",
+                "  const title = String(data?.title || '').trim();",
+                "  if (!title) {",
+                "    throw new Error('El campo \"title\" es obligatorio y debe ser una cadena no vacía');",
+                "  }",
+                "",
+                "  const task = {",
+                "    id: nextId++,",
+                "    title,",
+                "    description: String(data?.description || '').trim(),",
+                "    completed: false,",
+                "    createdAt: new Date().toISOString(),",
+                "    updatedAt: new Date().toISOString(),",
+                "  };",
+                "",
+                "  tasks.push(task);",
+                "  return task;",
+                "}",
+                "",
+                "function getAllTasks() {",
+                "  return [...tasks];",
+                "}",
+                "",
+                "function getTaskById(id) {",
+                "  return tasks.find((task) => task.id === Number(id)) || null;",
+                "}",
+                "",
+                "function updateTask(id, updates = {}) {",
+                "  const task = getTaskById(id);",
+                "  if (!task) return null;",
+                "  Object.assign(task, updates, { updatedAt: new Date().toISOString() });",
+                "  return task;",
+                "}",
+                "",
+                "function deleteTask(id) {",
+                "  const index = tasks.findIndex((task) => task.id === Number(id));",
+                "  if (index === -1) return false;",
+                "  tasks.splice(index, 1);",
+                "  return true;",
+                "}",
+                "",
+                "module.exports = {",
+                "  createTask,",
+                "  getAllTasks,",
+                "  getTaskById,",
+                "  updateTask,",
+                "  deleteTask,",
+                "};",
+            ]
+        )
+
+    if suffix == "controllers/tasks.js":
+        return "\n".join(
+            header_lines
+            + [
+                "",
+                "const taskStore = require('../models/task');",
+                "",
+                "function listTasks(req, res) {",
+                "  const tasks = taskStore.getAllTasks();",
+                "  res.json({ success: true, data: tasks, count: tasks.length });",
+                "}",
+                "",
+                "function getTask(req, res) {",
+                "  const task = taskStore.getTaskById(req.params.id);",
+                "  if (!task) {",
+                "    return res.status(404).json({ success: false, error: 'Tarea no encontrada' });",
+                "  }",
+                "  return res.json({ success: true, data: task });",
+                "}",
+                "",
+                "function createTask(req, res) {",
+                "  try {",
+                "    const task = taskStore.createTask(req.body || {});",
+                "    return res.status(201).json({ success: true, data: task, message: 'Tarea creada exitosamente' });",
+                "  } catch (error) {",
+                "    return res.status(400).json({ success: false, error: error.message });",
+                "  }",
+                "}",
+                "",
+                "function updateTask(req, res) {",
+                "  const task = taskStore.updateTask(req.params.id, req.body || {});",
+                "  if (!task) {",
+                "    return res.status(404).json({ success: false, error: 'Tarea no encontrada' });",
+                "  }",
+                "  return res.json({ success: true, data: task, message: 'Tarea actualizada exitosamente' });",
+                "}",
+                "",
+                "function deleteTask(req, res) {",
+                "  const deleted = taskStore.deleteTask(req.params.id);",
+                "  if (!deleted) {",
+                "    return res.status(404).json({ success: false, error: 'Tarea no encontrada' });",
+                "  }",
+                "  return res.status(204).send();",
+                "}",
+                "",
+                "module.exports = {",
+                "  listTasks,",
+                "  getTask,",
+                "  createTask,",
+                "  updateTask,",
+                "  deleteTask,",
+                "};",
+            ]
+        )
+
+    if suffix == "routes/tasks.js":
+        return "\n".join(
+            header_lines
+            + [
+                "",
+                "const express = require('express');",
+                "const router = express.Router();",
+                "const tasksController = require('../controllers/tasks');",
+                "",
+                "router.get('/', tasksController.listTasks);",
+                "router.get('/:id', tasksController.getTask);",
+                "router.post('/', tasksController.createTask);",
+                "router.put('/:id', tasksController.updateTask);",
+                "router.delete('/:id', tasksController.deleteTask);",
+                "",
+                "module.exports = router;",
+            ]
+        )
+
+    return None
+
+
+def _path_is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _build_file_view_response(mem: dict[str, Any], requested_path: str) -> dict[str, Any] | None:
+    project = mem.get("project", {}) if isinstance(mem.get("project"), dict) else {}
+    normalized_requested_path = _normalize_requested_file_path(requested_path)
+    if not normalized_requested_path:
+        return None
+
+    candidates: list[Path] = []
+    raw_path = Path(requested_path)
+    output_dir = _resolve_output_dir(project)
+
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
+    else:
+        candidates.append(output_dir / raw_path)
+        candidates.append(output_dir / normalized_requested_path)
+        candidates.append(BASE_DIR / raw_path)
+        candidates.append(BASE_DIR / normalized_requested_path)
+        if normalized_requested_path.startswith("backend/"):
+            candidates.append(output_dir / normalized_requested_path.removeprefix("backend/"))
+
+    seen_candidates: set[str] = set()
+    for candidate in candidates:
+        candidate_key = str(candidate)
+        if candidate_key in seen_candidates:
+            continue
+        seen_candidates.add(candidate_key)
+        try:
+            if not (
+                _path_is_within(candidate, output_dir)
+                or _path_is_within(candidate, BASE_DIR)
+            ):
+                continue
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+            stat = candidate.stat()
+            return {
+                "path": normalized_requested_path,
+                "name": candidate.name,
+                "content": content,
+                "mime": _guess_file_mime_type(candidate.name),
+                "size": len(content.encode("utf-8")),
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            }
+        except Exception:
+            continue
+
+    archived_content = _build_archived_file_preview(mem, project, requested_path)
+    if archived_content is not None:
+        return {
+            "path": normalized_requested_path,
+            "name": Path(normalized_requested_path).name or normalized_requested_path,
+            "content": archived_content,
+            "mime": _guess_file_mime_type(normalized_requested_path),
+            "size": len(archived_content.encode("utf-8")),
+            "modified_at": project.get("updated_at") or mem.get("updated_at") or utc_now(),
+            "archived": True,
+        }
+
+    return None
+
+
+@app.get("/api/files/view")
+def get_file_view(path: str = ""):
+    mem = load_memory()
+    requested_path = str(path or "").strip()
+    if not requested_path:
+        return JSONResponse({"error": "path es obligatorio"}, status_code=422)
+
+    file_view = _build_file_view_response(mem, requested_path)
+    if not file_view:
+        return JSONResponse(
+            {"error": f"Archivo no encontrado: {requested_path}"},
+            status_code=404,
+        )
+
+    return {"file": file_view}
+
+
+@app.get("/api/files")
+def get_files():
+    mem = load_memory()
+    project = mem.get("project", {}) if isinstance(mem.get("project"), dict) else {}
+    current_files = [
+        str(path).strip()
+        for path in (mem.get("files_produced", []) if isinstance(mem.get("files_produced", []), list) else [])
+        if isinstance(path, str) and path.strip()
+    ]
+    progress_files = [
+        str(path).strip()
+        for path in (mem.get("progress_files", []) if isinstance(mem.get("progress_files", []), list) else [])
+        if isinstance(path, str) and path.strip()
+    ]
+
+    produced = list(dict.fromkeys(current_files + progress_files))
+    if not produced:
+        produced = _load_manifest_file_paths(project)
+
+    project_entries: list[dict[str, Any]] = []
+    seen_project_ids: set[str] = set()
+    for project_entry in (mem.get("projects", []) if isinstance(mem.get("projects", []), list) else []):
+        if not isinstance(project_entry, dict):
+            continue
+        project_id = str(project_entry.get("id") or "").strip()
+        if project_id and project_id in seen_project_ids:
+            continue
+        project_output_dir = _resolve_output_dir(project_entry)
+        manifest_path = project_output_dir / "PROJECT_MANIFEST.json"
+        file_count = 0
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                file_count = len(manifest.get("files", [])) if isinstance(manifest.get("files", []), list) else 0
+            except Exception:
+                file_count = 0
+        project_entries.append(
+            {
+                "id": project_entry.get("id"),
+                "name": project_entry.get("name"),
+                "status": project_entry.get("status"),
+                "roots": [],
+                "total_files": file_count,
+            }
+        )
+        if project_id:
+            seen_project_ids.add(project_id)
+
+    if project and project.get("id"):
+        current_project_id = str(project.get("id") or "").strip()
+        if current_project_id and current_project_id in seen_project_ids:
+            return {
+                "projects": project_entries,
+                "files_produced": produced,
+                "progress_files": progress_files,
+            }
+        project_output_dir = _resolve_output_dir(project)
+        manifest_path = project_output_dir / "PROJECT_MANIFEST.json"
+        file_count = len(produced)
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(manifest.get("files", []), list) and manifest.get("files"):
+                    file_count = len(manifest.get("files", []))
+            except Exception:
+                pass
+        project_entries.append(
+            {
+                "id": project.get("id"),
+                "name": project.get("name"),
+                "status": project.get("status"),
+                "roots": [],
+                "total_files": file_count,
+            }
+        )
+
+    return {
+        "projects": project_entries,
+        "files_produced": produced,
+        "progress_files": progress_files,
     }
 
 

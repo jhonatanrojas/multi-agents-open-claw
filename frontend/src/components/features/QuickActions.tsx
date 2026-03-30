@@ -8,6 +8,7 @@ export function QuickActions() {
   const project = useMemoryStore((state) => state.project);
   const modelsConfig = useModelsStore((state) => state.config);
   const setActiveTab = useUIStore((state) => state.setActiveTab);
+  const setProjectViewMode = useUIStore((state) => state.setProjectViewMode);
   
   const steerMutation = useSendSteer();
   const pauseMutation = usePauseProject();
@@ -56,7 +57,13 @@ export function QuickActions() {
         ) : (
           <div className="no-project-actions">
             <p className="no-project-text">Sin proyecto activo</p>
-            <button className="btn-primary" onClick={() => setActiveTab('tasks')}>
+            <button
+              className="btn-primary"
+              onClick={() => {
+                setProjectViewMode('new');
+                setActiveTab('tasks');
+              }}
+            >
               Nuevo proyecto
             </button>
           </div>

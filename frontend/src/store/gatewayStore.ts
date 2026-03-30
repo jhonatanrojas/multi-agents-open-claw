@@ -19,6 +19,10 @@ function eventFingerprint(event: GatewayEvent): string {
   return `${event.agent_id}|${event.session_key}|${event.event}|${event.kind}|${event.seq ?? ''}|${event.stateVersion ?? ''}`;
 }
 
+function isChatEvent(event: GatewayEvent): boolean {
+  return String(event.event || '').trim().toLowerCase() === 'chat';
+}
+
 // Dedupe events array
 function dedupeEvents(events: GatewayEvent[]): GatewayEvent[] {
   const seen = new Set<string>();
@@ -86,7 +90,7 @@ export const useGatewayStore = create<GatewayState>((set, get) => ({
 export const selectLatestChatsByAgent = (agentId: string) => {
   return (state: GatewayState) => {
     const agentEvents = state.events
-      .filter((e) => e.agent_id === agentId && e.event.toLowerCase() === 'chat')
+      .filter((e) => e.agent_id === agentId && isChatEvent(e))
       .sort((a, b) => 
         new Date(b.received_at).getTime() - new Date(a.received_at).getTime()
       );
@@ -98,7 +102,7 @@ export const selectAllChats = (state: GatewayState) => {
   const chatsByAgent = new Map<string, GatewayEvent>();
   
   const chatEvents = state.events
-    .filter((e) => e.event.toLowerCase() === 'chat')
+    .filter((e) => isChatEvent(e))
     .sort((a, b) => 
       new Date(b.received_at).getTime() - new Date(a.received_at).getTime()
     );

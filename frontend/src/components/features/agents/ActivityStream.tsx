@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useGatewayStore } from '@/store';
 import type { GatewayEvent } from '@/types';
+import { extractGatewayText } from '@/utils';
 import './ActivityStream.css';
 
 interface AgentActivity {
@@ -9,6 +10,10 @@ interface AgentActivity {
   kind: string;
   timestamp: Date;
   isTyping: boolean;
+}
+
+function isChatEvent(event: GatewayEvent): boolean {
+  return String(event.event || '').trim().toLowerCase() === 'chat';
 }
 
 function AgentActivityCard({ activity }: { activity: AgentActivity; index: number }) {
@@ -102,7 +107,7 @@ export function ActivityStream() {
     const latestByAgent = new Map<string, GatewayEvent>();
     
     for (const event of events) {
-      if (event.event.toLowerCase() !== 'chat') continue;
+      if (!isChatEvent(event)) continue;
       
       const existing = latestByAgent.get(event.agent_id);
       if (!existing || new Date(event.received_at) > new Date(existing.received_at)) {
@@ -113,9 +118,7 @@ export function ActivityStream() {
     // Convert to AgentActivity
     const newActivities: AgentActivity[] = [];
     for (const [agentId, event] of latestByAgent) {
-      const payload = event.payload as Record<string, unknown> || {};
-      const content = typeof payload.content === 'string' ? payload.content : 
-                     typeof payload.text === 'string' ? payload.text : '';
+      const content = extractGatewayText(event.payload) || event.summary || event.event || '';
       
       newActivities.push({
         agentId,

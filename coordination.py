@@ -183,6 +183,9 @@ class TaskSkillProfile:
     skills: list[str]
     instructions: list[str]
     prompt_focus: str
+    preview_required: bool = False
+    preview_host: str | None = None
+    preview_mechanism: str | None = None
 
 
 def slugify(value: str | None) -> str:
@@ -380,6 +383,194 @@ def _brief_likely_needs_architecture(text: str) -> bool:
     )
 
 
+def _stack_from_brief_text(text: str) -> str:
+    """Infer a coarse stack directly from a brief string."""
+    if any(token in text for token in ("laravel", "php", "artisan", "eloquent")):
+        return "laravel"
+    if any(token in text for token in ("express", "node", "nestjs", "fastify", "npm")):
+        return "node-express"
+    if any(token in text for token in ("react", "typescript", "vite", "next.js", "nextjs")):
+        return "frontend"
+    if any(token in text for token in ("html", "css", "javascript", "vanilla", "localstorage", "dom")):
+        return "vanilla-frontend"
+    if any(token in text for token in ("fastapi", "sqlalchemy", "pydantic", "sqlite", "python backend")):
+        return "fastapi"
+    if any(token in text for token in ("docs", "documentation", "markdown", "manual", "guide")):
+        return "documentation"
+    return "general"
+
+
+def _structure_kind_from_stack(stack: str) -> str:
+    """Map a coarse stack to the canonical project structure kind."""
+    if stack in {"node-express", "fastapi"}:
+        return "backend-service"
+    if stack == "frontend":
+        return "framework-frontend"
+    if stack == "laravel":
+        return "laravel-app"
+    if stack == "documentation":
+        return "documentation"
+    if stack == "vanilla-frontend":
+        return "vanilla-static"
+    return "general"
+
+
+def _planning_clarification_questions_for_kind(kind: str, text: str) -> list[str]:
+    """Return project-specific clarification questions for the detected project kind."""
+    kind = (kind or "general").strip().lower()
+
+    if kind == "backend-service":
+        if any(token in text for token in ("crud", "api", "rest", "tarea", "tareas", "todo", "todos")):
+            return [
+                "¿Qué persistencia quieres para los datos: SQLite, PostgreSQL, MongoDB o memoria?",
+                "¿La API será pública o requerirá autenticación y roles?",
+                "¿Debemos incluir validación, tests y documentación OpenAPI/Swagger desde el inicio?",
+            ]
+        return [
+            "¿Qué base de datos debe usar el servicio backend?",
+            "¿La API será pública o tendrá autenticación/roles?",
+            "¿Se espera entrega con tests y documentación técnica?",
+        ]
+
+    if kind == "framework-frontend":
+        return [
+            "¿El frontend debe integrarse en un proyecto existente o arrancar desde cero?",
+            "¿Qué framework o stack frontend debe usarse si no está fijado en el brief?",
+            "¿Qué datos o APIs consumirá la interfaz y qué pantallas principales necesita?",
+        ]
+
+    if kind == "laravel-app":
+        return [
+            "¿La aplicación usará una base de datos nueva o una existente?",
+            "¿Necesitas autenticación, roles o un panel administrativo?",
+            "¿La entrega debe ser Blade/renderizado en servidor, API JSON o ambas cosas?",
+        ]
+
+    if kind == "documentation":
+        return [
+            "¿Cuál es la audiencia principal de la documentación?",
+            "¿Qué formato final prefieres: README, guía en Markdown, docs/ o wiki?",
+            "¿La documentación debe cubrir instalación, uso, troubleshooting o todo lo anterior?",
+        ]
+
+    if kind == "vanilla-static":
+        return [
+            "¿El proyecto es una landing estática o necesita interacción con datos?",
+            "¿Prefieres mantenerlo en HTML/CSS/JS puro o agregar una dependencia ligera?",
+            "¿Hay una referencia visual o contenido base que debamos respetar?",
+        ]
+
+    return [
+        "¿Este proyecto es nuevo o una feature sobre un proyecto existente?",
+        "Si es un proyecto nuevo, ¿prefieres Vanilla HTML/CSS/JS con estructura simple o un framework (React/Vue/Angular/Next)?",
+    ]
+
+
+def _planning_clarification_questions(text: str) -> list[str]:
+    """Return project-specific clarification questions for the detected stack."""
+    stack = _stack_from_brief_text(text)
+    kind = _structure_kind_from_stack(stack)
+
+    return _planning_clarification_questions_for_kind(kind, text)
+
+
+def _task_preview_profile(
+    project: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    agent_id: str | None = None,
+) -> dict[str, Any]:
+    """Return preview/deploy guidance for BYTE when the task actually needs it."""
+    task_agent = str(agent_id or task.get("agent") or "").strip().lower()
+    if task_agent != "byte":
+        return {
+            "required": False,
+            "host": None,
+            "mechanism": None,
+            "notes": [],
+        }
+
+    structure = project.get("project_structure") or infer_project_structure(project, task)
+    kind = str(structure.get("kind") or "general").strip().lower()
+    task_text = " ".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or ""),
+            " ".join(str(item) for item in (task.get("acceptance") or []) if isinstance(item, str)),
+        ]
+    ).lower()
+
+    deploy_requested = any(
+        token in task_text
+        for token in (
+            "preview",
+            "deploy",
+            "deployment",
+            "manual release",
+            "publish",
+        )
+    )
+    frontend_markers = any(
+        token in task_text
+        for token in (
+            "frontend",
+            "ui",
+            "react",
+            "vue",
+            "html",
+            "css",
+            "javascript",
+            "vanilla",
+            "next",
+        )
+    )
+
+    frontend_kind = kind in {"vanilla-static", "framework-frontend"}
+    backend_kind = kind in {"backend-service", "laravel-app"}
+    required = frontend_kind or deploy_requested
+    if not required:
+        return {
+            "required": False,
+            "host": None,
+            "mechanism": None,
+            "notes": [],
+        }
+
+    if frontend_kind or frontend_markers:
+        host = "preview.deploymatrix.com"
+        if kind == "vanilla-static":
+            mechanism = "Levanta el build estatico y publícalo con cloudflared tunnel."
+            stack_note = "Para estáticos, usa `npx serve -s dist` o `npx serve -s build`."
+        else:
+            mechanism = "Levanta el frontend compilado o el dev server y publícalo con cloudflared tunnel."
+            stack_note = "Para frameworks frontend, usa `npm run build` y luego `npx serve -s dist` o `npx serve -s build`."
+    elif backend_kind:
+        host = "preview-backend.deploymatrix.com"
+        if kind == "backend-service":
+            mechanism = "Levanta la API local y publícala con cloudflared tunnel."
+            stack_note = "Para Node/Express, usa `npm start` o `npm run start` antes de publicar el túnel."
+        else:
+            mechanism = "Levanta la app Laravel local y publícala con cloudflared tunnel."
+            stack_note = "Para Laravel, usa `php artisan serve --host 127.0.0.1 --port 8000` antes de publicar el túnel."
+    else:
+        host = "preview-backend.deploymatrix.com"
+        mechanism = "Levanta el servidor local y publícalo con cloudflared tunnel."
+        stack_note = "Si la entrega necesita URL pública, expón el servicio local con cloudflared."
+
+    return {
+        "required": True,
+        "host": host,
+        "mechanism": mechanism,
+        "notes": [
+            f"Usa el host compartido {'frontend' if host == 'preview.deploymatrix.com' else 'backend/API'}.",
+            f"URL pública esperada: https://{host}/",
+            "Escribe la URL final en `MEMORY.json.preview_url` cuando el preview quede vivo.",
+            "Mantén `MEMORY.json.preview_status` en `running` mientras el preview esté activo y `stopped` después de la confirmación humana.",
+            stack_note,
+        ],
+    }
+
+
 def needs_planning_clarification(brief: str) -> list[str]:
     """Return clarifying questions required before planning, if any."""
     text = (brief or "").lower()
@@ -391,11 +582,7 @@ def needs_planning_clarification(brief: str) -> list[str]:
         return []
     if not _brief_likely_needs_architecture(text):
         return []
-
-    return [
-        "¿Este proyecto es nuevo o una feature sobre un proyecto existente?",
-        "Si es un proyecto nuevo, ¿prefieres Vanilla HTML/CSS/JS con estructura simple o un framework (React/Vue/Angular/Next)?",
-    ]
+    return _planning_clarification_questions(text)
 
 
 def infer_project_structure(project: dict[str, Any], task: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -783,6 +970,7 @@ def build_task_skill_profile(project: dict[str, Any], task: dict[str, Any]) -> d
     stack = _stack_from_project(project, task)
     title_text = _project_text(project, task)
     base_skills, instructions, prompt_focus = _base_skills_for_stack(stack, task.get("agent", "byte"))
+    preview_profile = _task_preview_profile(project, task, agent_id=task.get("agent"))
 
     skills = list(dict.fromkeys(base_skills))
 
@@ -801,6 +989,20 @@ def build_task_skill_profile(project: dict[str, Any], task: dict[str, Any]) -> d
         skills.append("Backup and Restore")
     if "apache" in title_text:
         skills.append("Apache")
+    if preview_profile.get("required"):
+        skills.append("Deployment")
+        host = str(preview_profile.get("host") or "").strip()
+        if host:
+            instructions.append(f"Publica un preview temporal en {host} antes de cerrar la tarea.")
+        instructions.append(
+            "Cuando el preview esté activo, guarda la URL en MEMORY.json.preview_url y marca preview_status como running."
+        )
+        mechanism = preview_profile.get("mechanism")
+        if isinstance(mechanism, str) and mechanism.strip():
+            instructions.append(mechanism.strip())
+        for note in preview_profile.get("notes", []) or []:
+            if isinstance(note, str) and note.strip():
+                instructions.append(note.strip())
 
     if task.get("agent") == "pixel" and "frontend" not in stack:
         instructions.append("Coordínate con BYTE sobre el alcance de la UI y los límites de archivos.")
@@ -814,6 +1016,9 @@ def build_task_skill_profile(project: dict[str, Any], task: dict[str, Any]) -> d
             skills=list(dict.fromkeys(skills)),
             instructions=list(dict.fromkeys(instructions)),
             prompt_focus=prompt_focus,
+            preview_required=bool(preview_profile.get("required")),
+            preview_host=preview_profile.get("host"),
+            preview_mechanism=preview_profile.get("mechanism"),
         )
     )
 
@@ -909,6 +1114,7 @@ def materialize_planned_project(
             "project_structure": project_structure,
         }
     )
+    mem["active_project_id"] = mem["project"]["id"]
     plan_value = plan_payload.get("plan")
     mem["plan"] = plan_value if isinstance(plan_value, dict) else {"phases": []}
     mem["milestones"] = plan_payload.get("milestones", [])
@@ -921,6 +1127,9 @@ def materialize_planned_project(
             task["phase"] = phase.get("id")
             task["status"] = "pending"
             profile = build_task_skill_profile(mem["project"], task)
+            task["preview_required"] = bool(profile.get("preview_required"))
+            task["preview_host"] = profile.get("preview_host")
+            task["preview_mechanism"] = profile.get("preview_mechanism")
             task["execution_dir"] = normalize_task_execution_dir(mem["project"], task, repo_state=None)
             task_files = task.get("files")
             if isinstance(task_files, list):
@@ -962,21 +1171,30 @@ def build_project_context(mem: dict[str, Any], repo_state: dict[str, Any]) -> st
             "skill_family": task.get("skill_family"),
             "workspace_notes": task.get("workspace_notes", []),
             "execution_dir": task.get("execution_dir"),
+            "preview_required": bool(task.get("preview_required")),
+            "preview_host": task.get("preview_host"),
+            "preview_mechanism": task.get("preview_mechanism"),
         }
         for task in mem.get("tasks", [])
         if isinstance(task, dict) and task.get("id")
     }
+    project = mem.get("project", {}) if isinstance(mem.get("project", {}), dict) else {}
     task_files_map = {
-        task["id"]: collect_task_expected_files(task, mem.get("project", {}), str(task.get("execution_dir") or ""))
+        task["id"]: collect_task_expected_files(task, project, str(task.get("execution_dir") or ""))
         for task in mem.get("tasks", [])
         if isinstance(task, dict) and task.get("id")
     }
     context = {
-        "project": mem.get("project", {}),
+        "project": project,
         "repo": repo_state,
         "milestones": mem.get("milestones", []),
         "task_skill_map": task_skill_map,
         "task_files_map": task_files_map,
+        "task_preview_map": {
+            task["id"]: _task_preview_profile(project, task, agent_id=task.get("agent"))
+            for task in mem.get("tasks", [])
+            if isinstance(task, dict) and task.get("id")
+        },
         "output_dir": mem.get("project", {}).get("output_dir", "./output"),
         "execution_dir_map": {
             task.get("id"): task.get("execution_dir")
@@ -1003,6 +1221,9 @@ def render_task_context_md(
     execution_dir = task.get("execution_dir") or infer_task_execution_dir(project, task, repo_state)
     project_structure = project.get("project_structure") or infer_project_structure(project, task)
     directories = project_structure.get("directories", {}) or {}
+    preview_required = bool(skill_profile.get("preview_required"))
+    preview_host = skill_profile.get("preview_host")
+    preview_mechanism = skill_profile.get("preview_mechanism")
 
     lines = [
         f"# Tarea activa: {task.get('id')}",
@@ -1054,6 +1275,20 @@ def render_task_context_md(
     lines.append("")
     lines.append("## Enfoque de habilidades")
     lines.extend(f"- {item}" for item in skills or ["Inspección del repositorio", "Descomposición de tareas"])
+    if preview_required and isinstance(preview_host, str) and preview_host.strip():
+        lines.append("")
+        lines.append("## Despliegue / Preview")
+        lines.append(f"- Host compartido: {preview_host.strip()}")
+        lines.append(f"- URL pública esperada: https://{preview_host.strip()}/")
+        if isinstance(preview_mechanism, str) and preview_mechanism.strip():
+            lines.append(f"- Mecanismo: {preview_mechanism.strip()}")
+        lines.extend(
+            [
+                "- Esta tarea requiere publicar un preview temporal antes de cerrarla.",
+                "- Guarda la URL en `MEMORY.json.preview_url` cuando el preview quede activo.",
+                "- Mantén `preview_status = running` mientras el preview esté vivo y `stopped` después de la confirmación humana.",
+            ]
+        )
     lines.append("")
     lines.append("## Reglas de coordinación")
     lines.extend(
@@ -1356,6 +1591,11 @@ def write_agent_workspace_files(
         "task": task,
         "execution_dir": execution_dir,
         "expected_files": expected_files,
+        "deployment": {
+            "preview_required": bool(skill_profile.get("preview_required")),
+            "preview_host": skill_profile.get("preview_host"),
+            "preview_mechanism": skill_profile.get("preview_mechanism"),
+        },
         "project": {
             "name": project.get("name"),
             "description": project.get("description"),
@@ -1379,6 +1619,9 @@ def write_agent_workspace_files(
         "execution_dir": execution_dir,
         "repo_path": repo_state.get("repo_path") or project.get("output_dir"),
         "branch": repo_state.get("branch") or project.get("branch"),
+        "preview_required": bool(skill_profile.get("preview_required")),
+        "preview_host": skill_profile.get("preview_host"),
+        "preview_mechanism": skill_profile.get("preview_mechanism"),
         "created_at": timestamp,
         "updated_at": timestamp,
         "events": [

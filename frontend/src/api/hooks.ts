@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import * as api from './client';
+import { useMemoryStore } from '@/store';
 
 // Query keys
 export const queryKeys = {
@@ -84,6 +85,37 @@ export function useStartProject(options?: {
   });
 }
 
+export function useLoadProject() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: api.loadProject,
+    onSuccess: async () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.state });
+      queryClient.invalidateQueries({ queryKey: queryKeys.files });
+      try {
+        const state = await api.fetchState();
+        useMemoryStore.getState().setMemory(state);
+      } catch (error) {
+        console.error('Failed to refresh memory after loading project:', error);
+      }
+    },
+  });
+}
+
+export function useExtendProject() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: api.extendProject,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.state });
+      queryClient.invalidateQueries({ queryKey: queryKeys.files });
+      queryClient.invalidateQueries({ queryKey: queryKeys.runtime });
+    },
+  });
+}
+
 export function usePauseProject() {
   const queryClient = useQueryClient();
   
@@ -112,6 +144,18 @@ export function useResumeProject() {
   
   return useMutation({
     mutationFn: api.resumeProject,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.state });
+      queryClient.invalidateQueries({ queryKey: queryKeys.files });
+    },
+  });
+}
+
+export function useRetryPlanning() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: api.retryPlanning,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.state });
       queryClient.invalidateQueries({ queryKey: queryKeys.files });

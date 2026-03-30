@@ -46,6 +46,31 @@ The system must keep design artifacts and project deliverables separate.
 
 ---
 
+### Project Extension Contract
+
+The dashboard must be able to extend the currently loaded project without creating a new project record.
+
+**Endpoint:** `POST /api/project/extend`
+
+**Request body:**
+```json
+{
+  "brief": "string",
+  "project_id": "string | null",
+  "auto_resume": true,
+  "source": "dashboard"
+}
+```
+
+**Behavior:**
+- The extension is enqueued as a follow-up task on the active project memory.
+- The `project_id` must match the currently loaded project when provided.
+- If `auto_resume` is `true` and no orchestrator is running, the backend may restart the orchestrator with `--resume`.
+- If the project is already running, the extension must reuse the same project instead of creating a new one.
+- A delivered project may be reopened in place and continue with the same `project_id`.
+
+---
+
 ## API Endpoint Schemas
 
 ### Task Progress API

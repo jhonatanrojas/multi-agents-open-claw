@@ -4,6 +4,10 @@ import { useMemoryStore } from '@/store';
 import type { Blocker } from '@/types';
 
 function isRelevantBlocker(blocker: Blocker, projectId: string, projectCreatedAt?: string): boolean {
+  if ((blocker as { resolved?: boolean }).resolved) {
+    return false;
+  }
+
   const blockerProjectId = String((blocker as { project_id?: string }).project_id || '').trim();
   if (projectId && blockerProjectId) {
     return blockerProjectId === projectId;
@@ -22,14 +26,32 @@ function isRelevantBlocker(blocker: Blocker, projectId: string, projectCreatedAt
   return !projectId;
 }
 
+function extractBriefFromBlocker(blocker?: Blocker): string | undefined {
+  const text = String(blocker?.msg || '').trim();
+  if (!text) {
+    return undefined;
+  }
+
+  const match = text.match(/Brief:\s*([\s\S]*?)(?:\n\s*Preguntas:|\n\s*Respuesta esperada:|\n\s*Siguiente paso:|$)/i);
+  return (match?.[1] || '').trim() || undefined;
+}
+
 export function BlockersBar() {
   const blockers = useMemoryStore((state) => state.blockers);
   const project = useMemoryStore((state) => state.project);
   const pending = project?.pending_clarification;
-  const pendingActive = Boolean(pending && !pending.resolved);
   const projectId = String(project?.id || '').trim();
   const projectCreatedAt = String(project?.created_at || '').trim();
   const visibleBlockers = blockers.filter((blocker) => isRelevantBlocker(blocker, projectId, projectCreatedAt));
+  const clarificationBlocker = visibleBlockers.find(
+    (blocker) => Array.isArray(blocker.questions) && blocker.questions.length > 0
+  );
+  const pendingActive = Boolean((pending && !pending.resolved) || clarificationBlocker);
+  const activeQuestions =
+    Array.isArray(pending?.questions) && pending.questions.length > 0
+      ? pending.questions
+      : clarificationBlocker?.questions || [];
+  const activeBrief = pending?.original_brief || extractBriefFromBlocker(clarificationBlocker);
 
   const [reply, setReply] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -112,13 +134,13 @@ export function BlockersBar() {
               🧭 Aclaración pendiente
             </div>
             <div style={{ color: '#f0c1c1', fontSize: '0.8rem', lineHeight: 1.5 }}>
-              {pending?.original_brief || 'El proyecto necesita una respuesta para continuar la planificación.'}
+              {activeBrief || 'El proyecto necesita una respuesta para continuar la planificación.'}
             </div>
           </div>
 
-          {Array.isArray(pending?.questions) && pending.questions.length > 0 && (
+          {activeQuestions.length > 0 && (
             <ul style={{ margin: 0, paddingLeft: '20px', color: '#f4d0d0', fontSize: '0.8rem' }}>
-              {pending.questions.map((question, index) => (
+              {activeQuestions.map((question, index) => (
                 <li key={index} style={{ marginBottom: '4px' }}>
                   {question}
                 </li>

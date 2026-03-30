@@ -101,3 +101,69 @@
   display: flex;
   gap: 10px;
 }
+
+.project-extension {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 0.5px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.project-extension-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.project-extension-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.project-extension-subtitle {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.project-extension-textarea {
+  min-height: 92px;
+  resize: vertical;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.project-extension-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.project-extension-feedback {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.project-extension-feedback.error {
+  color: #e88;
+}
+
+.project-extension-feedback.success {
+  color: #8c8;
+}
+
+.project-extension-actions {
+  justify-content: flex-end;
+}

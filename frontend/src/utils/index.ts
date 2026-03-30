@@ -109,6 +109,105 @@ export function dedupeGatewayEvents(events: GatewayEvent[]): GatewayEvent[] {
   });
 }
 
+function parseJsonIfPossible(value: string): unknown | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function extractTextFromObject(value: Record<string, unknown>, depth = 0): string {
+  if (depth > 4) return '';
+
+  const stringKeys = ['text', 'content', 'message', 'summary', 'output', 'result', 'body'];
+  for (const key of stringKeys) {
+    const candidate = value[key];
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  const data = value.data;
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const nested = extractTextFromObject(data as Record<string, unknown>, depth + 1);
+    if (nested) return nested;
+  }
+
+  const choices = value.choices;
+  if (Array.isArray(choices)) {
+    for (const choice of choices) {
+      if (!choice || typeof choice !== 'object' || Array.isArray(choice)) continue;
+      const nestedChoice = choice as Record<string, unknown>;
+      const nested = extractTextFromObject(nestedChoice, depth + 1);
+      if (nested) return nested;
+      const message = nestedChoice.message;
+      if (message && typeof message === 'object' && !Array.isArray(message)) {
+        const nestedMessage = extractTextFromObject(message as Record<string, unknown>, depth + 1);
+        if (nestedMessage) return nestedMessage;
+      }
+    }
+  }
+
+  const content = value.content;
+  if (Array.isArray(content)) {
+    const parts = content
+      .map((block) => {
+        if (!block || typeof block !== 'object' || Array.isArray(block)) return '';
+        const nestedBlock = block as Record<string, unknown>;
+        if (typeof nestedBlock.type === 'string' && nestedBlock.type !== 'text') {
+          return '';
+        }
+        const text = nestedBlock.text;
+        if (typeof text === 'string' && text.trim()) {
+          return text.trim();
+        }
+        return extractTextFromObject(nestedBlock, depth + 1);
+      })
+      .filter(Boolean);
+    if (parts.length > 0) {
+      return parts.join(' ').trim();
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Extract human-readable text from a gateway event payload.
+ * Prefers nested text fields and avoids dumping raw JSON when possible.
+ */
+export function extractGatewayText(payload: unknown): string {
+  if (payload == null) return '';
+
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim();
+    if (!trimmed) return '';
+
+    const parsed = parseJsonIfPossible(trimmed);
+    if (parsed && typeof parsed === 'object') {
+      return extractGatewayText(parsed);
+    }
+    return trimmed;
+  }
+
+  if (Array.isArray(payload)) {
+    const parts = payload
+      .map((item) => extractGatewayText(item))
+      .filter((part) => part.trim().length > 0);
+    return parts.join(' ').trim();
+  }
+
+  if (typeof payload === 'object') {
+    return extractTextFromObject(payload as Record<string, unknown>);
+  }
+
+  return String(payload).trim();
+}
+
 /**
  * Normalize preview status to known values
  */

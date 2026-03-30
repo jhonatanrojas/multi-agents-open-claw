@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useMemoryStore, useGatewayStore } from '@/store';
+import { useMemoryStore, useGatewayStore, useModelsStore } from '@/store';
 import { sendSteer } from '@/api/client';
 import { StatusBadge } from '@/components/shared';
 import { AGENT_META } from '@/constants';
@@ -8,6 +8,7 @@ import './AgentsPanel.css';
 export function AgentsPanel() {
   const agents = useMemoryStore((s) => s.agents);
   const gatewayEvents = useGatewayStore((s) => s.events);
+  const modelConfig = useModelsStore((s) => s.config);
   
   // Selected agent for steer
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
@@ -47,6 +48,15 @@ export function AgentsPanel() {
   };
   
   const agentList = Object.entries(agents);
+
+  const getAgentModelInfo = (agentId: string) => {
+    const selectedModelId = modelConfig?.agents?.[agentId]?.model || AGENT_META[agentId as keyof typeof AGENT_META]?.model;
+    const selectedModel = modelConfig?.available?.find((model) => model.qualified === selectedModelId);
+    return {
+      model: selectedModelId || 'N/A',
+      provider: selectedModel?.provider || 'desconocido',
+    };
+  };
   
   return (
     <div className="agents-panel">
@@ -63,6 +73,7 @@ export function AgentsPanel() {
           
           const latestEvent = getLatestEvent(agentId);
           const isSelected = selectedAgent === agentId;
+          const modelInfo = getAgentModelInfo(agentId);
           
           return (
             <div 
@@ -80,7 +91,8 @@ export function AgentsPanel() {
               </div>
               
               <div className="agent-model">
-                <code>{meta.model}</code>
+                <code>{modelInfo.model}</code>
+                <span className="agent-model-provider">· {modelInfo.provider}</span>
               </div>
               
               {/* Latest activity */}

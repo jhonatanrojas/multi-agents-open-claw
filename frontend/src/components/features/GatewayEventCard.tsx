@@ -1,6 +1,6 @@
 import type { GatewayEvent } from '@/types';
 import { AGENT_META } from '@/constants';
-import { fmtTime } from '@/utils';
+import { extractGatewayText, fmtTime } from '@/utils';
 
 interface GatewayEventCardProps {
   event: GatewayEvent;
@@ -34,10 +34,10 @@ export function GatewayEventCard({ event }: GatewayEventCardProps) {
     if (event.payload && typeof event.payload === 'object') {
       const p = event.payload as Record<string, unknown>;
       if (p.tool) return `Usando: ${p.tool}`;
-      if (p.content) {
-        const content = String(p.content);
-        return content.length > 100 ? content.slice(0, 100) + '...' : content;
-      }
+    }
+    const text = extractGatewayText(event.payload);
+    if (text) {
+      return text.length > 100 ? text.slice(0, 100) + '...' : text;
     }
     return null;
   };

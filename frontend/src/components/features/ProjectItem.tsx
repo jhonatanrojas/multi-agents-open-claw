@@ -17,15 +17,33 @@ export function ProjectItem({
   onResume,
   onDelete,
 }: ProjectItemProps) {
+  const normalizedStatus = (project.status || '').toLowerCase();
+  const isHistorical = normalizedStatus === 'deleted' || normalizedStatus === 'archived';
+
   const getStatusColor = () => {
-    switch (project.status) {
+    switch (normalizedStatus) {
       case 'active': return '#639922';
       case 'paused': return '#D48A00';
       case 'completed': return '#1D9E75';
       case 'failed': return '#E24B4A';
+      case 'deleted':
+      case 'archived':
+        return '#7A7A7A';
       default: return '#888';
     }
   };
+
+  const displayStatus = isHistorical ? 'histórico' : project.status;
+  const hasRuntimeTaskCounts =
+    Boolean(project.task_counts && project.task_counts.total > 0);
+  const displayTaskTotal = hasRuntimeTaskCounts
+    ? project.task_counts!.total
+    : project.task_count_snapshot ?? 0;
+  const displayTaskDone = hasRuntimeTaskCounts
+    ? project.task_counts!.done
+    : (isHistorical && displayTaskTotal > 0 ? displayTaskTotal : 0);
+  const hasDeploySnapshot =
+    Boolean(project.deploy_phase_name || project.deploy_task_title || project.deploy_host);
 
   return (
     <div
@@ -38,7 +56,7 @@ export function ProjectItem({
         padding: '12px 16px',
         backgroundColor: isActive ? '#2a2a4a' : '#252536',
         borderRadius: '8px',
-        cursor: 'pointer',
+        cursor: onSelect ? 'pointer' : 'default',
         borderLeft: `3px solid ${getStatusColor()}`,
         transition: 'background-color 0.15s',
       }}
@@ -56,7 +74,7 @@ export function ProjectItem({
               textTransform: 'capitalize' as const,
             }}
           >
-            {project.status}
+            {displayStatus}
           </span>
         </div>
         {project.description && (
@@ -73,11 +91,46 @@ export function ProjectItem({
             {project.description}
           </p>
         )}
-        {project.task_counts && (
-          <div style={{ fontSize: '0.75rem', color: '#666' }}>
-            {project.task_counts.done}/{project.task_counts.total} tareas completadas
+        {hasDeploySnapshot && (
+          <div
+            style={{
+              marginBottom: '6px',
+              padding: '8px 10px',
+              borderRadius: '6px',
+              border: '1px solid #34344a',
+              background: '#1c1c2a',
+            }}
+          >
+            <div style={{ fontSize: '0.68rem', color: '#8f8fa8', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+              Fase 5 · despliegue histórico
+            </div>
+            {project.deploy_phase_name && (
+              <div style={{ fontSize: '0.78rem', color: '#ddd', marginTop: '3px', fontWeight: 600 }}>
+                {project.deploy_phase_name}
+              </div>
+            )}
+            {project.deploy_task_title && (
+              <div style={{ fontSize: '0.74rem', color: '#b0b0c0', marginTop: '2px' }}>
+                {project.deploy_task_title}
+              </div>
+            )}
+            {project.deploy_host && (
+              <div style={{ fontSize: '0.72rem', color: '#7f7f95', marginTop: '2px' }}>
+                Host: {project.deploy_host}
+              </div>
+            )}
           </div>
         )}
+        {hasRuntimeTaskCounts && (
+          <div style={{ fontSize: '0.75rem', color: '#666' }}>
+            {displayTaskDone}/{displayTaskTotal} tareas completadas
+          </div>
+        )}
+        {!hasRuntimeTaskCounts && project.task_count_snapshot ? (
+          <div style={{ fontSize: '0.75rem', color: '#666' }}>
+            {project.task_count_snapshot} tareas registradas en el snapshot
+          </div>
+        ) : null}
       </div>
 
       <div style={{ display: 'flex', gap: '4px' }} onClick={(e) => e.stopPropagation()}>

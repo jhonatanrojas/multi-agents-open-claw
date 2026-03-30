@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
 import { useUIStore, useMemoryStore, useModelsStore } from '@/store';
-import { useStartProject } from '@/api';
+import { useLoadProject, useRetryPlanning, useStartProject, useTestModel, useUpdateModels } from '@/api';
 import { Tabs, type TabId } from '@/components/shared';
+import { ProjectItem } from '@/components/features/ProjectItem';
 import { TasksList } from '@/components/features/TasksList';
 import { ProjectBar } from '@/components/features/ProjectBar';
 import { ProjectsPanel } from '@/components/features/ProjectsPanel';
@@ -15,6 +16,7 @@ import { MiniverseTab } from '@/components/features/MiniverseTab';
 import { ModelsPanel } from '@/components/features/ModelsPanel';
 import { BlockersBar } from '@/components/features/BlockersBar';
 import { SummaryBar } from '@/components/features/SummaryBar';
+import { RuntimePanel } from '@/components/features/RuntimePanel';
 import type { Project } from '@/types';
 import './Dashboard.css';
 
@@ -32,13 +34,30 @@ const TABS: Array<{ id: TabId; label: string }> = [
 export function Dashboard() {
   const activeTab = useUIStore((state) => state.activeTab);
   const setActiveTab = useUIStore((state) => state.setActiveTab);
+  const projectViewMode = useUIStore((state) => state.projectViewMode);
+  const setProjectViewMode = useUIStore((state) => state.setProjectViewMode);
   const project = useMemoryStore((state) => state.project);
   const projects = useMemoryStore((state) => state.projects);
   const modelConfig = useModelsStore((state) => state.config);
+  const modelsLoading = useModelsStore((state) => state.isLoading);
   const availableModels = modelConfig?.available || [];
-  
-  // View mode: 'new' for new project, 'view' for viewing existing
-  const [viewMode, setViewMode] = useState<'new' | 'view'>('new');
+
+  const visibleProjects = projects
+    .filter((p) => p.status !== 'deleted' && p.status !== 'archived')
+    .slice()
+    .sort((a, b) => {
+      const aTime = new Date(a.updated_at || a.created_at || 0).getTime();
+      const bTime = new Date(b.updated_at || b.created_at || 0).getTime();
+      return bTime - aTime;
+    });
+  const historicalProjects = projects
+    .filter((p) => p.status === 'deleted' || p.status === 'archived')
+    .slice()
+    .sort((a, b) => {
+      const aTime = new Date(a.updated_at || a.created_at || 0).getTime();
+      const bTime = new Date(b.updated_at || b.created_at || 0).getTime();
+      return bTime - aTime;
+    });
   
   // Status message
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
@@ -65,7 +84,7 @@ export function Dashboard() {
       // The state will be refreshed automatically by SSE or polling
       // Switch to project view after a short delay
       setTimeout(() => {
-        setViewMode('view');
+        setProjectViewMode('view');
         setActiveTab('tasks');
         setStatusMessage(null);
       }, 2000);
@@ -77,23 +96,75 @@ export function Dashboard() {
       });
     },
   });
+
+  const loadProjectMutation = useLoadProject();
+  const retryPlanningMutation = useRetryPlanning();
+  const testModelMutation = useTestModel();
+  const updateModelsMutation = useUpdateModels();
   
   // Determine if we're viewing a project
-  const isViewingProject = viewMode === 'view' && project;
+  const isViewingProject = projectViewMode === 'view' && project;
+  const canRetryPlanning =
+    project?.orchestrator?.status === 'error' && project?.orchestrator?.phase === 'planning';
   
   // Set initial tab based on mode
   useEffect(() => {
-    if (viewMode === 'new' && activeTab !== 'projects' && activeTab !== 'models') {
+    if (projectViewMode === 'new' && activeTab !== 'projects' && activeTab !== 'models') {
       setActiveTab('projects');
     }
-  }, [viewMode, activeTab, setActiveTab]);
+  }, [projectViewMode, activeTab, setActiveTab]);
 
   const handleProjectSelect = (p: Project | null) => {
     if (p) {
-      setViewMode('view');
-      setActiveTab('tasks');
+      if (project?.id === p.id) {
+        setProjectViewMode('view');
+        setActiveTab('tasks');
+        setStatusMessage(null);
+        return;
+      }
+
+      loadProjectMutation.mutate(p.id, {
+        onSuccess: () => {
+          setProjectViewMode('view');
+          setActiveTab('tasks');
+          setStatusMessage(null);
+        },
+        onError: (error) => {
+          setStatusMessage({
+            type: 'error',
+            text: `Error al cargar el proyecto: ${String(error)}`,
+          });
+        },
+      });
     } else {
-      setViewMode('new');
+      setProjectViewMode('new');
+      setStatusMessage(null);
+    }
+  };
+
+  const handleTestModel = async (model: string) => {
+    const result = await testModelMutation.mutateAsync(model);
+    return {
+      ...result,
+      model,
+    };
+  };
+
+  const handleSaveModels = async (agents: Record<'arch' | 'byte' | 'pixel', string>) => {
+    try {
+      const result = await updateModelsMutation.mutateAsync(agents);
+      useModelsStore.getState().setConfig(result.config);
+      setStatusMessage({
+        type: 'success',
+        text: 'Modelos guardados y persistidos en la configuración activa',
+      });
+      setTimeout(() => setStatusMessage(null), 2000);
+    } catch (error) {
+      setStatusMessage({
+        type: 'error',
+        text: `No se pudo guardar la configuración: ${String(error)}`,
+      });
+      throw error;
     }
   };
 
@@ -107,7 +178,7 @@ export function Dashboard() {
             const p = projects.find(proj => proj.id === id);
             if (p) handleProjectSelect(p);
           } else {
-            setViewMode('new');
+            setProjectViewMode('new');
           }
         }}
       />
@@ -118,6 +189,45 @@ export function Dashboard() {
           {statusMessage.type === 'success' ? '✅' : '❌'} {statusMessage.text}
         </div>
       )}
+
+      {!isViewingProject && project && canRetryPlanning && (
+        <div className="status-message warning planning-retry-banner">
+          <div className="planning-retry-copy">
+            <strong>⚠️ Bloqueo de planificación</strong>
+            <span>
+              {project.orchestrator?.detail || 'La planificación falló. Puedes reintentarla desde aquí.'}
+            </span>
+          </div>
+          <button
+            className="btn-primary planning-retry-button"
+            onClick={() =>
+              retryPlanningMutation.mutate(undefined, {
+                onSuccess: () => {
+                  setStatusMessage({
+                    type: 'success',
+                    text: 'Replanificación iniciada correctamente',
+                  });
+                  setTimeout(() => setStatusMessage(null), 2000);
+                },
+                onError: (error) => {
+                  setStatusMessage({
+                    type: 'error',
+                    text: `No se pudo reintentar la planificación: ${String(error)}`,
+                  });
+                },
+              })
+            }
+            disabled={retryPlanningMutation.isPending}
+          >
+            {retryPlanningMutation.isPending ? 'Reintentando...' : 'Reintentar planificación'}
+          </button>
+        </div>
+      )}
+
+      <RuntimePanel />
+
+      {/* Blockers should be visible both while creating and while viewing a project */}
+      <BlockersBar />
       
       {/* Content based on mode */}
       {isViewingProject ? (
@@ -125,7 +235,6 @@ export function Dashboard() {
           {/* Project info */}
           <ProjectBar />
           <SummaryBar />
-          <BlockersBar />
           
           {/* Tab Navigation */}
           <Tabs
@@ -150,13 +259,15 @@ export function Dashboard() {
             
             {activeTab === 'models' && (
               <div style={{ maxWidth: '600px' }}>
-                <ModelsPanel
-                  modelConfig={modelConfig}
-                  availableModels={availableModels}
-                  onSave={(agents) => console.log('Save models:', agents)}
-                />
-              </div>
-            )}
+              <ModelsPanel
+                modelConfig={modelConfig}
+                availableModels={availableModels}
+                isLoading={modelsLoading}
+                onSave={handleSaveModels}
+                onTestModel={handleTestModel}
+              />
+            </div>
+          )}
             
             {activeTab === 'gateway' && <GatewayTab />}
             {activeTab === 'files' && <FilesTab />}
@@ -198,19 +309,36 @@ export function Dashboard() {
           </div>
           
           {/* Recent Projects */}
-          {projects.length > 0 && (
+          {visibleProjects.length > 0 && (
             <div className="recent-projects">
               <h3>Proyectos recientes</h3>
               <div className="recent-projects-list">
-                {projects.slice(0, 5).map(p => (
-                  <button
-                    key={p.id}
-                    className="recent-project-card"
-                    onClick={() => handleProjectSelect(p)}
-                  >
-                    <span className="recent-project-name">{p.name}</span>
-                    <span className="recent-project-status">{p.status}</span>
-                  </button>
+                {visibleProjects
+                  .slice(0, 5)
+                  .map(p => (
+                    <button
+                      key={p.id}
+                      className="recent-project-card"
+                      onClick={() => handleProjectSelect(p)}
+                    >
+                      <span className="recent-project-name">{p.name}</span>
+                      <span className="recent-project-status">{p.status}</span>
+                    </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Historical Projects */}
+          {historicalProjects.length > 0 && (
+            <div className="historical-projects">
+              <h3>Historial</h3>
+              <p className="historical-projects-hint">
+                Proyectos cerrados o eliminados con su snapshot final, incluyendo la fase de despliegue.
+              </p>
+              <div className="historical-projects-list">
+                {historicalProjects.slice(0, 5).map((p) => (
+                  <ProjectItem key={p.id} project={p} />
                 ))}
               </div>
             </div>
@@ -223,7 +351,8 @@ export function Dashboard() {
               <ModelsPanel
                 modelConfig={modelConfig}
                 availableModels={availableModels}
-                onSave={(agents) => console.log('Save models:', agents)}
+                onSave={handleSaveModels}
+                onTestModel={handleTestModel}
               />
             </div>
           </div>

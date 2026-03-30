@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ModelSelect } from './ModelSelect';
 import type { AvailableModel, ModelConfig } from '@/types';
 
@@ -7,39 +7,71 @@ type AgentId = 'arch' | 'byte' | 'pixel';
 interface ModelsPanelProps {
   modelConfig: ModelConfig | null;
   availableModels: AvailableModel[];
-  onSave: (agents: Record<AgentId, { model: string }>) => void;
-  onTestModel?: (model: string) => Promise<void>;
+  isLoading?: boolean;
+  onSave: (agents: Record<AgentId, string>) => Promise<void> | void;
+  onTestModel?: (model: string) => Promise<{
+    ok: boolean;
+    model: string;
+    status?: string;
+    elapsed_ms?: number;
+    message?: string;
+    error?: string;
+  }>;
 }
 
 export function ModelsPanel({
   modelConfig,
   availableModels,
+  isLoading = false,
   onSave,
   onTestModel,
 }: ModelsPanelProps) {
+  const getSelectionsFromConfig = () => ({
+    arch: modelConfig?.agents?.arch?.model || '',
+    byte: modelConfig?.agents?.byte?.model || '',
+    pixel: modelConfig?.agents?.pixel?.model || '',
+  });
   const [selections, setSelections] = useState<Record<AgentId, string>>({
-    arch: modelConfig?.agents?.arch?.model || 'nvidia/z-ai/glm5',
-    byte: modelConfig?.agents?.byte?.model || 'nvidia/moonshotai/kimi-k2.5',
-    pixel: modelConfig?.agents?.pixel?.model || 'nvidia/moonshotai/kimi-k2.5',
+    ...getSelectionsFromConfig(),
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSelections(getSelectionsFromConfig());
+    setSaved(false);
+    setSaveError(null);
+  }, [
+    modelConfig?.agents?.arch?.model,
+    modelConfig?.agents?.byte?.model,
+    modelConfig?.agents?.pixel?.model,
+  ]);
 
   const handleChange = (agentId: AgentId, model: string) => {
     setSelections((prev) => ({ ...prev, [agentId]: model }));
     setSaved(false);
+    setSaveError(null);
   };
 
   const handleSave = async () => {
+    if (isLoading || !modelConfig) {
+      setSaveError('La configuración de modelos todavía se está cargando.');
+      return;
+    }
+
     setSaving(true);
+    setSaveError(null);
     try {
       await onSave({
-        arch: { model: selections.arch },
-        byte: { model: selections.byte },
-        pixel: { model: selections.pixel },
+        arch: selections.arch,
+        byte: selections.byte,
+        pixel: selections.pixel,
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
+    } catch (error) {
+      setSaveError(String(error));
     } finally {
       setSaving(false);
     }
@@ -69,9 +101,22 @@ export function ModelsPanel({
         ))}
       </div>
 
+      {isLoading && (
+        <div style={{ fontSize: '0.8rem', color: '#f2c96d' }}>
+          Cargando configuración de modelos...
+        </div>
+      )}
+
+      {saveError && (
+        <div style={{ fontSize: '0.8rem', color: '#e88' }}>
+          {saveError}
+        </div>
+      )}
+
       <button
+        type="button"
         onClick={handleSave}
-        disabled={saving || saved}
+        disabled={saving || saved || isLoading || !modelConfig}
         style={{
           width: '100%',
           padding: '12px',
@@ -81,11 +126,11 @@ export function ModelsPanel({
           color: saved ? '#8c8' : '#fff',
           border: 'none',
           borderRadius: '8px',
-          cursor: saving || saved ? 'not-allowed' : 'pointer',
+          cursor: saving || saved || isLoading || !modelConfig ? 'not-allowed' : 'pointer',
           transition: 'background-color 0.2s',
         }}
       >
-        {saving ? 'Guardando...' : saved ? '✓ Guardado' : '💾 Guardar Modelos'}
+        {saving ? 'Guardando...' : saved ? '✓ Guardado' : isLoading ? 'Cargando...' : '💾 Guardar Modelos'}
       </button>
     </div>
   );

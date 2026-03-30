@@ -6,26 +6,23 @@ import './LogTab.css';
 
 export function LogTab() {
   const log = useMemoryStore((state) => state.log);
-  
-  // Group logs by time window
-  const now = Date.now();
-  const recentLogs = log.filter((entry: LogEntry) => {
-    const logTime = new Date(entry.ts).getTime();
-    return now - logTime < 3600000; // Last hour
-  });
+  const visibleLogs = [...log].slice(-100).reverse();
+  const isClarificationAck = (entry: LogEntry) =>
+    entry.msg?.includes('Acuse de recibo:') || entry.msg?.includes('Aclaración recibida');
   
   return (
     <div className="log-tab">
       <Panel title="Log del sistema" subtitle={`${log.length} eventos`}>
-        {recentLogs.length === 0 ? (
-          <EmptyState>Sin eventos en la última hora.</EmptyState>
+        {visibleLogs.length === 0 ? (
+          <EmptyState>Sin eventos registrados.</EmptyState>
         ) : (
           <div className="log-list">
-            {recentLogs.slice(-50).reverse().map((entry: LogEntry, i: number) => {
+            {visibleLogs.map((entry: LogEntry, i: number) => {
               const meta = entry.agent ? AGENT_META[entry.agent as keyof typeof AGENT_META] : null;
+              const ack = isClarificationAck(entry);
               
               return (
-                <div key={i} className="log-entry">
+                <div key={i} className={`log-entry${ack ? ' log-entry-ack' : ''}`}>
                   <span className="log-time">
                     {formatTime(entry.ts)}
                   </span>
@@ -38,12 +35,17 @@ export function LogTab() {
                     </span>
                   )}
                   <span className="log-level">
-                    <Badge variant="info">
+                    <Badge variant={ack ? 'success' : 'info'}>
                       {entry.msg?.split(':')[0] || 'info'}
                     </Badge>
                   </span>
                   <span className="log-message">
                     {entry.msg}
+                    {ack && (
+                      <span className="log-ack-note">
+                        Reanudación solicitada
+                      </span>
+                    )}
                   </span>
                 </div>
               );

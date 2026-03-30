@@ -59,6 +59,17 @@ export interface ClarificationState {
   resolved?: boolean;
 }
 
+export interface ProjectOrchestratorState {
+  status?: string;
+  pid?: number | null;
+  phase?: string | null;
+  task_id?: string | null;
+  detail?: string | null;
+  started_at?: string | null;
+  updated_at?: string | null;
+  dry_run?: boolean;
+}
+
 // Project types
 export interface Project {
   id: string;
@@ -68,14 +79,25 @@ export interface Project {
   repo_path?: string;
   branch?: string;
   created_at?: string;
+  updated_at?: string;
   artifact_index?: string;
   task_counts?: { open: number; done: number; total: number };
+  task_count_snapshot?: number;
   tech_stack?: { backend?: string };
   runtime_status?: string;
   can_resume?: boolean;
   preview_url?: string;
   preview_status?: string;
+  replanned_at?: string;
+  deploy_task_id?: string;
+  deploy_phase_name?: string;
+  deploy_task_title?: string;
+  deploy_host?: string;
+  deploy_preview_required?: boolean;
+  deploy_preview_mechanism?: string;
+  task_ids_snapshot?: string[];
   pending_clarification?: ClarificationState;
+  orchestrator?: ProjectOrchestratorState;
 }
 
 // Phase types
@@ -271,9 +293,19 @@ export interface RuntimeProcess {
   elapsed_sec: number;
 }
 
+export interface ProjectOrchestratorSnapshot {
+  pid?: number;
+  status?: string;
+  phase?: string;
+  task_id?: string;
+  detail?: string;
+  updated_at?: string;
+}
+
 export interface RuntimeSnapshot {
   primary_pid?: number;
   lockfile: { pid?: number };
+  project_orchestrator?: ProjectOrchestratorSnapshot;
   processes: RuntimeProcess[];
   duplicates: RuntimeProcess[];
   issues: string[];
