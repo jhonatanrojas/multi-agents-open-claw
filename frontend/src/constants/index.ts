@@ -74,9 +74,27 @@ export const STATUS_ES: Record<string, string> = {
 };
 
 // API constants
-// Default to the same-origin proxy; allow override for non-browser tooling.
+// Default to the same-origin proxy in production.
+// When running the Vite dev/preview servers, point to the public dashboard API
+// so the browser does not depend on a local reverse proxy.
 const DEFAULT_API_BASE = '/devsquad/api';
-export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() || DEFAULT_API_BASE;
+const PREVIEW_API_BASE = 'http://84.32.131.10:8001/devsquad/api';
+
+function detectApiBase(): string {
+  const override = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
+  if (override) {
+    return override;
+  }
+  if (typeof window !== 'undefined') {
+    const { port } = window.location;
+    if (port === '4173' || port === '5173') {
+      return PREVIEW_API_BASE;
+    }
+  }
+  return DEFAULT_API_BASE;
+}
+
+export const API_BASE = detectApiBase();
 export const CONTEXT_DOC_PATH = '/var/www/openclaw-multi-agents/shared/CONTEXT.md';
 export const MODEL_SELECTION_KEY = 'devsquad:model-selection:v1';
 export const LOG_MAX = 200;

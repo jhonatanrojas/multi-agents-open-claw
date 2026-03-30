@@ -2470,6 +2470,30 @@ async def reply_project_clarification(req: ProjectClarificationReplyRequest):
     refresh_project_runtime_state(mem)
     save_memory(mem)
 
+    try:
+        send_telegram_message(
+            format_telegram_blocker_message(
+                "Aclaración recibida",
+                source="DevSquad",
+                status="blocked" if not req.auto_resume else "running",
+                detail=reply,
+                reply_hint="ARCH reanudará la planificación con esta respuesta.",
+                next_action="Se está reanudando la planificación si el proyecto lo permite.",
+            )
+        )
+    except Exception as exc:
+        mem = load_memory()
+        mem.setdefault("log", []).append(
+            {
+                "ts": utc_now(),
+                "level": "warning",
+                "agent": "dashboard",
+                "msg": f"No se pudo notificar la aclaración por Telegram: {exc}",
+            }
+        )
+        mem["log"] = mem["log"][-500:]
+        save_memory(mem)
+
     if req.auto_resume:
         args = [sys.executable, str(BASE_DIR / "orchestrator.py")]
         if project.get("repo_url"):
