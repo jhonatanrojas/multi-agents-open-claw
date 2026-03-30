@@ -65,14 +65,21 @@ export function useTestModel() {
 
 // ============ PROJECTS ============
 
-export function useStartProject() {
+export function useStartProject(options?: { 
+  onSuccess?: (data: any) => void; 
+  onError?: (error: any) => void;
+}) {
   const queryClient = useQueryClient();
   
   return useMutation({
     mutationFn: api.startProject,
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.state });
       queryClient.invalidateQueries({ queryKey: queryKeys.files });
+      options?.onSuccess?.(data);
+    },
+    onError: (error) => {
+      options?.onError?.(error);
     },
   });
 }

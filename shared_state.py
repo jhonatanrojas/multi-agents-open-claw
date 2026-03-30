@@ -157,6 +157,50 @@ def _normalize_task_preview_fields(mem: dict[str, Any]) -> None:
             task["preview_status"] = "not_applicable"
 
 
+def get_project_blockers(mem: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return blockers that belong to the current project only."""
+    blockers = mem.get("blockers")
+    if not isinstance(blockers, list):
+        return []
+
+    project = mem.get("project") if isinstance(mem.get("project"), dict) else {}
+    project_id = str(project.get("id") or "").strip()
+    if not project_id:
+        return [blocker for blocker in blockers if isinstance(blocker, dict)]
+
+    project_created_at = str(project.get("created_at") or "").strip()
+    task_ids = {
+        str(task.get("id") or "").strip()
+        for task in (mem.get("tasks") if isinstance(mem.get("tasks"), list) else [])
+        if isinstance(task, dict) and str(task.get("id") or "").strip()
+    }
+
+    filtered: list[dict[str, Any]] = []
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            continue
+
+        blocker_project_id = str(blocker.get("project_id") or "").strip()
+        if blocker_project_id:
+            if blocker_project_id == project_id:
+                filtered.append(blocker)
+            continue
+
+        blocker_task_id = str(blocker.get("task_id") or "").strip()
+        if blocker_task_id and blocker_task_id in task_ids:
+            filtered.append(blocker)
+            continue
+
+        blocker_ts = str(blocker.get("ts") or "").strip()
+        if project_created_at and blocker_ts and blocker_ts < project_created_at:
+            continue
+
+        if not blocker_ts and not blocker_task_id:
+            filtered.append(blocker)
+
+    return filtered
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -224,7 +268,7 @@ def refresh_project_runtime_state(mem: dict[str, Any]) -> dict[str, Any]:
     project["runtime_status"] = runtime_status
     project["can_resume"] = bool(counts["open"])
     project["blocked_reason"] = blocked_reason
-    project["has_blockers"] = bool(mem.get("blockers"))
+    project["has_blockers"] = bool(get_project_blockers(mem))
     return mem
 
 

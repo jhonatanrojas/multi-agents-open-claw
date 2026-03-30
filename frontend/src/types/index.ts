@@ -43,6 +43,20 @@ export interface Task {
   failure_count?: number;
   suggested_agent?: string;
   retryable?: boolean;
+  project_id?: string;
+  description?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ClarificationState {
+  questions?: string[];
+  original_brief?: string;
+  sent_at?: string;
+  reply?: string | null;
+  reply_received_at?: string;
+  reply_source?: string;
+  resolved?: boolean;
 }
 
 // Project types
@@ -61,6 +75,7 @@ export interface Project {
   can_resume?: boolean;
   preview_url?: string;
   preview_status?: string;
+  pending_clarification?: ClarificationState;
 }
 
 // Phase types
@@ -81,6 +96,11 @@ export interface LogEntry {
 export interface Blocker {
   source: string;
   msg: string;
+  task_id?: string;
+  questions?: string[];
+  reply_hint?: string;
+  project_id?: string;
+  ts?: string;
 }
 
 // Memory (full state)

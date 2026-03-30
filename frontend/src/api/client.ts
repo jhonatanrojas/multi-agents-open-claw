@@ -123,6 +123,17 @@ export async function resumeProject(params?: {
   });
 }
 
+export async function replyClarification(params: {
+  reply: string;
+  auto_resume?: boolean;
+  source?: string;
+}): Promise<{ message: string; auto_resumed: boolean; project_id: string }> {
+  return apiCall('/project/clarification/reply', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
 // ============ FILES ============
 
 export async function fetchFiles(): Promise<FilesSnapshot> {

@@ -57,6 +57,7 @@ from coordination import (
     needs_planning_clarification,
     slugify,
     record_task_review,
+    format_telegram_blocker_message,
     send_telegram_message,
     apply_session_diagnostics_to_workspace,
     finalize_repo_after_task,
@@ -640,6 +641,8 @@ def record_blocker(
     retryable: bool | None = None,
 ) -> dict[str, Any]:
     """Store a blocker in shared memory."""
+    mem = load_memory()
+    project_id = str(mem.get("project", {}).get("id") or "").strip() or None
     entry = {
         "id": f"blk-{abs(hash((source, task_id, agent_id, message, utc_now()))) % 1_000_000}",
         "ts": utc_now(),
@@ -648,8 +651,8 @@ def record_blocker(
         "task_id": task_id,
         "agent_id": agent_id,
         "retryable": retryable,
+        "project_id": project_id,
     }
-    mem = load_memory()
     mem.setdefault("blockers", [])
     mem["blockers"].append(entry)
     refresh_project_runtime_state(mem)
@@ -748,6 +751,7 @@ def approve_proposal(proposal_id: str) -> dict[str, Any] | None:
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "source_proposal_id": proposal_id,
+        "project_id": project.get("id"),
     }
 
     tasks.append(new_task)
@@ -1085,12 +1089,15 @@ def _save_clarification_pending(
 ) -> None:
     """Persist clarification state in MEMORY so the orchestrator does not
     re-send the same question if it restarts."""
+    project = mem.get("project", {}) or {}
     mem.setdefault("project", {})["pending_clarification"] = {
         "questions": questions,
         "original_brief": brief,
         "sent_at": sent_at,
         "reply": None,
         "resolved": False,
+        "project_id": project.get("id"),
+        "project_created_at": project.get("created_at"),
     }
 
 
@@ -1103,6 +1110,10 @@ def _consume_clarification_reply(mem: dict[str, Any]) -> str | None:
     """
     clarification = mem.get("project", {}).get("pending_clarification")
     if not isinstance(clarification, dict):
+        return None
+    current_project_id = str(mem.get("project", {}).get("id") or "").strip()
+    clarification_project_id = str(clarification.get("project_id") or "").strip()
+    if clarification_project_id and current_project_id and clarification_project_id != current_project_id:
         return None
     reply = clarification.get("reply")
     if not reply:
@@ -1282,7 +1293,15 @@ async def relay_team_messages(client: OpenClawClient) -> None:
                 )
                 try:
                     send_telegram_message(
-                        f"{issue_type} de {normalized['from']}: {normalized['message']}"
+                        format_telegram_blocker_message(
+                            "Bloqueo reportado por agente" if issue_type == "BLOCKER" else "Pregunta reportada por agente",
+                            source=normalized["from"],
+                            status="blocked" if issue_type == "BLOCKER" else "needs_clarification",
+                            task_id=normalized.get("task_id") or normalized.get("from") or None,
+                            detail=normalized["message"],
+                            reply_hint="Responde en DevSquad o por Telegram para reanudar el flujo.",
+                            next_action="ARCH procesará la respuesta en el siguiente ciclo.",
+                        )
                     )
                 except Exception as exc:
                     log_event(f"Falló la notificación por Telegram: {exc}", "system")
@@ -1504,27 +1523,17 @@ def _persist_planner_diagnostics(
 
 
 def _format_planning_clarification_message(brief: str, questions: list[str], structure: dict[str, Any]) -> str:
-    lines = [
-        "Se requiere aclaración antes de planificar el proyecto.",
-        f"Brief: {brief}",
-        "",
-        "Preguntas:",
-    ]
-    lines.extend(f"- {question}" for question in questions)
     layout_kind = structure.get("kind") or "n/a"
-    layout_root = structure.get("root") or "n/a"
-    layout_entry = structure.get("entrypoint") or "n/a"
-    lines.extend(
-        [
-            "",
-            f"Tipo detectado: {layout_kind}",
-            f"Raíz sugerida: {layout_root}",
-            f"Punto de entrada sugerido: {layout_entry}",
-            "",
-            "Responde por Telegram con la aclaración concreta. ARCH reanudará la planificación cuando esté disponible.",
-        ]
+    return format_telegram_blocker_message(
+        "Bloqueo de planificación",
+        source="ARCH",
+        status="needs_clarification",
+        detail=f"Se requiere aclaración antes de planificar. Tipo detectado: {layout_kind}.",
+        brief=brief,
+        questions=questions,
+        reply_hint="Responde con una aclaración concreta por Telegram o desde DevSquad.",
+        next_action="ARCH reanudará la planificación cuando llegue tu respuesta.",
     )
-    return "\n".join(lines)
 
 
 async def plan_project(
@@ -1568,7 +1577,19 @@ async def plan_project(
                 "name": brief[:60].strip() or "Project",
                 "description": brief,
                 "tech_stack": infer_tech_stack_from_brief(brief),
+                "status": "blocked",
+                "id": f"project-{utc_now().replace(':', '-').replace('.', '-')[:19].lower()}",
             }
+            
+            # Save the project even if blocked
+            mem_pre["project"] = clarification_project
+            
+            # Add to projects list if not already there
+            projects_list = mem_pre.setdefault("projects", [])
+            if not any(p.get("id") == clarification_project["id"] for p in projects_list):
+                projects_list.append(clarification_project)
+                mem_pre["projects"] = projects_list
+            
             clarification_structure = infer_project_structure(clarification_project, {})
             clarification_message = _format_planning_clarification_message(
                 brief,
@@ -1948,6 +1969,20 @@ def _handle_task_blocked(
         agent_id=agent_id,
         retryable=True,
     )
+    try:
+        send_telegram_message(
+            format_telegram_blocker_message(
+                "Bloqueo reportado por agente",
+                source=agent_id.upper(),
+                status="blocked",
+                task_id=task_id,
+                detail=detail,
+                reply_hint="Responde en DevSquad o por Telegram para reanudar el flujo.",
+                next_action="ARCH reanudará la tarea cuando el bloqueo se resuelva.",
+            )
+        )
+    except Exception as exc:
+        log_event(f"Falló la notificación de bloqueo por Telegram: {exc}", "system", level="warning")
     bridge.heartbeat("idle", f"Bloqueo en {task_id}")
     update_agent_status(agent_id, "idle", None)
     update_orchestrator_state(
@@ -2267,11 +2302,25 @@ async def execute_task(
                     _push_task_not_before(t, cooldown_sec)
         _sync_project_status(mem)
         refresh_project_runtime_state(mem)
-        save_memory(mem)
-        record_blocker(f"Tarea {task_id} ({agent_id}) falló [{failure_kind or 'unknown'}]: {detail}",
-                       source=agent_id, task_id=task_id, agent_id=agent_id, retryable=retryable)
-        if fallback_agent and retryable and failure_count >= RESUME_FAILURE_THRESHOLD:
-            log_event(f"Tarea {task_id} reasignada a {fallback_agent} tras {failure_count} fallos", "system", level="warning")
+    save_memory(mem)
+    record_blocker(f"Tarea {task_id} ({agent_id}) falló [{failure_kind or 'unknown'}]: {detail}",
+                   source=agent_id, task_id=task_id, agent_id=agent_id, retryable=retryable)
+    try:
+        send_telegram_message(
+            format_telegram_blocker_message(
+                "Tarea fallida",
+                source=agent_id.upper(),
+                status="blocked",
+                task_id=task_id,
+                detail=detail,
+                reply_hint="Revisa el error en DevSquad o reintenta la tarea con corrección.",
+                next_action="ARCH decidirá el siguiente paso tras la revisión.",
+            )
+        )
+    except Exception as exc:
+        log_event(f"Falló la notificación de tarea fallida por Telegram: {exc}", "system", level="warning")
+    if fallback_agent and retryable and failure_count >= RESUME_FAILURE_THRESHOLD:
+        log_event(f"Tarea {task_id} reasignada a {fallback_agent} tras {failure_count} fallos", "system", level="warning")
         bridge.heartbeat("error", f"Error en {task_id}")
         update_agent_status(agent_id, "error", task_id)
         update_orchestrator_state("blocked", phase="execution", task_id=task_id, detail=detail, dry_run=dry_run)
@@ -2821,6 +2870,7 @@ async def main(args: argparse.Namespace) -> None:
                                 "source": "arch",
                                 "msg": str(exc),
                                 "questions": getattr(exc, "questions", []),
+                                "project_id": mem.get("project", {}).get("id"),
                             }
                         )
                         refresh_project_runtime_state(mem)
@@ -2877,13 +2927,23 @@ async def main(args: argparse.Namespace) -> None:
                                 "ts": utc_now(),
                                 "source": "arch",
                                 "msg": str(exc),
+                                "project_id": mem.get("project", {}).get("id"),
                             }
                         )
                         refresh_project_runtime_state(mem)
                         save_memory(mem)
                         log_event(f"Se requiere aprobación del repositorio: {exc}", "arch", level="warning")
                         try:
-                            send_telegram_message(f"Se requiere aprobación del repositorio: {exc}")
+                            send_telegram_message(
+                                format_telegram_blocker_message(
+                                    "Aprobación del repositorio requerida",
+                                    source="ARCH",
+                                    status="blocked",
+                                    detail=str(exc),
+                                    reply_hint="Envía la URL del repositorio o permite la inicialización local desde DevSquad.",
+                                    next_action="ARCH reanudará la planificación cuando el repositorio esté listo.",
+                                )
+                            )
                         except Exception:
                             pass
                         print(str(exc))

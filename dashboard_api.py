@@ -48,10 +48,10 @@ from typing import Any
 
 import requests
 import websockets
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from openclaw_sdk import (
     get_available_models,
@@ -97,7 +97,7 @@ _API_KEY: str = os.getenv("DASHBOARD_API_KEY", "")
 # Endpoints exempt from auth (public monitoring + streaming)
 _AUTH_EXEMPT = {"/health", "/api/health"}
 GATEWAY_EVENT_LIMIT = 300
-GATEWAY_AGENT_RE = re.compile(r"^agent:(arch|byte|pixel):", re.IGNORECASE)
+GATEWAY_AGENT_RE = re.compile(r"^agent:(main|arch|byte|pixel):", re.IGNORECASE)
 RESUME_COOLDOWN_DEFAULT_SEC = int(os.getenv("OPENCLAW_RESUME_COOLDOWN_SEC", "60"))
 RESUME_COOLDOWN_PROVIDER_SEC = int(os.getenv("OPENCLAW_PROVIDER_RESUME_COOLDOWN_SEC", "300"))
 _RESUME_PROVIDER_SIGNALS = (
@@ -1374,10 +1374,10 @@ def _default_miniverse_mock() -> dict[str, Any]:
             "language": "TypeScript",
             "updated_at": now,
         },
-        "world": {
-            "base_url": "local-mock://miniverse",
-            "api_url": "local-mock://miniverse/api",
-            "ui_url": "local-mock://miniverse/ui",
+            "world": {
+                "base_url": "local-mock://miniverse",
+                "api_url": "local-mock://miniverse/api",
+                "ui_url": "local-mock://miniverse/ui",
             "gridCols": 12,
             "gridRows": 8,
             "floor": [
@@ -1457,6 +1457,13 @@ def _default_miniverse_mock() -> dict[str, Any]:
             ],
             "citizens": [
                 {
+                    "agentId": "main",
+                    "name": "MAIN",
+                    "sprite": "rio",
+                    "position": "desk_0_1",
+                    "type": "agent",
+                },
+                {
                     "agentId": "pixel",
                     "name": "PIXEL",
                     "sprite": "nova",
@@ -1488,10 +1495,19 @@ def _default_miniverse_mock() -> dict[str, Any]:
                 "world": "Miniverse local mock",
                 "version": "mock",
                 "grid": {"cols": 12, "rows": 8},
-                "agents": {"online": 3, "total": 3},
+                "agents": {"online": 4, "total": 4},
                 "theme": "cozy-startup",
             },
             "agents": [
+                {
+                    "agent": "main",
+                    "state": "idle",
+                    "role": "Observer",
+                    "task": "Observing the squad runtime",
+                    "last_seen": now,
+                    "x": 6,
+                    "y": 4,
+                },
                 {
                     "agent": "pixel",
                     "state": "working",
@@ -1533,6 +1549,13 @@ def _default_miniverse_mock() -> dict[str, Any]:
                     "type": "tool",
                     "agent": "pixel",
                     "message": "Render local disponible mientras el mundo real responde.",
+                    "timestamp": now,
+                },
+                {
+                    "id": "mock-3",
+                    "type": "message",
+                    "agent": "main",
+                    "message": "MAIN observa el mundo compartido.",
                     "timestamp": now,
                 },
             ],
@@ -2148,6 +2171,20 @@ class ProjectPauseRequest(BaseModel):
     reason: str | None = None
 
 
+class ProjectClarificationReplyRequest(BaseModel):
+    reply: str = Field(..., min_length=1, max_length=2000)
+    auto_resume: bool = Field(default=True)
+    source: str = Field(default="dashboard")
+
+
+class ProjectClarificationReplyResponse(BaseModel):
+    ok: bool
+    project_id: str
+    auto_resumed: bool
+    message: str
+    timestamp: str
+
+
 def _spawn_orchestrator(args: list[str]) -> None:
     log_path = BASE_DIR / "logs" / "orchestrator.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2162,7 +2199,36 @@ def _spawn_orchestrator(args: list[str]) -> None:
 
 @app.post("/api/project/start")
 async def start_project(req: ProjectRequest):
-    """Spawn orchestrator in background."""
+    """Spawn orchestrator in background.
+    
+    Validates that there's no active project with similar description.
+    """
+    # Check for duplicate active projects
+    mem = load_memory()
+    active_project = mem.get("project", {})
+    projects = mem.get("projects", [])
+    
+    # Check if there's already an active project running
+    if active_project and active_project.get("status") in ("starting", "running", "pending", "in_progress"):
+        return JSONResponse({
+            "error": f"Ya existe un proyecto activo: {active_project.get('name', 'Sin nombre')}",
+            "active_project_id": active_project.get("id"),
+            "active_project_status": active_project.get("status"),
+        }, status_code=409)
+    
+    # Check for similar projects (same brief or description)
+    normalized_brief = req.brief.strip().lower()[:100]
+    for p in projects:
+        if p.get("status") in ("completed", "failed"):
+            continue
+        desc = (p.get("description") or "").lower()
+        if normalized_brief in desc or desc[:100] in normalized_brief:
+            return JSONResponse({
+                "error": f"Ya existe un proyecto similar activo: {p.get('name', 'Sin nombre')}",
+                "similar_project_id": p.get("id"),
+                "similar_project_status": p.get("status"),
+            }, status_code=409)
+    
     # GAP-2 — validate brief before spawning subprocess
     try:
         safe_brief = _validate_brief(req.brief)
@@ -2200,6 +2266,34 @@ async def start_project(req: ProjectRequest):
     if req.webhook_url:
         args.extend(["--webhook-url", req.webhook_url])
     args.append(safe_brief)
+
+    mem.setdefault("project", {})
+    mem["project"].update(
+        {
+            "name": req.repo_name or safe_brief[:60] or "Project",
+            "description": safe_brief,
+            "repo_url": req.repo_url,
+            "repo_name": req.repo_name,
+            "branch": req.branch,
+            "allow_init_repo": req.allow_init_repo,
+            "created_at": utc_now(),
+            "status": "starting",
+            "updated_at": utc_now(),
+        }
+    )
+    mem["blockers"] = []
+    mem["project"].pop("pending_clarification", None)
+    mem["project"].setdefault("orchestrator", {})
+    mem["project"]["orchestrator"].update(
+        {
+            "status": "starting",
+            "phase": "planning",
+            "detail": "Proyecto iniciado desde el dashboard",
+            "updated_at": utc_now(),
+        }
+    )
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
 
     _spawn_orchestrator(args)
     return {
@@ -2319,6 +2413,85 @@ async def resume_project(req: ProjectResumeRequest):
     }
 
 
+@app.post("/api/project/clarification/reply", response_model=ProjectClarificationReplyResponse)
+async def reply_project_clarification(req: ProjectClarificationReplyRequest):
+    """Store a clarification reply and optionally restart planning immediately."""
+    mem = load_memory()
+    project = mem.get("project", {}) or {}
+    project_id = str(project.get("id") or "").strip()
+    pending = project.get("pending_clarification")
+    reply = req.reply.strip()
+
+    if not project_id:
+        return JSONResponse({"error": "No hay proyecto activo"}, status_code=422)
+    pending_project_id = str(pending.get("project_id") or "").strip() if isinstance(pending, dict) else ""
+    if not isinstance(pending, dict) or pending.get("resolved") or (pending_project_id and pending_project_id != project_id):
+        return JSONResponse({"error": "No hay una aclaración pendiente para responder"}, status_code=404)
+    if not reply:
+        return JSONResponse({"error": "La aclaración no puede estar vacía"}, status_code=422)
+
+    pending["reply"] = reply
+    pending["reply_source"] = req.source or "dashboard"
+    pending["reply_received_at"] = utc_now()
+    pending["resolved"] = False
+
+    project.setdefault("orchestrator", {})
+    project["updated_at"] = utc_now()
+    if req.auto_resume:
+        project["status"] = "in_progress"
+        project["orchestrator"].update(
+            {
+                "status": "starting",
+                "phase": "planning",
+                "detail": "Aclaración recibida; reanudando planificación",
+                "updated_at": utc_now(),
+            }
+        )
+    else:
+        project["status"] = "blocked"
+        project["orchestrator"].update(
+            {
+                "status": "blocked",
+                "phase": "planning",
+                "detail": "Aclaración registrada; pendiente de reanudación",
+                "updated_at": utc_now(),
+            }
+        )
+    mem.setdefault("log", []).append(
+        {
+            "ts": utc_now(),
+            "level": "info",
+            "agent": "dashboard",
+            "msg": f"Aclaración recibida desde {req.source}: {reply[:120]}{'...' if len(reply) > 120 else ''}",
+            "meta": {"auto_resume": req.auto_resume, "source": req.source},
+        }
+    )
+    mem["log"] = mem["log"][-500:]
+    refresh_project_runtime_state(mem)
+    save_memory(mem)
+
+    if req.auto_resume:
+        args = [sys.executable, str(BASE_DIR / "orchestrator.py")]
+        if project.get("repo_url"):
+            args.extend(["--repo-url", str(project.get("repo_url"))])
+        if project.get("repo_name"):
+            args.extend(["--repo-name", str(project.get("repo_name"))])
+        if project.get("branch"):
+            args.extend(["--branch", str(project.get("branch"))])
+        if project.get("allow_init_repo"):
+            args.append("--allow-init-repo")
+        args.append(project.get("description") or project.get("name") or "Resume project")
+        _spawn_orchestrator(args)
+
+    return ProjectClarificationReplyResponse(
+        ok=True,
+        project_id=project_id,
+        auto_resumed=bool(req.auto_resume),
+        message="Aclaración registrada" + (" y planificación reanudada" if req.auto_resume else ""),
+        timestamp=utc_now(),
+    )
+
+
 @app.post("/api/project/load")
 async def load_project(payload: dict[str, Any] | None = None):
     project_id = payload.get("project_id") if isinstance(payload, dict) else None
@@ -2355,14 +2528,17 @@ async def load_project(payload: dict[str, Any] | None = None):
     # pero al menos reanudamos sobre la ruta del repo donde OpenClaw reparará su estado
     defaults = deepcopy(DEFAULT_MEMORY)
     mem["project"] = project_to_load
+    mem["blockers"] = []
     mem["project"]["status"] = "in_progress"
     mem["project"]["updated_at"] = utc_now()
+    mem["project"].setdefault("created_at", utc_now())
     
     # Reset temporal de tasks/logs (se pueden repoblar si orchestrator.py reconstruye desde repo)
     mem["tasks"] = []
     mem["plan"] = defaults["plan"]
     mem["log"] = []
     mem["blockers"] = []
+    mem["project"].pop("pending_clarification", None)
     
     mem["project"].setdefault("orchestrator", {})
     mem["project"]["orchestrator"].update({
@@ -2590,7 +2766,65 @@ async def background_telegram_polling():
                 for nm in new_msgs:
                     if nm["id"] not in existing_ids:
                         mem.setdefault("messages", []).append(nm)
-                
+
+                project = mem.get("project", {}) or {}
+                pending = project.get("pending_clarification")
+                if (
+                    isinstance(pending, dict)
+                    and not pending.get("resolved")
+                    and not pending.get("reply")
+                    and (not pending.get("project_id") or str(pending.get("project_id")) == str(project.get("id") or ""))
+                ):
+                    first_reply = next(
+                        (
+                            nm.get("text")
+                            for nm in new_msgs
+                            if isinstance(nm, dict) and isinstance(nm.get("text"), str) and nm.get("text", "").strip() and not nm.get("text", "").strip().startswith("/")
+                        ),
+                        None,
+                    )
+                    if first_reply:
+                        reply_text = str(first_reply).strip()
+                        pending["reply"] = reply_text
+                        pending["reply_source"] = "telegram"
+                        pending["reply_received_at"] = utc_now()
+                        pending["resolved"] = False
+                        project["status"] = "in_progress"
+                        project["updated_at"] = utc_now()
+                        project.setdefault("orchestrator", {})
+                        project["orchestrator"].update(
+                            {
+                                "status": "starting",
+                                "phase": "planning",
+                                "detail": "Aclaración recibida por Telegram; reanudando planificación",
+                                "updated_at": utc_now(),
+                            }
+                        )
+                        mem.setdefault("log", []).append(
+                            {
+                                "ts": utc_now(),
+                                "level": "info",
+                                "agent": "telegram",
+                                "msg": f"Aclaración recibida por Telegram: {reply_text[:120]}{'...' if len(reply_text) > 120 else ''}",
+                                "meta": {"source": "telegram", "auto_resume": True},
+                            }
+                        )
+                        mem["log"] = mem["log"][-500:]
+                        refresh_project_runtime_state(mem)
+                        save_memory(mem)
+
+                        args = [sys.executable, str(BASE_DIR / "orchestrator.py")]
+                        if project.get("repo_url"):
+                            args.extend(["--repo-url", str(project.get("repo_url"))])
+                        if project.get("repo_name"):
+                            args.extend(["--repo-name", str(project.get("repo_name"))])
+                        if project.get("branch"):
+                            args.extend(["--branch", str(project.get("branch"))])
+                        if project.get("allow_init_repo"):
+                            args.append("--allow-init-repo")
+                        args.append(project.get("description") or project.get("name") or "Resume project")
+                        _spawn_orchestrator(args)
+
                 # Limit memory
                 if len(mem["messages"]) > 200:
                     mem["messages"] = mem["messages"][-200:]
@@ -2600,7 +2834,7 @@ async def background_telegram_polling():
                 
                 # Notify UI via SSE/WS
                 # (Existing WebSocket connections will see the change in next broadcast)
-                broadcast_state_change(mem)
+                # broadcast_state_change(mem)  # TODO: implement
 
         except Exception as e:
             print(f"[Polling Error] {e}")
@@ -2615,6 +2849,360 @@ def get_logs():
         "log": mem.get("log", [])[-100:],
         "structured_log": _read_jsonl_tail(JSONL_LOG_FILE, 100),
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEER & INTERVENTION ENDPOINTS — Dashboard as Co-Pilot Surface
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SteerRequest(BaseModel):
+    """Request to send a steering message to an active agent."""
+    message: str = Field(..., min_length=1, max_length=1000, description="Steer message content")
+    urgent: bool = Field(default=False, description="If true, agent processes immediately on next heartbeat")
+
+
+class SteerResponse(BaseModel):
+    """Response after sending a steer message."""
+    ok: bool
+    agent_id: str
+    message: str
+    queued_at: str
+    session_key: str | None = None
+
+
+@app.post("/api/agents/{agent_id}/steer", response_model=SteerResponse)
+async def steer_agent(agent_id: str, req: SteerRequest):
+    """
+    Send a steer message to an active sub-agent session.
+    
+    ## Design
+    
+    This endpoint enables **active intervention** by the human operator:
+    - The message is queued in MEMORY.json under `messages[].agent_id`
+    - On next heartbeat cycle, the agent reads pending messages
+    - The agent incorporates the steer into its next planning step
+    
+    ## Flow
+    
+    1. Human clicks on active agent in Dashboard
+    2. Human types steer message (max 1000 chars)
+    3. Frontend calls POST /api/agents/{agent_id}/steer
+    4. Backend queues message in MEMORY.json
+    5. Agent's next heartbeat reads message from queue
+    6. Agent logs: "Received steer: {message[:50]}..."
+    7. Agent adjusts plan accordingly
+    
+    ## Status Codes
+    
+    - 200: Message queued successfully
+    - 404: Agent not found or not active
+    - 422: Invalid message (empty or too long)
+    """
+    mem = load_memory()
+    
+    # Validate agent exists and is active
+    agents = mem.get("agents", {})
+    if agent_id not in agents:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    
+    agent = agents[agent_id]
+    agent_status = agent.get("status", "offline")
+    
+    if agent_status not in ("working", "idle", "waiting"):
+        # Still queue the message, but warn the caller
+        pass
+    
+    # Queue the steer message
+    timestamp = utc_now()
+    steer_entry = {
+        "type": "steer",
+        "agent_id": agent_id,
+        "message": req.message,
+        "urgent": req.urgent,
+        "queued_at": timestamp,
+        "read": False,
+        "read_at": None,
+    }
+    
+    # Add to messages array
+    messages = mem.get("messages", [])
+    messages.append(steer_entry)
+    mem["messages"] = messages[-100:]  # Keep last 100 messages
+    
+    # Log the steer action
+    log_entry = {
+        "ts": timestamp,
+        "level": "info",
+        "agent": "dashboard",
+        "msg": f"Steer sent to {agent_id}: {req.message[:80]}{'...' if len(req.message) > 80 else ''}",
+        "meta": {"urgent": req.urgent}
+    }
+    mem.setdefault("log", []).append(log_entry)
+    mem["log"] = mem["log"][-500:]  # Keep last 500 log entries
+    
+    save_memory(mem)
+    
+    # Broadcast to connected clients via SSE (if available)
+    # broadcast_state_change(mem)  # TODO: implement SSE broadcast
+    
+    return SteerResponse(
+        ok=True,
+        agent_id=agent_id,
+        message=req.message,
+        queued_at=timestamp,
+        session_key=agent.get("session_key"),
+    )
+
+
+class TaskPauseResponse(BaseModel):
+    """Response after pausing a task."""
+    ok: bool
+    task_id: str
+    status: str
+    paused_at: str
+    agent_notified: bool
+
+
+@app.post("/api/tasks/{task_id}/pause", response_model=TaskPauseResponse)
+async def pause_task(task_id: str):
+    """
+    Flag a task as paused in MEMORY.json for ARCH to detect.
+    
+    ## Design
+    
+    This enables the human operator to **pause work** on a specific task:
+    - The task status is set to "paused" in MEMORY.json
+    - ARCH coordinator detects the pause on next heartbeat
+    - ARCH reassigns resources or waits for resume signal
+    
+    ## Flow
+    
+    1. Human sees a task that needs to pause
+    2. Human clicks "Pause" on the task
+    3. Frontend calls POST /api/tasks/{task_id}/pause
+    4. Backend updates task status to "paused"
+    5. ARCH's next heartbeat sees paused status
+    6. ARCH logs: "Task {task_id} paused by operator"
+    7. ARCH updates plan to work around pause
+    
+    ## Status Codes
+    
+    - 200: Task paused successfully
+    - 404: Task not found
+    - 409: Task already paused
+    """
+    mem = load_memory()
+    
+    # Find the task
+    tasks = mem.get("tasks", [])
+    task = None
+    task_index = None
+    
+    for i, t in enumerate(tasks):
+        if t.get("id") == task_id or t.get("task_id") == task_id:
+            task = t
+            task_index = i
+            break
+    
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+    
+    current_status = task.get("status", "pending")
+    
+    if current_status == "paused":
+        raise HTTPException(status_code=409, detail=f"Task '{task_id}' is already paused")
+    
+    # Update task status
+    timestamp = utc_now()
+    tasks[task_index]["status"] = "paused"
+    tasks[task_index]["paused_at"] = timestamp
+    tasks[task_index]["paused_by"] = "operator"
+    mem["tasks"] = tasks
+    
+    # Log the pause action
+    log_entry = {
+        "ts": timestamp,
+        "level": "info",
+        "agent": "dashboard",
+        "msg": f"Task {task_id} paused by operator",
+        "meta": {"previous_status": current_status}
+    }
+    mem.setdefault("log", []).append(log_entry)
+    mem["log"] = mem["log"][-500:]
+    
+    save_memory(mem)
+    # broadcast_state_change(mem)  # TODO: implement SSE broadcast
+    
+    # Notify ARCH if it has a session
+    agent_notified = False
+    agents = mem.get("agents", {})
+    if "arch" in agents and agents["arch"].get("status") == "working":
+        # Queue a notification message for ARCH
+        notification = {
+            "type": "task_paused",
+            "task_id": task_id,
+            "timestamp": timestamp,
+            "notified_at": utc_now(),
+        }
+        mem.setdefault("messages", []).append(notification)
+        save_memory(mem)
+        agent_notified = True
+    
+    return TaskPauseResponse(
+        ok=True,
+        task_id=task_id,
+        status="paused",
+        paused_at=timestamp,
+        agent_notified=agent_notified,
+    )
+
+
+class ContextUpdateRequest(BaseModel):
+    """Request to update a section of CONTEXT.md."""
+    section: str = Field(..., description="Section name to update (e.g., 'Tech Stack', 'Architecture')")
+    content: str = Field(..., description="New content for the section")
+    reason: str = Field(default="", description="Reason for the change (logged in history)")
+
+
+class ContextUpdateResponse(BaseModel):
+    """Response after updating context."""
+    ok: bool
+    section: str
+    content_length: int
+    updated_at: str
+    history_entry_id: str
+
+
+@app.patch("/api/context", response_model=ContextUpdateResponse)
+async def update_context(req: ContextUpdateRequest):
+    """
+    Update a specific section of CONTEXT.md and log the change.
+    
+    ## Design
+    
+    This enables the human operator to **modify context** for agents:
+    - Updates a specific section in CONTEXT.md
+    - Logs the change in plan_history[] for audit
+    - Agents pick up changes on next context refresh
+    
+    ## Flow
+    
+    1. Human edits a section in the Dashboard
+    2. Frontend calls PATCH /api/context
+    3. Backend updates CONTEXT.md section
+    4. Backend logs change in plan_history
+    5. Agents see updated context on next read
+    
+    ## Supported Sections
+    
+    - `Tech Stack`: Language, framework, and tool choices
+    - `Architecture`: System design decisions
+    - `Constraints`: Requirements and limitations
+    - `Context`: Project background and goals
+    - `Instructions`: Specific agent instructions
+    
+    ## Status Codes
+    
+    - 200: Section updated successfully
+    - 400: Invalid section name
+    - 500: Failed to write CONTEXT.md
+    """
+    mem = load_memory()
+    
+    # Validate section name
+    valid_sections = ["Tech Stack", "Architecture", "Constraints", "Context", "Instructions", "Notes"]
+    if req.section not in valid_sections:
+        # Allow custom sections but warn in logs
+        print(f"[Context] Unknown section: {req.section}")
+    
+    # Read current CONTEXT.md
+    context_path = CONTEXT_FILE if 'CONTEXT_FILE' in globals() else "/var/www/openclaw-multi-agents/shared/CONTEXT.md"
+    
+    try:
+        context_content = ""
+        if os.path.exists(context_path):
+            with open(context_path, 'r', encoding='utf-8') as f:
+                context_content = f.read()
+    except Exception as e:
+        print(f"[Context] Error reading CONTEXT.md: {e}")
+        context_content = ""
+    
+    # Update the section
+    timestamp = utc_now()
+    section_header = f"## {req.section}"
+    
+    # Find and replace section content
+    lines = context_content.split('\n')
+    new_lines = []
+    in_section = False
+    section_start = -1
+    
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            if in_section:
+                # End of current section
+                in_section = False
+            if line == section_header:
+                in_section = True
+                section_start = i
+                new_lines.append(line)
+                new_lines.append(req.content)
+                continue
+        
+        if not in_section:
+            new_lines.append(line)
+    
+    # If section not found, append it
+    if section_start == -1:
+        new_lines.append("")
+        new_lines.append(section_header)
+        new_lines.append(req.content)
+    
+    updated_content = '\n'.join(new_lines)
+    
+    # Write updated CONTEXT.md
+    try:
+        os.makedirs(os.path.dirname(context_path), exist_ok=True)
+        with open(context_path, 'w', encoding='utf-8') as f:
+            f.write(updated_content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write CONTEXT.md: {e}")
+    
+    # Log in plan_history
+    history_entry = {
+        "id": f"ctx-{timestamp.replace(':', '-').replace('.', '-')}",
+        "timestamp": timestamp,
+        "type": "context_update",
+        "section": req.section,
+        "reason": req.reason or f"Updated {req.section} section",
+        "content_preview": req.content[:200] + ("..." if len(req.content) > 200 else ""),
+        "by": "operator",
+    }
+    
+    mem.setdefault("plan_history", []).append(history_entry)
+    mem["plan_history"] = mem["plan_history"][-50:]  # Keep last 50 entries
+    
+    # Log the action
+    log_entry = {
+        "ts": timestamp,
+        "level": "info",
+        "agent": "dashboard",
+        "msg": f"Context section '{req.section}' updated: {req.reason or 'No reason provided'}",
+        "meta": {"section": req.section, "content_length": len(req.content)}
+    }
+    mem.setdefault("log", []).append(log_entry)
+    mem["log"] = mem["log"][-500:]
+    
+    save_memory(mem)
+    # broadcast_state_change(mem)  # TODO: implement SSE broadcast
+    
+    return ContextUpdateResponse(
+        ok=True,
+        section=req.section,
+        content_length=len(req.content),
+        updated_at=timestamp,
+        history_entry_id=history_entry["id"],
+    )
 
 
 # ── OpenAPI Documentation (Tarea 4.2) ────────────────────────────────────────

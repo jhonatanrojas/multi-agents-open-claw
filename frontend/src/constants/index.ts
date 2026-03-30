@@ -74,7 +74,9 @@ export const STATUS_ES: Record<string, string> = {
 };
 
 // API constants
-export const API_BASE = '/devsquad/api';
+// Default to the same-origin proxy; allow override for non-browser tooling.
+const DEFAULT_API_BASE = '/devsquad/api';
+export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim() || DEFAULT_API_BASE;
 export const CONTEXT_DOC_PATH = '/var/www/openclaw-multi-agents/shared/CONTEXT.md';
 export const MODEL_SELECTION_KEY = 'devsquad:model-selection:v1';
 export const LOG_MAX = 200;

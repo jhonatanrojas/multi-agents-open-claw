@@ -12,12 +12,27 @@ export function TasksList() {
   const pauseMutation = usePauseProject();
   const resumeMutation = useResumeProject();
   
+  // Filter tasks for current project
+  // If task has project_id, filter by it
+  // If task has no project_id, include if it's the only project or was created recently
+  const projectId = project?.id;
+  const projectTasks = tasks.filter((t: Task) => {
+    // If task has project_id, match exactly
+    if (t.project_id) {
+      return t.project_id === projectId;
+    }
+    // If no project_id, check if it matches current project by other means
+    // (e.g., recently created when this project is active)
+    // For now, include all tasks without project_id when there's an active project
+    return projectId !== undefined;
+  });
+  
   // Group tasks by status
-  const activeTasks = tasks.filter((t: Task) => 
+  const activeTasks = projectTasks.filter((t: Task) => 
     ['in_progress', 'planned', 'pending'].includes(t.status)
   );
-  const completedTasks = tasks.filter((t: Task) => t.status === 'done');
-  const failedTasks = tasks.filter((t: Task) => 
+  const completedTasks = projectTasks.filter((t: Task) => t.status === 'done');
+  const failedTasks = projectTasks.filter((t: Task) => 
     ['error', 'paused', 'blocked'].includes(t.status)
   );
   
@@ -25,6 +40,26 @@ export function TasksList() {
     <div className="tasks-list">
       {/* Project bar */}
       <ProjectBar />
+      
+      {/* Project name header */}
+      {project && (
+        <div className="tasks-project-header">
+          <h3>📋 Tareas de: {project.name}</h3>
+          <span className="task-count">{projectTasks.length} tareas</span>
+        </div>
+      )}
+      
+      {/* No tasks state */}
+      {projectTasks.length === 0 && project && (
+        <Panel>
+          <EmptyState>
+            Este proyecto aún no tiene tareas.
+            {project.status === 'blocked' && (
+              <><br/>El proyecto está esperando clarificación para continuar.</>
+            )}
+          </EmptyState>
+        </Panel>
+      )}
       
       {/* Active tasks */}
       {activeTasks.length > 0 && (
@@ -71,11 +106,11 @@ export function TasksList() {
         </Panel>
       )}
       
-      {/* Empty state */}
-      {tasks.length === 0 && !project && (
+      {/* Empty state when no project */}
+      {!project && (
         <Panel>
           <EmptyState>
-            No hay tareas activas. Inicia un proyecto para comenzar.
+            Selecciona o crea un proyecto para ver sus tareas.
           </EmptyState>
         </Panel>
       )}

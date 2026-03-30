@@ -27,6 +27,7 @@ WORKSPACE_NAMES = {
     "byte": "programmer",
     "pixel": "designer",
 }
+TELEGRAM_MESSAGE_LIMIT = 3500
 
 # ---------------------------------------------------------------------------
 # Fase 0 — Contrato formal de estructura de proyecto
@@ -89,6 +90,90 @@ def get_telegram_credentials() -> tuple[str | None, str | None]:
         os.getenv("TELEGRAM_BOT_TOKEN"),
         os.getenv("TELEGRAM_CHAT_ID"),
     )
+
+
+def _telegram_compact_text(value: str | None, *, limit: int = 220) -> str:
+    text = re.sub(r"\s+", " ", (value or "").strip())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _telegram_message_chunks(message: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    normalized = (message or "").strip()
+    if not normalized:
+        return []
+    if len(normalized) <= limit:
+        return [normalized]
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_lines
+        if current_lines:
+            chunks.append("\n".join(current_lines).strip())
+            current_lines = []
+
+    for line in normalized.splitlines() or [normalized]:
+        line = line.rstrip()
+        candidate = "\n".join(current_lines + [line]) if current_lines else line
+        if len(candidate) <= limit:
+            current_lines.append(line)
+            continue
+
+        flush_current()
+        if not line:
+            continue
+        if len(line) <= limit:
+            current_lines.append(line)
+            continue
+
+        start = 0
+        while start < len(line):
+            chunks.append(line[start:start + limit])
+            start += limit
+
+    flush_current()
+    return chunks or [normalized[:limit]]
+
+
+def format_telegram_blocker_message(
+    title: str,
+    *,
+    source: str | None = None,
+    status: str | None = None,
+    task_id: str | None = None,
+    detail: str | None = None,
+    brief: str | None = None,
+    questions: list[str] | None = None,
+    reply_hint: str | None = None,
+    next_action: str | None = None,
+) -> str:
+    """Return a compact, standard Telegram message for blockers and clarifications."""
+    lines: list[str] = [f"⚠️ {title}", f"Estado: {status or 'blocked'}"]
+    if source:
+        lines.append(f"Fuente: {source}")
+    if task_id:
+        lines.append(f"Tarea: {task_id}")
+    if detail:
+        lines.append(f"Detalle: {_telegram_compact_text(detail, limit=300)}")
+    if brief:
+        lines.append(f"Brief: {_telegram_compact_text(brief, limit=260)}")
+
+    clean_questions = [q.strip() for q in (questions or []) if isinstance(q, str) and q.strip()]
+    if clean_questions:
+        lines.append("")
+        lines.append("Preguntas:")
+        for idx, question in enumerate(clean_questions, start=1):
+            lines.append(f"{idx}. {_telegram_compact_text(question, limit=240)}")
+
+    if reply_hint:
+        lines.append("")
+        lines.append(f"Respuesta esperada: {reply_hint.strip()}")
+    if next_action:
+        lines.append(f"Siguiente paso: {next_action.strip()}")
+    return "\n".join(lines).strip()
 
 
 @dataclass
@@ -1563,38 +1648,69 @@ def send_telegram_message(
             "reason": "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID",
         }
 
+    chunks = _telegram_message_chunks(message)
+    if not chunks:
+        return {
+            "sent": False,
+            "reason": "El mensaje de Telegram está vacío",
+        }
+
     delay = max(0.5, float(backoff_seconds))
     last_error: str | None = None
+    responses: list[dict[str, Any]] = []
 
-    for attempt in range(1, max(1, retries) + 1):
-        try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{resolved_token}/sendMessage",
-                json={
-                    "chat_id": resolved_chat_id,
-                    "text": message,
-                    "disable_web_page_preview": True,
-                },
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            return {
-                "sent": True,
-                "status_code": response.status_code,
-                "response": response.json() if response.content else {},
-                "attempt": attempt,
-            }
-        except Exception as exc:
-            last_error = str(exc)
-            if attempt >= max(1, retries):
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        attempt_delay = delay
+        chunk_error: str | None = None
+        for attempt in range(1, max(1, retries) + 1):
+            try:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{resolved_token}/sendMessage",
+                    json={
+                        "chat_id": resolved_chat_id,
+                        "text": chunk,
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                responses.append(
+                    {
+                        "chunk": chunk_index,
+                        "status_code": response.status_code,
+                        "response": response.json() if response.content else {},
+                        "attempt": attempt,
+                    }
+                )
+                chunk_error = None
+                last_error = None
                 break
-            time.sleep(delay)
-            delay *= 2
+            except Exception as exc:
+                chunk_error = str(exc)
+                last_error = chunk_error
+                if attempt >= max(1, retries):
+                    break
+                time.sleep(attempt_delay)
+                attempt_delay *= 2
+
+        if chunk_error:
+            return {
+                "sent": False,
+                "reason": chunk_error,
+                "attempts": max(1, retries),
+                "chunk": chunk_index,
+                "chunks": len(chunks),
+                "responses": responses,
+            }
+
+        if chunk_index < len(chunks):
+            time.sleep(0.25)
 
     return {
-        "sent": False,
-        "reason": last_error or "Falló el envío de Telegram",
-        "attempts": max(1, retries),
+        "sent": True,
+        "chunks": len(chunks),
+        "responses": responses,
+        "reason": None,
     }
 
 

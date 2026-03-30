@@ -4,6 +4,7 @@ import path from 'path'
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: '/devsquad/',
   plugins: [react()],
   resolve: {
     alias: {
@@ -32,6 +33,10 @@ export default defineConfig({
   preview: {
     allowedHosts: [
       'info-largely-lawsuit-involve.trycloudflare.com',
+      'soonest-actors-holding-intervention.trycloudflare.com',
     ],
+  },
+  build: {
+    cssMinify: false,
   },
 })

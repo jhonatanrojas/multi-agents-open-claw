@@ -1,0 +1,45 @@
+.blockers-bar {
+  background: #FFF2D8;
+  border: 1px solid #F5A623;
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+}
+
+.blockers-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-weight: 600;
+  color: #9A5B00;
+}
+
+.blockers-count {
+  background: #F5A623;
+  color: white;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+}
+
+.blockers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.blocker-item {
+  display: flex;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.blocker-agent {
+  font-weight: 500;
+  color: #9A5B00;
+}
+
+.blocker-msg {
+  color: #666;
+}

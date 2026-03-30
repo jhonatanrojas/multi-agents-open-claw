@@ -1,5 +1,32 @@
 .tasks-list {
   display: flex;
   flex-direction: column;
+  gap: 16px;
+}
+
+.tasks-project-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: var(--bg-primary);
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-bottom: 8px;
+}
+
+.tasks-project-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.tasks-project-header .task-count {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+}
+  display: flex;
+  flex-direction: column;
   gap: 14px;
 }

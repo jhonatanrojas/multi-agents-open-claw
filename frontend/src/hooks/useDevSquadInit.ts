@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { useMemoryStore, useGatewayStore, useModelsStore, useRuntimeStore, useFilesStore, useContextStore, useUIStore, useMiniverseStore } from '@/store';
 import { useSSE } from './useSSE';
 import { useGatewayWS } from './useGatewayWS';
-import { fetchModels, fetchGatewayEvents, fetchMiniverse, fetchRuntime, fetchFiles, fetchContext } from '@/api/client';
+import { fetchModels, fetchGatewayEvents, fetchMiniverse, fetchRuntime, fetchFiles, fetchContext, fetchState } from '@/api/client';
 
 /**
  * Hook that initializes all data sources for the Dev Squad dashboard.
@@ -18,6 +18,21 @@ export function useDevSquadInit() {
   
   // Fetch initial state on mount
   useEffect(() => {
+    // Fetch initial state (projects, tasks, agents, etc.)
+    const loadState = async () => {
+      try {
+        const state = await fetchState();
+        useMemoryStore.getState().setMemory(state);
+        console.log('[DevSquad] Initial state loaded:', {
+          project: state.project?.name,
+          projects: state.projects?.length,
+          tasks: state.tasks?.length,
+        });
+      } catch (e) {
+        console.error('[DevSquad] Failed to load initial state:', e);
+      }
+    };
+    
     // Fetch models on mount
     const loadModels = async () => {
       try {
@@ -62,12 +77,19 @@ export function useDevSquadInit() {
     };
     
     // Run all initial fetches
+    loadState(); // Load state first
     Promise.all([loadModels(), loadGatewayEvents(), loadFiles(), loadContext()]);
     
     // Refresh models every minute
     const modelsInterval = setInterval(loadModels, 60000);
     
-    return () => clearInterval(modelsInterval);
+    // Refresh state every 3 seconds as backup to SSE
+    const stateInterval = setInterval(loadState, 3000);
+    
+    return () => {
+      clearInterval(modelsInterval);
+      clearInterval(stateInterval);
+    };
   }, []);
   
   // Fetch miniverse when tab is active

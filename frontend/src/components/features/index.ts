@@ -1,4 +1,5 @@
 export { AgentsGrid } from './AgentsGrid';
+export { AgentsPanel } from './AgentsPanel';
 export { ProjectBar } from './ProjectBar';
 export { TasksList } from './TasksList';
 export { LogTab } from './LogTab';
@@ -14,6 +15,7 @@ export { GatewayChatCard } from './GatewayChatCard';
 export { FileRow } from './FileRow';
 export { FilePreview } from './FilePreview';
 export { ProjectItem } from './ProjectItem';
+export { ProjectSelector } from './ProjectSelector';
 export { ProjectsPanel } from './ProjectsPanel';
 export { StartProjectForm } from './StartProjectForm';
 export { CopilotTab } from './CopilotTab';
