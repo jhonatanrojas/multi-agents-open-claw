@@ -1,9 +1,88 @@
 # Plan de Mejora — Sistema Multi-Agente v2
 ## ARCH / BYTE / PIXEL + OpenClaw + Runtime + Dashboard
 
-> **Stack real:** Python / FastAPI · OpenClaw · MEMORY.json · Laravel + React  
+> **Stack real:** Python / FastAPI · OpenClaw runtime · React / TypeScript / Vite · MEMORY.json  
 > **Agentes:** ARCH (coordinador) · BYTE (programador) · PIXEL (diseñador) · JUDGE (revisor)  
-> **Estado actual:** proto multi-agent — base fuerte, falta formalizar estado + supervisor + contratos
+> **Estado actual:** el prompt de arquitectura base ya está aplicado; este plan endurece el sistema vivo y cierra gaps de coordinación, estado y observabilidad
+
+> **Ejecutor real:** el agente `main` de OpenClaw instala y supervisa este plan mediante el job oficial `multiagent-phase-runner`. El sistema multi-agente en desarrollo es el objetivo a endurecer, no el ejecutor.
+
+## Conciliación real con el código base
+
+El repo ya no parte de cero. La base real que este plan debe respetar es:
+
+- Backend operativo: [dashboard_api.py](/var/www/openclaw-multi-agents/dashboard_api.py)
+- Orquestación runtime: [orchestrator.py](/var/www/openclaw-multi-agents/orchestrator.py)
+- Estado operacional primario: `~/.openclaw/multi-agents/MEMORY.json` via [shared_state.py](/var/www/openclaw-multi-agents/shared_state.py)
+- Snapshot legado y compatibilidad: [shared/MEMORY.json](/var/www/openclaw-multi-agents/shared/MEMORY.json)
+- Manejo de fallback de modelos: [model_fallback.py](/var/www/openclaw-multi-agents/model_fallback.py)
+- Frontend real: [frontend/](/var/www/openclaw-multi-agents/frontend/) con React, TypeScript y Vite
+
+### Gaps que siguen abiertos
+
+- `dashboard_api.py` sigue concentrando demasiada lógica en un solo archivo.
+- La sincronización entre estado vivo, snapshot y UI todavía depende de varias capas manuales.
+- `shared_state.py` formaliza la memoria operativa, pero el plan aún debe llevarla a contratos y validaciones más estrictas.
+- `model_fallback.py` y el catálogo de modelos necesitan endurecimiento continuo para evitar errores silenciosos.
+- El dashboard ya tiene mejoras funcionales, pero el contrato entre tabs, runtime y proyectos sigue siendo sensible a desincronización.
+
+## Integración de OpenClaw en el plan
+
+La operación activa del plan usa el job oficial `multiagent-phase-runner` en la sesión `main`; `HEARTBEAT.md` queda como recordatorio ligero y el runner casero se considera retirado.
+
+Este plan adopta OpenClaw como plataforma operativa para ejecución, revisión,
+notificaciones y control del ciclo multiagente. No sustituye el backend actual;
+lo endurece y le añade disciplina de plataforma.
+
+### Primitivas OpenClaw que se vuelven contrato del plan
+
+- **Scheduler**: `openclaw cron` es el contrato operativo para programar,
+  pausar, reanudar y auditar la automatización. Los comandos `cron.list`,
+  `cron.run`, `cron.enable`, `cron.disable` y `cron.rm` sustituyen cualquier
+  runner casero.
+- **Ejecución directa**: `openclaw agent` es la unidad mínima para ejecutar
+  una vuelta de `main` o `judge` sin interacción manual.
+- **Agentes y routing**: `openclaw agents` y `bindings` son la fuente de verdad
+  para registrar `main`, `judge` y futuros agentes, y para aislar canales,
+  peers y workspaces por rol.
+- **Modelos**: `openclaw models` define la allowlist efectiva y la
+  disponibilidad por proveedor.
+- **Canales**: `openclaw channels` y `openclaw message send` son el canal
+  oficial para Telegram y notificaciones operativas.
+- **Sesiones y memoria**: `openclaw sessions` y `openclaw memory` participan en
+  la política de compactación, limpieza de sesiones sobredimensionadas,
+  auditoría histórica y recuperación de contexto.
+- **Salud y soporte**: `openclaw gateway health`, `openclaw gateway status`,
+  `openclaw status` y `openclaw doctor` son checks previos antes de ejecutar
+  fases o registrar un nuevo job.
+- **Seguridad**: `openclaw security audit` valida la configuración antes de
+  escalar el sistema o activar agentes sensibles.
+- **Workflow declarativo**: OpenProse queda como opción opcional futura para
+  convertir fases complejas en programas declarativos reutilizables.
+
+### Cómo mejora cada pieza el sistema multiagente
+
+| Primitiva OpenClaw | Mejora concreta | Fases impactadas |
+|---|---|---|
+| `openclaw cron` | Elimina el runner casero, mantiene un solo scheduler persistente y permite pausa/reanudación real. | F0.1, F0.8, F4.1 |
+| `openclaw agent` | Ejecuta una fase o un paso sin interacción humana y deja un resultado trazable por sesión. | F1.1, F2.1, F2.4, F2.5 |
+| `openclaw agents` + `bindings` | Aísla contexto por agente, canal o peer y evita mezcla de mensajes entre roles. | F1.1, F2.4, F2.6 |
+| `openclaw models` | Hace explícita la allowlist real por proveedor y reduce errores de catálogo o fallback. | F0.3, F0.6, F1.2 |
+| `openclaw channels` + `message send` | Centraliza Telegram y otras notificaciones del ciclo de fase, bloqueo y reanudación. | F0.1, F0.8, F3.6 |
+| `openclaw sessions` + `memory` | Permite compactar, recuperar y auditar el historial sin depender solo de archivos locales sueltos. | F1.2, F3.4, F3.5 |
+| `openclaw gateway health` + `status` + `doctor` | Aporta preflight, diagnóstico y limpieza antes de ejecutar fases sensibles o reanudar. | F0.8, F4.1, F4.2 |
+| `openclaw security audit` | Endurece el arranque y detecta riesgos de sandbox, herramientas y autenticación. | F0.4, F4.4 |
+| OpenProse | Ofrece una vía futura para convertir secuencias de fases en flujos declarativos. | F4.x y evolución posterior |
+
+### Flujo operativo deseado
+
+1. Preflight con salud, seguridad, agentes y modelos antes de ejecutar.
+2. Ejecutar una sola fase por tick.
+3. Revisar cada fase con `JUDGE` antes de avanzar.
+4. Compactar checkpoint y estado después de cada fase aprobada o rechazada.
+5. Notificar avances, bloqueos y reanudaciones por Telegram.
+6. Mantener el runner separado del flujo actual del dashboard.
+7. Si la tarea es nueva o repetible, seguir la guía de [cron oficial para nuevas tareas](/var/www/openclaw-multi-agents/docs/cron-oficial-nuevas-tareas.md).
 
 ---
 
@@ -404,6 +483,49 @@ Reglas de retry por tipo de fallo:
 
 ---
 
+## F1.8 — Canonicalización de salida y reparación de acciones _(nuevo)_
+
+**Problema:** ARCH, BYTE y PIXEL pueden devolver texto libre, JSON parcial,
+JSON embebido en markdown o esquemas antiguos. El sistema debe aceptar esa
+salida, normalizarla y convertirla en una acción canónica antes de persistir
+o ejecutar.
+
+Este comportamiento debe parecerse al `main` oficial de OpenClaw:
+la entrada se consume tal como llega, la salida se repara si hace falta y el
+flujo continúa cuando la intención es inequívoca. La diferencia es que ARCH
+además decide la acción canónica y consolida el estado.
+
+Objetivo:
+- ARCH actúa como capa de normalización y reparación.
+- La salida puede llegar como texto, JSON puro o JSON embebido.
+- Si la intención es clara, ARCH corrige el payload y ejecuta la acción.
+- Si la intención no es clara, ARCH devuelve `needs_clarification` o bloquea
+  con una razón explícita.
+
+Acciones canónicas mínimas:
+- `create_files`
+- `finish_task`
+- `mark_blocked`
+- `request_clarification`
+- `update_state`
+- `spawn_review`
+
+Reglas de reparación:
+- Intentar parsear JSON puro primero.
+- Intentar extraer JSON embebido después.
+- Si aún falla, interpretar la intención del texto y construir un
+  `ActionEnvelope` canónico.
+- Guardar siempre la salida original junto con la versión normalizada.
+
+**Criterio de aceptación:** ARCH puede recibir una salida textual o JSON
+malformado y aun así:
+- crear archivos cuando la intención sea clara,
+- cerrar la tarea cuando corresponda,
+- pedir aclaración cuando falte información,
+- o bloquear con causa explícita sin perder el contexto.
+
+---
+
 # FASE 2 — Supervisor + Task System
 
 **Objetivo:** separar decisión, ejecución y flujo en capas independientes.
@@ -437,6 +559,12 @@ class SupervisorService:
         Returns APPROVED, REJECTED (with reason), or NEEDS_INFO.
         """
 
+    def normalize_output(self, raw_output: str, task: Task) -> ActionEnvelope:
+        """
+        Accepts free text, JSON, or embedded JSON and returns the canonical
+        action envelope the system can persist or execute safely.
+        """
+
     def handle_blocker(self, task: Task, run: RunContext) -> BlockerResolution:
         """
         Decides whether to retry, reassign, decompose, or escalate.
@@ -450,6 +578,9 @@ class SupervisorService:
 
 El supervisor es el único componente que modifica el estado del run.
 Los agentes solo reciben tareas y devuelven resultados.
+Si la salida de un agente viene mal formada, el supervisor la repara y
+la convierte en una acción canónica; no exige JSON perfecto para continuar
+cuando la intención es clara.
 
 ---
 
@@ -470,6 +601,26 @@ class TaskIntent:
     context_files: list[str]   # archivos que el agente debe leer
     parallel_safe: bool
 ```
+
+```python
+@dataclass
+class ActionEnvelope:
+    action: Literal[
+        'create_files', 'finish_task', 'mark_blocked',
+        'request_clarification', 'update_state', 'spawn_review'
+    ]
+    status: Literal['ok', 'needs_clarification', 'blocked']
+    message: str
+    raw_output: str
+    normalized_output: dict
+    payload: dict
+    files: list[str]
+    requires_review: bool
+```
+
+`ActionEnvelope` es el contrato canónico entre salidas de agentes y
+acciones del supervisor. Puede construirse a partir de texto libre, JSON
+puro o JSON embebido.
 
 ---
 
@@ -527,12 +678,20 @@ class AgentWorker(ABC):
 class TaskResult:
     task_id: str
     status: Literal['done', 'error', 'needs_clarification']
-    output: dict
+    raw_output: str
+    normalized_output: dict
+    action: Optional[str]   # create_files | finish_task | mark_blocked | request_clarification | update_state | spawn_review
     files_produced: list[str]
     notes: str
     question: Optional[str]   # si status == 'needs_clarification'
     error_kind: Optional[str] # si status == 'error'
 ```
+
+El worker puede responder con texto libre o JSON parcial; ARCH/supervisor
+se encarga de normalizar la salida en un `ActionEnvelope` antes de persistir
+estado, escribir archivos o disparar la siguiente acción.
+Ese contrato imita el comportamiento robusto de `main`: no se detiene por
+formato imperfecto si la intención puede reconstruirse de forma segura.
 
 ---
 
@@ -551,6 +710,8 @@ AgentWorker.execute() — ARCH / BYTE / PIXEL
         ↓
 TaskResult
         ↓
+SupervisorService.normalize_output() — corrige texto, JSON parcial o JSON embebido
+        ↓
 SupervisorService.review_result() — spawna JUDGE
         ↓
 APPROVED → marcar done, siguiente tarea
@@ -558,6 +719,14 @@ REJECTED → needs_revision, notificar agente, reintentar
         ↓
 SupervisorService.decide_next_step() (siguiente ciclo)
 ```
+
+Regla operativa:
+- Si `normalize_output()` puede construir un `ActionEnvelope` válido, el run
+  continúa aunque la respuesta original no fuera JSON puro.
+- Si la intención no es inequívoca, el supervisor bloquea con
+  `needs_clarification` y notifica por Telegram.
+- El objetivo es mantener la tolerancia práctica de `main` sin perder
+  la consolidación canónica que ARCH necesita.
 
 ---
 

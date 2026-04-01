@@ -14,6 +14,7 @@ Uso:
 from __future__ import annotations
 
 import json
+import os
 import time
 import logging
 from dataclasses import dataclass, field
@@ -25,6 +26,12 @@ log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_CONFIG_PATH = BASE_DIR / "models_config.json"
+
+# Cache configuration with environment variable support
+MODEL_STATUS_CACHE_PATH = Path(
+    os.getenv("MODEL_STATUS_CACHE_PATH", "/var/cache/openclaw/model_status.json")
+)
+CACHE_TTL_SECONDS = int(os.getenv("MODEL_STATUS_CACHE_TTL", "300"))  # 5 minutes default
 
 # Códigos de error que disparan fallback
 FALLBACK_ERROR_CODES = {429, 402, 503, 502, 504}
@@ -337,17 +344,24 @@ def save_model_status_cache() -> None:
     Guardar estado de modelos a disco.
     
     Persiste el estado del circuit breaker para sobrevivir reinicios.
+    Incluye manejo de excepciones y logging explícito.
     """
     manager = get_fallback_manager()
+    
+    # Filter out entries older than TTL (5 minutes)
+    now = time.time()
+    cutoff = now - CACHE_TTL_SECONDS
+    
     cache_data = {
-        "timestamp": time.time(),
+        "timestamp": now,
+        "ttl_seconds": CACHE_TTL_SECONDS,
         "circuit_breaker": {
             model: {
-                "failures": failures,
-                "last_failure": max(failures) if failures else None,
+                "failures": [f for f in failures if f > cutoff],
+                "last_failure": max((f for f in failures if f > cutoff), default=None),
             }
             for model, failures in manager.circuit_breaker._failures.items()
-            if failures
+            if failures and any(f > cutoff for f in failures)
         },
         "model_status": {
             model: {
@@ -358,14 +372,32 @@ def save_model_status_cache() -> None:
                 "is_available": status.is_available,
             }
             for model, status in manager._model_status.items()
+            if status.last_error_time > cutoff  # Only include recent statuses
         },
     }
     
     try:
+        # Ensure cache directory exists
+        MODEL_STATUS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Validate directory is writable
+        if not os.access(MODEL_STATUS_CACHE_PATH.parent, os.W_OK):
+            log.error(f"Cache directory not writable: {MODEL_STATUS_CACHE_PATH.parent}")
+            return
+        
         with open(MODEL_STATUS_CACHE_PATH, "w") as f:
             json.dump(cache_data, f, indent=2)
+        
+        log.info(f"Model status cache saved to {MODEL_STATUS_CACHE_PATH}")
+        
+    except PermissionError as e:
+        log.error(f"Permission denied saving model status cache: {e}")
+    except OSError as e:
+        log.error(f"OS error saving model status cache: {e}")
+    except json.JSONEncodeError as e:
+        log.error(f"JSON encoding error saving model status cache: {e}")
     except Exception as e:
-        log.warning(f"Could not save model status cache: {e}")
+        log.error(f"Unexpected error saving model status cache: {type(e).__name__}: {e}")
 
 
 def load_model_status_cache() -> None:
@@ -373,41 +405,73 @@ def load_model_status_cache() -> None:
     Cargar estado de modelos desde disco.
     
     Restaura el estado del circuit breaker desde la sesión anterior.
+    Valida TTL (no usa entradas de más de 5 minutos).
+    Incluye manejo de excepciones con logging explícito.
     """
     if not MODEL_STATUS_CACHE_PATH.exists():
+        log.debug(f"Cache file does not exist: {MODEL_STATUS_CACHE_PATH}")
+        return
+    
+    # Validate file is readable
+    if not os.access(MODEL_STATUS_CACHE_PATH, os.R_OK):
+        log.error(f"Cache file not readable: {MODEL_STATUS_CACHE_PATH}")
         return
     
     try:
-        with open(MODEL_STATUS_CACHE_PATH) as f:
+        with open(MODEL_STATUS_CACHE_PATH, "r") as f:
             cache_data = json.load(f)
         
-        manager = get_fallback_manager()
+        # Validate cache timestamp (ignore if older than TTL)
+        cache_timestamp = cache_data.get("timestamp", 0)
+        cache_age = time.time() - cache_timestamp
+        if cache_age > CACHE_TTL_SECONDS:
+            log.info(f"Cache is {cache_age:.0f}s old (TTL: {CACHE_TTL_SECONDS}s), ignoring stale entries")
+            return
         
-        # Restaurar circuit breaker
+        manager = get_fallback_manager()
+        now = time.time()
+        cutoff = now - CACHE_TTL_SECONDS
+        restored_count = 0
+        
+        # Restaurar circuit breaker (only entries within TTL)
         for model, data in cache_data.get("circuit_breaker", {}).items():
-            # Solo restaurar si el fallo fue hace menos de cooldown_seconds
             last_failure = data.get("last_failure")
-            if last_failure:
-                age = time.time() - last_failure
+            if last_failure and last_failure > cutoff:
+                age = now - last_failure
                 if age < manager.circuit_breaker.cooldown_seconds:
                     manager.circuit_breaker._failures[model] = [last_failure]
+                    restored_count += 1
         
-        # Restaurar model_status
+        # Restaurar model_status (only entries within TTL)
         for model, data in cache_data.get("model_status", {}).items():
-            if data.get("last_error_time", 0) > time.time() - 3600:  # Solo última hora
+            last_error_time = data.get("last_error_time", 0)
+            if last_error_time > cutoff:
                 manager._model_status[model] = ModelStatus(
                     qualified_name=model,
                     last_error=data.get("last_error"),
                     last_error_code=data.get("last_error_code"),
-                    last_error_time=data.get("last_error_time"),
+                    last_error_time=last_error_time,
                     consecutive_failures=data.get("consecutive_failures", 0),
                     is_available=data.get("is_available", True),
                 )
+                restored_count += 1
         
-        log.info(f"Loaded model status cache from {MODEL_STATUS_CACHE_PATH}")
+        log.info(f"Loaded model status cache from {MODEL_STATUS_CACHE_PATH} ({restored_count} entries restored, age: {cache_age:.0f}s)")
         
+    except json.JSONDecodeError as e:
+        log.error(f"Invalid JSON in model status cache: {e}")
+        # Corrupted cache - try to remove it
+        try:
+            MODEL_STATUS_CACHE_PATH.unlink()
+            log.info(f"Removed corrupted cache file: {MODEL_STATUS_CACHE_PATH}")
+        except OSError:
+            pass
+    except PermissionError as e:
+        log.error(f"Permission denied reading model status cache: {e}")
+    except OSError as e:
+        log.error(f"OS error reading model status cache: {e}")
     except Exception as e:
-        log.warning(f"Could not load model status cache: {e}")
+        log.error(f"Unexpected error loading model status cache: {type(e).__name__}: {e}")
 
 
 def get_cached_model_status() -> dict[str, Any]:

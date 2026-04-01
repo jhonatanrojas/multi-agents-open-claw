@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Outlet } from 'react-router-dom';
+import { Outlet, Navigate } from 'react-router-dom';
 import { Header } from '@/components/shared';
 import { QuickActions, FilePreview, GatewayChatCard } from '@/components/features';
 import { useDevSquadInit } from '@/hooks';
-import { useUIStore, useGatewayStore, useFilesStore, selectAllChats } from '@/store';
+import { useUIStore, useGatewayStore, useFilesStore, selectAllChats, useAuthStore } from '@/store';
 import './ThreePanelLayout.css';
 
 const STORAGE_KEY_LEFT = 'devsquad:left-panel-collapsed';
@@ -20,7 +20,14 @@ const TAB_SHORTCUTS: Record<string, string> = {
 };
 
 export function ThreePanelLayout() {
-  // Initialize all data sources
+  // =====================
+  // ALL HOOKS MUST BE CALLED BEFORE ANY CONDITIONAL RETURNS
+  // =====================
+  
+  // Auth state
+  const { isAuthenticated, sessionChecked, checkSession } = useAuthStore();
+  
+  // Initialize data sources (always call, even if redirecting)
   const { isConnected, gatewayConnected } = useDevSquadInit();
   
   // Stores
@@ -31,18 +38,27 @@ export function ThreePanelLayout() {
   const gatewayState = useGatewayStore();
   const chatEvents = selectAllChats(gatewayState);
   
-  // Left panel collapse state
+  // Local state
   const [leftCollapsed, setLeftCollapsed] = useState(() => {
+    if (typeof window === 'undefined') return false;
     return localStorage.getItem(STORAGE_KEY_LEFT) === 'true';
   });
   
-  // Right panel resize
   const [rightWidth, setRightWidth] = useState(() => {
+    if (typeof window === 'undefined') return 360;
     const saved = localStorage.getItem(STORAGE_KEY_RIGHT);
     return saved ? parseInt(saved, 10) : 360;
   });
+  
   const isResizing = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  
+  // Check session on mount
+  useEffect(() => {
+    if (!sessionChecked) {
+      checkSession();
+    }
+  }, [sessionChecked, checkSession]);
   
   // Persist left panel state
   useEffect(() => {
@@ -110,7 +126,33 @@ export function ThreePanelLayout() {
     };
   }, []);
   
-  // Get right panel content based on active tab
+  // =====================
+  // CONDITIONAL RETURNS (AFTER ALL HOOKS)
+  // =====================
+  
+  // Redirect to login if not authenticated
+  if (sessionChecked && !isAuthenticated) {
+    const currentPath = typeof window !== 'undefined' ? window.location.pathname : '/';
+    const isDevsquad = currentPath.startsWith('/devsquad');
+    return <Navigate to={isDevsquad ? '/devsquad/login' : '/login'} replace />;
+  }
+  
+  // Show loading while checking session
+  if (!sessionChecked) {
+    return (
+      <div className="three-panel-layout loading">
+        <div className="loading-spinner">
+          <div className="spinner" />
+          <p>Verificando sesión...</p>
+        </div>
+      </div>
+    );
+  }
+  
+  // =====================
+  // RENDER
+  // =====================
+  
   const renderRightPanel = () => {
     switch (activeTab) {
       case 'files':

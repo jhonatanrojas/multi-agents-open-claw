@@ -54,8 +54,10 @@ import requests
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi import Cookie
 from pydantic import BaseModel, Field
+import secrets
 
 from openclaw_sdk import (
     get_available_models,
@@ -83,6 +85,24 @@ from shared_state import (
 )
 from orchestrator import approve_proposal, propose_follow_up_task
 
+# Import API routers (F0.5 - Modularization)
+from api import (
+    auth_router,
+    state_router,
+    projects_router,
+    models_router,
+    runtime_router,
+    files_router,
+    agents_router,
+    tasks_router,
+    context_router,
+    runs_router,
+    runtime_state_router,
+)
+
+# Import centralized configuration (F0.7)
+from config import config, load_config
+
 from websockets.exceptions import ConnectionClosed
 
 MINIVERSE_URL = os.getenv("MINIVERSE_URL", "http://127.0.0.1:9999")
@@ -106,8 +126,85 @@ _MINIVERSE_CACHE: dict[str, Any] = {
 # GAP-1 / P5 — API key auth (empty string = disabled)
 _API_KEY: str = os.getenv("DASHBOARD_API_KEY", "")
 
-# Endpoints exempt from auth (public monitoring + streaming)
-_AUTH_EXEMPT = {"/health", "/api/health"}
+# Session cookie auth for SSE/WebSocket (F0.1)
+_SESSION_SECRET: str = os.getenv("DASHBOARD_SESSION_SECRET", "")
+if not _SESSION_SECRET and _API_KEY:
+    # Derive a stable secret from API key if not explicitly set
+    _SESSION_SECRET = hashlib.sha256(f"sse-session-{_API_KEY}".encode()).hexdigest()[:32]
+
+# Active sessions: token -> {created_at, last_used}
+# Persisted to MEMORY.json for surviving gateway restarts
+_active_sessions: dict[str, dict[str, Any]] = {}
+_SESSION_MAX_AGE_SEC: int = int(os.getenv("DASHBOARD_SESSION_MAX_AGE", "86400"))  # 24 hours
+_SESSION_CLEANUP_INTERVAL_SEC: int = 3600  # Cleanup every hour
+_SESSION_STATE_KEY = "_sessions"  # Key in MEMORY.json for session persistence
+
+def _load_sessions_from_memory() -> None:
+    """Load persisted sessions from MEMORY.json on startup."""
+    global _active_sessions
+    try:
+        mem = load_memory()
+        persisted = mem.get(_SESSION_STATE_KEY, {})
+        if isinstance(persisted, dict):
+            # Filter out expired sessions
+            now = datetime.now()
+            valid_sessions = {}
+            for token, session in persisted.items():
+                if not isinstance(session, dict):
+                    continue
+                try:
+                    last_used = datetime.fromisoformat(session.get("last_used", ""))
+                    if now - last_used <= timedelta(seconds=_SESSION_MAX_AGE_SEC):
+                        valid_sessions[token] = session
+                except Exception:
+                    continue
+            _active_sessions = valid_sessions
+            if valid_sessions:
+                print(f"[F0.1] Restored {len(valid_sessions)} valid session(s) from persistence")
+    except Exception as e:
+        print(f"[F0.1] Warning: Could not load persisted sessions: {e}")
+
+def _save_sessions_to_memory() -> None:
+    """Save active sessions to MEMORY.json for persistence across restarts."""
+    try:
+        mem = load_memory()
+        mem[_SESSION_STATE_KEY] = _active_sessions
+        save_memory(mem)
+    except Exception as e:
+        print(f"[F0.1] Warning: Could not persist sessions: {e}")
+
+# Load sessions on module import
+_load_sessions_from_memory()
+
+# Endpoints exempt from auth (public monitoring)
+_AUTH_EXEMPT = {
+    "/health", 
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/session",
+}
+
+# Endpoints that accept cookie auth (SSE/WebSocket)
+# Endpoints that accept cookie auth (SSE/WebSocket and regular API)
+_COOKIE_AUTH_PATHS = {
+    "/api/stream",
+    "/api/state", 
+    "/api/models",
+    "/api/models/available",
+    "/api/models/providers",
+    "/api/models/health",
+    "/api/files",
+    "/api/gateway/events",
+    "/api/miniverse",
+    "/api/runtime/orchestrators",
+    "/api/context",
+    "/api/runs",
+    "/api/tasks",
+    "/api/agents",
+    "/ws/state",
+    "/ws/gateway-events"
+}
 GATEWAY_EVENT_LIMIT = 300
 GATEWAY_AGENT_RE = re.compile(r"^agent:(main|arch|byte|pixel):", re.IGNORECASE)
 RESUME_COOLDOWN_DEFAULT_SEC = int(os.getenv("OPENCLAW_RESUME_COOLDOWN_SEC", "60"))
@@ -125,6 +222,70 @@ _RESUME_PROVIDER_SIGNALS = (
     "api key",
     "invalid or expired token",
 )
+
+
+def _create_session() -> str:
+    """Create a new session token for cookie-based auth."""
+    token = secrets.token_urlsafe(32)
+    now = utc_now()
+    _active_sessions[token] = {
+        "created_at": now,
+        "last_used": now,
+    }
+    # Persist sessions to survive gateway restarts
+    _save_sessions_to_memory()
+    return token
+
+
+def _validate_session(session_token: str | None) -> bool:
+    """Validate a session token and update last_used."""
+    if not session_token or not _API_KEY:
+        return not _API_KEY  # If no API key required, allow all
+    
+    # Reload sessions from persistence to handle cross-process scenarios
+    # (e.g., after gateway restart or load balancer switch)
+    _load_sessions_from_memory()
+    
+    if session_token not in _active_sessions:
+        return False
+    session = _active_sessions[session_token]
+    try:
+        last_used = datetime.fromisoformat(session["last_used"])
+        # Handle both timezone-aware and naive datetimes
+        if last_used.tzinfo is None:
+            now = datetime.now()
+        else:
+            now = datetime.now(timezone.utc)
+        max_age = timedelta(seconds=_SESSION_MAX_AGE_SEC)
+        if now - last_used > max_age:
+            del _active_sessions[session_token]
+            _save_sessions_to_memory()
+            return False
+    except Exception:
+        return False
+    session["last_used"] = utc_now()
+    # Persist updated last_used time
+    _save_sessions_to_memory()
+    return True
+
+
+def _cleanup_expired_sessions() -> None:
+    """Remove expired sessions. Called periodically."""
+    now = datetime.now()
+    expired = []
+    for token, session in _active_sessions.items():
+        try:
+            last_used = datetime.fromisoformat(session["last_used"])
+            if now - last_used > timedelta(seconds=_SESSION_MAX_AGE_SEC):
+                expired.append(token)
+        except Exception:
+            expired.append(token)
+    for token in expired:
+        del _active_sessions[token]
+    # Persist cleaned sessions
+    if expired:
+        _save_sessions_to_memory()
+        print(f"[F0.1] Cleaned up {len(expired)} expired session(s)")
 
 
 def _resume_cooldown_seconds(task: dict[str, Any]) -> int:
@@ -750,6 +911,9 @@ _gateway_events = _GatewayEventBroadcaster()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Validate configuration at startup (F0.7)
+    load_config()
+    
     asyncio.create_task(_broadcaster.run())
     asyncio.create_task(_gateway_events.run())
     yield
@@ -759,24 +923,68 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Dev Squad Dashboard API", lifespan=lifespan)
 
+# CORS with credentials support for cookie-based auth (F0.1 / F0.4)
+# Default: restrict to localhost for development; production MUST set DASHBOARD_ALLOWED_ORIGINS
+_allowed_origins = os.getenv("DASHBOARD_ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
+_cors_origins = [o.strip() for o in _allowed_origins if o.strip()]
+
+# Security: wildcard is NOT allowed when credentials=True; require explicit origins
+if "*" in _cors_origins:
+    import warnings
+    warnings.warn("DASHBOARD_ALLOWED_ORIGINS contains '*' which is insecure. Using localhost defaults.", RuntimeWarning)
+    _cors_origins = ["http://localhost:3000", "http://localhost:5173"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Requested-With"],
+    allow_credentials=True,  # Required for cookie-based SSE auth
+    max_age=600,  # Cache preflight requests for 10 minutes
 )
+
+# Register API routers (F0.5 - Modularization)
+# Routers already have /api prefix in their definitions
+app.include_router(auth_router)  # Has /auth prefix
+app.include_router(state_router)  # Has /api/* routes
+app.include_router(projects_router)  # Has /api/project prefix
+app.include_router(models_router)  # Has /api/models prefix
+app.include_router(runtime_router)  # Has /api/runtime prefix
+app.include_router(files_router)  # Has /api/files prefix
+app.include_router(agents_router)  # Has /api/agents prefix
+app.include_router(tasks_router)  # Has /api/tasks prefix
+app.include_router(context_router)  # Has /api/context prefix
+app.include_router(runs_router)  # Has /api/runs prefix
+app.include_router(runtime_state_router)  # Has /api prefix
 
 
 # ── Auth middleware (GAP-1 / P5) ──────────────────────────────────────────────
 
 @app.middleware("http")
 async def _auth_middleware(request: Request, call_next):
-    if _API_KEY and request.url.path not in _AUTH_EXEMPT:
-        if request.headers.get("X-API-Key") != _API_KEY:
-            return JSONResponse(
-                {"error": "Unauthorized — provide a valid X-API-Key header"},
-                status_code=401,
-            )
+    path = request.url.path
+    
+    # Public endpoints - no auth required
+    if path in _AUTH_EXEMPT:
+        return await call_next(request)
+    
+    if _API_KEY:
+        # Check header auth first
+        if request.headers.get("X-API-Key") == _API_KEY:
+            return await call_next(request)
+        
+        # Check cookie auth for streaming endpoints (F0.1)
+        if path in _COOKIE_AUTH_PATHS:
+            session_token = request.cookies.get("dashboard_session")
+            if _validate_session(session_token):
+                return await call_next(request)
+        
+        # Unauthorized
+        return JSONResponse(
+            {"error": "Unauthorized — provide a valid X-API-Key header or session cookie"},
+            status_code=401,
+        )
+    
     return await call_next(request)
 
 
@@ -879,36 +1087,6 @@ def build_health_snapshot() -> dict[str, Any]:
         "memory_updated_at": mem.get("project", {}).get("updated_at"),
         "auth_enabled": bool(_API_KEY),
     }
-
-
-def _stop_orchestrator(reason: str | None = None) -> dict[str, Any]:
-    mem = load_memory()
-    lock_payload: dict[str, Any] = {}
-    if LOCK_FILE.exists():
-        try:
-            lock_payload = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            lock_payload = {}
-    pid = lock_payload.get("pid") or mem.get("project", {}).get("orchestrator", {}).get("pid")
-    alive = _pid_is_alive(pid)
-    if alive:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except Exception as exc:
-            return {"ok": False, "error": f"No se pudo detener el orquestador: {exc}"}
-    mem.setdefault("project", {})
-    mem["project"].setdefault("orchestrator", {})
-    mem["project"]["orchestrator"].update(
-        {
-            "status": "paused",
-            "phase": "paused",
-            "detail": reason or "Pausado desde el dashboard",
-            "updated_at": utc_now(),
-        }
-    )
-    mem["project"]["updated_at"] = utc_now()
-    save_memory(mem)
-    return {"ok": True, "pid": pid, "alive": alive}
 
 
 def _runtime_process_snapshot() -> dict[str, Any]:
@@ -1074,10 +1252,17 @@ def _sync_orchestrator_pid(pid: int | None) -> None:
 
 @app.get("/api/runtime/orchestrators")
 def get_runtime_orchestrators():
-    return {
-        "timestamp": utc_now(),
-        **_runtime_process_snapshot(),
-    }
+    """Return runtime orchestrator processes snapshot."""
+    try:
+        return {
+            "timestamp": utc_now(),
+            **_runtime_process_snapshot(),
+        }
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": str(e)},
+            status_code=500
+        )
 
 
 @app.post("/api/runtime/orchestrators/cleanup")
@@ -1158,13 +1343,27 @@ async def cleanup_runtime_orchestrators(payload: dict[str, Any] | None = None):
 @app.get("/health")
 @app.get("/api/health")
 def health():
-    snapshot = build_health_snapshot()
-    return JSONResponse(snapshot, status_code=200 if snapshot["ok"] else 503)
+    """Health check endpoint for monitoring."""
+    try:
+        snapshot = build_health_snapshot()
+        return JSONResponse(snapshot, status_code=200 if snapshot["ok"] else 503)
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": str(e)},
+            status_code=503
+        )
 
 
 @app.get("/api/state")
 def get_state():
-    return load_memory()
+    """Return current shared memory snapshot."""
+    try:
+        return load_memory()
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": f"Failed to load state: {str(e)}"},
+            status_code=500
+        )
 
 
 @app.post("/api/project/restart")
@@ -1192,19 +1391,44 @@ async def alert_telegram(payload: TelegramAlert):
 
 @app.get("/api/gateway/events")
 def get_gateway_events(limit: int = 100):
-    limit = max(1, min(int(limit or 100), GATEWAY_EVENT_LIMIT))
-    snapshot = _gateway_events.snapshot()
-    events = _gateway_consolidate_events(list(snapshot.get("events", [])))[-limit:]
-    return {
-        "status": snapshot.get("status", {}),
-        "events": events,
-        "limit": limit,
-    }
+    """Return consolidated gateway events with optional limit."""
+    try:
+        limit = max(1, min(int(limit or 100), GATEWAY_EVENT_LIMIT))
+        snapshot = _gateway_events.snapshot()
+        events = _gateway_consolidate_events(list(snapshot.get("events", [])))[-limit:]
+        return {
+            "status": snapshot.get("status", {}),
+            "events": events,
+            "limit": limit,
+        }
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": str(e)},
+            status_code=500
+        )
 
 
 @app.get("/api/stream")
-async def stream_state():
-    """Server-Sent Events stream — pushes state every 2 s with keepalive."""
+async def stream_state(dashboard_session: str | None = Cookie(None)):
+    """
+    Server-Sent Events stream — pushes state every 2 s with keepalive.
+    
+    ## Authentication
+    
+    This endpoint supports two authentication methods:
+    1. **Header**: `X-API-Key: <key>` (for non-browser clients)
+    2. **Cookie**: Session cookie from `/api/auth/login` (for browsers)
+    
+    ## Reconnection
+    
+    The cookie automatically survives page reloads and reconnections,
+    allowing seamless SSE reconnection after gateway restarts.
+    """
+    # Auth is handled by middleware, but double-check here for clarity
+    if _API_KEY:
+        # If we got here via middleware, the cookie is valid
+        pass
+    
     async def generator():
         last = None
         while True:
@@ -1221,7 +1445,28 @@ async def stream_state():
 
 @app.websocket("/ws/state")
 async def ws_state(websocket: WebSocket):
-    """WebSocket endpoint — receives push updates at ~1 s interval (GAP-9)."""
+    """
+    WebSocket endpoint — receives push updates at ~1 s interval (GAP-9).
+    
+    ## Authentication
+    
+    Supports cookie-based auth from `/api/auth/login`.
+    The browser automatically sends cookies with the WebSocket upgrade request.
+    """
+    # WebSocket auth: check cookie in handshake headers
+    if _API_KEY:
+        cookie_header = websocket.headers.get("cookie", "")
+        session_token = None
+        for cookie in cookie_header.split(";"):
+            cookie = cookie.strip()
+            if cookie.startswith("dashboard_session="):
+                session_token = cookie.split("=", 1)[1]
+                break
+        
+        if not _validate_session(session_token):
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
+    
     await websocket.accept()
     _broadcaster.add(websocket)
     # Send current snapshot immediately on connect
@@ -1236,7 +1481,28 @@ async def ws_state(websocket: WebSocket):
 
 @app.websocket("/ws/gateway-events")
 async def ws_gateway_events(websocket: WebSocket):
-    """WebSocket endpoint for live OpenClaw Gateway agent events."""
+    """
+    WebSocket endpoint for live OpenClaw Gateway agent events.
+    
+    ## Authentication
+    
+    Supports cookie-based auth from `/api/auth/login`.
+    The browser automatically sends cookies with the WebSocket upgrade request.
+    """
+    # WebSocket auth: check cookie in handshake headers
+    if _API_KEY:
+        cookie_header = websocket.headers.get("cookie", "")
+        session_token = None
+        for cookie in cookie_header.split(";"):
+            cookie = cookie.strip()
+            if cookie.startswith("dashboard_session="):
+                session_token = cookie.split("=", 1)[1]
+                break
+        
+        if not _validate_session(session_token):
+            await websocket.close(code=1008, reason="Unauthorized")
+            return
+    
     await websocket.accept()
     _gateway_events.add(websocket)
     try:
@@ -1933,8 +2199,6 @@ def get_providers():
 
 
 # ── Model Health (Tarea 2.1) ───────────────────────────────────────────────────
-
-@app.get("/api/health/models")
 
 @app.post("/api/models/test")
 def test_model(payload: dict[str, Any]):
@@ -3483,11 +3747,18 @@ async def background_telegram_polling():
 
 @app.get("/api/logs")
 def get_logs():
-    mem = load_memory()
-    return {
-        "log": mem.get("log", [])[-100:],
-        "structured_log": _read_jsonl_tail(JSONL_LOG_FILE, 100),
-    }
+    """Return recent log entries from memory and structured log file."""
+    try:
+        mem = load_memory()
+        return {
+            "log": mem.get("log", [])[-100:],
+            "structured_log": _read_jsonl_tail(JSONL_LOG_FILE, 100),
+        }
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": str(e)},
+            status_code=500
+        )
 
 
 def _resolve_output_dir(project: dict[str, Any]) -> Path:
@@ -4094,102 +4365,116 @@ def _build_file_view_response(mem: dict[str, Any], requested_path: str) -> dict[
 
 @app.get("/api/files/view")
 def get_file_view(path: str = ""):
-    mem = load_memory()
-    requested_path = str(path or "").strip()
-    if not requested_path:
-        return JSONResponse({"error": "path es obligatorio"}, status_code=422)
+    """Return file content for preview (live or archived)."""
+    try:
+        mem = load_memory()
+        requested_path = str(path or "").strip()
+        if not requested_path:
+            return JSONResponse({"error": "path es obligatorio"}, status_code=422)
 
-    file_view = _build_file_view_response(mem, requested_path)
-    if not file_view:
+        file_view = _build_file_view_response(mem, requested_path)
+        if not file_view:
+            return JSONResponse(
+                {"error": f"Archivo no encontrado: {requested_path}"},
+                status_code=404,
+            )
+
+        return {"file": file_view}
+    except Exception as e:
         return JSONResponse(
-            {"error": f"Archivo no encontrado: {requested_path}"},
-            status_code=404,
+            {"ok": False, "error": str(e)},
+            status_code=500
         )
-
-    return {"file": file_view}
 
 
 @app.get("/api/files")
 def get_files():
-    mem = load_memory()
-    project = mem.get("project", {}) if isinstance(mem.get("project"), dict) else {}
-    current_files = [
-        str(path).strip()
-        for path in (mem.get("files_produced", []) if isinstance(mem.get("files_produced", []), list) else [])
-        if isinstance(path, str) and path.strip()
-    ]
-    progress_files = [
-        str(path).strip()
-        for path in (mem.get("progress_files", []) if isinstance(mem.get("progress_files", []), list) else [])
-        if isinstance(path, str) and path.strip()
-    ]
+    """Return file listings for all projects with manifest file counts."""
+    try:
+        mem = load_memory()
+        project = mem.get("project", {}) if isinstance(mem.get("project"), dict) else {}
+        current_files = [
+            str(path).strip()
+            for path in (mem.get("files_produced", []) if isinstance(mem.get("files_produced", []), list) else [])
+            if isinstance(path, str) and path.strip()
+        ]
+        progress_files = [
+            str(path).strip()
+            for path in (mem.get("progress_files", []) if isinstance(mem.get("progress_files", []), list) else [])
+            if isinstance(path, str) and path.strip()
+        ]
 
-    produced = list(dict.fromkeys(current_files + progress_files))
-    if not produced:
-        produced = _load_manifest_file_paths(project)
+        produced = list(dict.fromkeys(current_files + progress_files))
+        if not produced:
+            produced = _load_manifest_file_paths(project)
 
-    project_entries: list[dict[str, Any]] = []
-    seen_project_ids: set[str] = set()
-    for project_entry in (mem.get("projects", []) if isinstance(mem.get("projects", []), list) else []):
-        if not isinstance(project_entry, dict):
-            continue
-        project_id = str(project_entry.get("id") or "").strip()
-        if project_id and project_id in seen_project_ids:
-            continue
-        project_output_dir = _resolve_output_dir(project_entry)
-        manifest_path = project_output_dir / "PROJECT_MANIFEST.json"
-        file_count = 0
-        if manifest_path.exists():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                file_count = len(manifest.get("files", [])) if isinstance(manifest.get("files", []), list) else 0
-            except Exception:
-                file_count = 0
-        project_entries.append(
-            {
-                "id": project_entry.get("id"),
-                "name": project_entry.get("name"),
-                "status": project_entry.get("status"),
-                "roots": [],
-                "total_files": file_count,
-            }
+        project_entries: list[dict[str, Any]] = []
+        seen_project_ids: set[str] = set()
+        for project_entry in (mem.get("projects", []) if isinstance(mem.get("projects", []), list) else []):
+            if not isinstance(project_entry, dict):
+                continue
+            project_id = str(project_entry.get("id") or "").strip()
+            if project_id and project_id in seen_project_ids:
+                continue
+            project_output_dir = _resolve_output_dir(project_entry)
+            manifest_path = project_output_dir / "PROJECT_MANIFEST.json"
+            file_count = 0
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    file_count = len(manifest.get("files", [])) if isinstance(manifest.get("files", []), list) else 0
+                except Exception:
+                    file_count = 0
+            project_entries.append(
+                {
+                    "id": project_entry.get("id"),
+                    "name": project_entry.get("name"),
+                    "status": project_entry.get("status"),
+                    "roots": [],
+                    "total_files": file_count,
+                }
+            )
+            if project_id:
+                seen_project_ids.add(project_id)
+
+        if project and project.get("id"):
+            current_project_id = str(project.get("id") or "").strip()
+            if current_project_id and current_project_id in seen_project_ids:
+                return {
+                    "projects": project_entries,
+                    "files_produced": produced,
+                    "progress_files": progress_files,
+                }
+            project_output_dir = _resolve_output_dir(project)
+            manifest_path = project_output_dir / "PROJECT_MANIFEST.json"
+            file_count = len(produced)
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if isinstance(manifest.get("files", []), list) and manifest.get("files"):
+                        file_count = len(manifest.get("files", []))
+                except Exception:
+                    pass
+            project_entries.append(
+                {
+                    "id": project.get("id"),
+                    "name": project.get("name"),
+                    "status": project.get("status"),
+                    "roots": [],
+                    "total_files": file_count,
+                }
+            )
+
+        return {
+            "projects": project_entries,
+            "files_produced": produced,
+            "progress_files": progress_files,
+        }
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": str(e)},
+            status_code=500
         )
-        if project_id:
-            seen_project_ids.add(project_id)
-
-    if project and project.get("id"):
-        current_project_id = str(project.get("id") or "").strip()
-        if current_project_id and current_project_id in seen_project_ids:
-            return {
-                "projects": project_entries,
-                "files_produced": produced,
-                "progress_files": progress_files,
-            }
-        project_output_dir = _resolve_output_dir(project)
-        manifest_path = project_output_dir / "PROJECT_MANIFEST.json"
-        file_count = len(produced)
-        if manifest_path.exists():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if isinstance(manifest.get("files", []), list) and manifest.get("files"):
-                    file_count = len(manifest.get("files", []))
-            except Exception:
-                pass
-        project_entries.append(
-            {
-                "id": project.get("id"),
-                "name": project.get("name"),
-                "status": project.get("status"),
-                "roots": [],
-                "total_files": file_count,
-            }
-        )
-
-    return {
-        "projects": project_entries,
-        "files_produced": produced,
-        "progress_files": progress_files,
-    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

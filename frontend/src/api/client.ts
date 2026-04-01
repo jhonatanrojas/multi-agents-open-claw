@@ -20,6 +20,7 @@ async function apiCall<T>(
   
   const response = await fetch(`${API}${endpoint}`, {
     ...options,
+    credentials: 'include', // Important: include cookies for auth (F0.1)
     headers: {
       'Content-Type': 'application/json',
       'X-CSRF-TOKEN': csrf,
@@ -31,6 +32,12 @@ async function apiCall<T>(
   const data = await response.json().catch(() => ({}));
   
   if (!response.ok) {
+    // Handle 401 Unauthorized - session may have expired
+    if (response.status === 401) {
+      // Trigger session check in auth store
+      const authStore = (await import('@/store/authStore')).useAuthStore.getState();
+      authStore.checkSession();
+    }
     throw new Error(data.error || data.message || `HTTP ${response.status}`);
   }
   
@@ -258,4 +265,48 @@ export async function cleanupRuntime(mode = 'duplicates'): Promise<{ message: st
     method: 'POST',
     body: JSON.stringify({ mode, force: true }),
   });
+}
+
+// ============ AUTH ============
+
+export interface LoginResponse {
+  ok: boolean;
+  message: string;
+  expires_in: number;
+}
+
+export async function login(username: string, password: string): Promise<LoginResponse> {
+  const response = await fetch(`${API}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+    credentials: 'include',
+  });
+  
+  const data = await response.json().catch(() => ({}));
+  
+  if (!response.ok) {
+    throw new Error(data.message || data.error || 'Login failed');
+  }
+  
+  return data;
+}
+
+export async function logout(): Promise<void> {
+  await fetch(`${API}/auth/logout`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+}
+
+export async function checkSession(): Promise<{ authenticated: boolean; reason?: string }> {
+  const response = await fetch(`${API}/auth/session`, {
+    credentials: 'include',
+  });
+  
+  if (!response.ok) {
+    return { authenticated: false };
+  }
+  
+  return response.json();
 }

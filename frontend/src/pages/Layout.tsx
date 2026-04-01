@@ -1,11 +1,32 @@
 import { Outlet } from 'react-router-dom';
 import { Header } from '@/components/shared';
-import { useDevSquadInit } from '@/hooks';
+import { LoginForm } from '@/components/auth';
+import { useDevSquadInit, useAuth } from '@/hooks';
 import './Layout.css';
 
 export function Layout() {
-  // Initialize all data sources
+  // Auth check
+  const { isAuthenticated, isLoading: authLoading } = useAuth();
+  
+  // Initialize all data sources (only when authenticated)
   const { isConnected, gatewayConnected } = useDevSquadInit();
+  
+  // Show loading while checking session
+  if (authLoading) {
+    return (
+      <div className="layout layout--loading">
+        <div className="auth-loading">
+          <div className="spinner-large"></div>
+          <p>Checking authentication...</p>
+        </div>
+      </div>
+    );
+  }
+  
+  // Show login if not authenticated
+  if (!isAuthenticated) {
+    return <LoginForm />;
+  }
   
   return (
     <div className="layout">

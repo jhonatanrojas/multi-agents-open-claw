@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
-import { useUIStore, useMemoryStore, useModelsStore } from '@/store';
+import { useUIStore, useMemoryStore, useModelsStore, useAuthStore, useToast } from '@/store';
 import { useLoadProject, useRetryPlanning, useStartProject, useTestModel, useUpdateModels } from '@/api';
-import { Tabs, type TabId } from '@/components/shared';
+import { Tabs, type TabId, ToastContainer } from '@/components/shared';
 import { ProjectItem } from '@/components/features/ProjectItem';
 import { TasksList } from '@/components/features/TasksList';
 import { ProjectBar } from '@/components/features/ProjectBar';
@@ -17,6 +17,8 @@ import { ModelsPanel } from '@/components/features/ModelsPanel';
 import { BlockersBar } from '@/components/features/BlockersBar';
 import { SummaryBar } from '@/components/features/SummaryBar';
 import { RuntimePanel } from '@/components/features/RuntimePanel';
+import { DashboardSkeleton, ConnectingScreen } from '@/components/features/DashboardSkeleton';
+import { LoginPage } from '@/pages/LoginPage';
 import type { Project } from '@/types';
 import './Dashboard.css';
 
@@ -38,9 +40,30 @@ export function Dashboard() {
   const setProjectViewMode = useUIStore((state) => state.setProjectViewMode);
   const project = useMemoryStore((state) => state.project);
   const projects = useMemoryStore((state) => state.projects);
+  const isConnected = useMemoryStore((state) => state.isConnected);
+  const lastUpdated = useMemoryStore((state) => state.lastUpdated);
   const modelConfig = useModelsStore((state) => state.config);
   const modelsLoading = useModelsStore((state) => state.isLoading);
   const availableModels = modelConfig?.available || [];
+
+  // Auth state
+  const { isAuthenticated, isLoading: authLoading } = useAuthStore();
+  const { success, error: showError } = useToast();
+
+  // Show skeleton while checking auth
+  if (authLoading) {
+    return <DashboardSkeleton />;
+  }
+
+  // Show login page if not authenticated
+  if (!isAuthenticated) {
+    return <LoginPage onLoginSuccess={() => window.location.reload()} />;
+  }
+
+  // Show connecting screen while waiting for first data
+  if (!isConnected && !lastUpdated) {
+    return <ConnectingScreen />;
+  }
 
   const visibleProjects = projects
     .filter((p) => p.status !== 'deleted' && p.status !== 'archived')
@@ -75,24 +98,23 @@ export function Dashboard() {
   // Start project mutation with success callback
   const startProjectMutation = useStartProject({
     onSuccess: (data) => {
-      // Show success message
+      success(data.message || 'Proyecto iniciado correctamente');
       setStatusMessage({ 
         type: 'success', 
         text: data.message || 'Proyecto iniciado correctamente' 
       });
       
-      // The state will be refreshed automatically by SSE or polling
-      // Switch to project view after a short delay
       setTimeout(() => {
         setProjectViewMode('view');
         setActiveTab('tasks');
         setStatusMessage(null);
       }, 2000);
     },
-    onError: (error) => {
+    onError: (err) => {
+      showError(String(err));
       setStatusMessage({ 
         type: 'error', 
-        text: `Error: ${String(error)}` 
+        text: `Error: ${String(err)}` 
       });
     },
   });
@@ -125,14 +147,16 @@ export function Dashboard() {
 
       loadProjectMutation.mutate(p.id, {
         onSuccess: () => {
+          success(`Proyecto "${p.name}" cargado`);
           setProjectViewMode('view');
           setActiveTab('tasks');
           setStatusMessage(null);
         },
-        onError: (error) => {
+        onError: (err) => {
+          showError(`Error al cargar el proyecto: ${String(err)}`);
           setStatusMessage({
             type: 'error',
-            text: `Error al cargar el proyecto: ${String(error)}`,
+            text: `Error al cargar el proyecto: ${String(err)}`,
           });
         },
       });
@@ -154,22 +178,27 @@ export function Dashboard() {
     try {
       const result = await updateModelsMutation.mutateAsync(agents);
       useModelsStore.getState().setConfig(result.config);
+      success('Modelos guardados correctamente');
       setStatusMessage({
         type: 'success',
         text: 'Modelos guardados y persistidos en la configuración activa',
       });
       setTimeout(() => setStatusMessage(null), 2000);
-    } catch (error) {
+    } catch (err) {
+      showError(`No se pudo guardar la configuración: ${String(err)}`);
       setStatusMessage({
         type: 'error',
-        text: `No se pudo guardar la configuración: ${String(error)}`,
+        text: `No se pudo guardar la configuración: ${String(err)}`,
       });
-      throw error;
+      throw err;
     }
   };
 
   return (
     <div className="dashboard">
+      {/* Toast Notifications */}
+      <ToastContainer />
+      
       {/* Project Selector - Always visible */}
       <ProjectSelector 
         selectedProjectId={isViewingProject ? project?.id || null : null}

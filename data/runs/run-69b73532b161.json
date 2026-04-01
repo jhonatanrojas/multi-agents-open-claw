@@ -1,0 +1,15 @@
+{
+  "run_id": "run-69b73532b161",
+  "project_id": "proj-003",
+  "status": "executing",
+  "current_phase": null,
+  "current_agent": "pixel",
+  "plan_version": 1,
+  "tasks": [],
+  "artifacts": [],
+  "blockers": [],
+  "milestones": [],
+  "started_at": "2026-03-31T14:24:06.543908",
+  "updated_at": "2026-03-31T14:24:06.543955",
+  "schema_version": 1
+}

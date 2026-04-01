@@ -13,3 +13,6 @@ export type { Orchestrator } from './runtimeStore';
 export { useFilesStore } from './filesStore';
 export type { FilesSnapshot } from './filesStore';
 export { useContextStore } from './contextStore';
+export { useAuthStore } from './authStore';
+export { useToastStore, useToast } from './toastStore';
+export type { Toast, ToastType } from './toastStore';

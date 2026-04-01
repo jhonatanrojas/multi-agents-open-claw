@@ -2,3 +2,4 @@ openclaw-sdk
 fastapi
 uvicorn[standard]
 requests
+sqlalchemy

@@ -77,15 +77,15 @@ export const STATUS_ES: Record<string, string> = {
 // Default to the same-origin proxy in production.
 // When running the Vite dev/preview servers, point to the public dashboard API
 // so the browser does not depend on a local reverse proxy.
-const DEFAULT_API_BASE = '/devsquad/api';
+const DEFAULT_API_BASE = '/api';
 
 function detectApiBase(): string {
   const override = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
   if (override) {
     return override;
   }
-  // Always use relative path for production (goes through Apache proxy)
-  // This avoids Cloudflare timeout issues with port 8001
+  // Use relative path for production (goes through Apache proxy at /api)
+  // Supports both /api (new) and /devsquad/api (legacy) through Apache config
   return DEFAULT_API_BASE;
 }
 

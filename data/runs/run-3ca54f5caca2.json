@@ -1,0 +1,15 @@
+{
+  "run_id": "run-3ca54f5caca2",
+  "project_id": "proj-0",
+  "status": "completed",
+  "current_phase": null,
+  "current_agent": null,
+  "plan_version": 1,
+  "tasks": [],
+  "artifacts": [],
+  "blockers": [],
+  "milestones": [],
+  "started_at": "2026-03-31T14:01:02.670336",
+  "updated_at": "2026-03-31T14:01:02.670359",
+  "schema_version": 1
+}

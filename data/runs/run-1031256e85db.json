@@ -1,0 +1,24 @@
+{
+  "run_id": "run-1031256e85db",
+  "project_id": "proj-003",
+  "status": "executing",
+  "current_phase": "planning",
+  "current_agent": "arch",
+  "plan_version": 1,
+  "tasks": [
+    {
+      "task_id": "task-d5de342a22e9",
+      "agent": "arch",
+      "status": "pending",
+      "description": "Analyze requirements",
+      "created_at": "2026-03-31T14:21:55.001715",
+      "completed_at": null
+    }
+  ],
+  "artifacts": [],
+  "blockers": [],
+  "milestones": [],
+  "started_at": "2026-03-31T14:21:54.998839",
+  "updated_at": "2026-03-31T14:21:55.001748",
+  "schema_version": 1
+}

@@ -4,20 +4,34 @@ import { useSSE } from './useSSE';
 import { useGatewayWS } from './useGatewayWS';
 import { fetchModels, fetchGatewayEvents, fetchMiniverse, fetchRuntime, fetchFiles, fetchContext, fetchState } from '@/api/client';
 
+import { useAuthStore } from '@/store/authStore';
+
+interface UseDevSquadInitOptions {
+  enabled?: boolean;
+}
+
 /**
  * Hook that initializes all data sources for the Dev Squad dashboard.
  * Combines SSE for state updates, WebSocket for gateway events,
  * and periodic polling for supplementary data.
  */
-export function useDevSquadInit() {
+export function useDevSquadInit(options: UseDevSquadInitOptions = {}) {
+  const { enabled = true } = options;
   const activeTab = useUIStore((state) => state.activeTab);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+  
+  // Only initialize if enabled and authenticated
+  const shouldInit = enabled && isAuthenticated;
   
   // Connect SSE and WebSocket
-  useSSE({ enabled: true });
-  useGatewayWS({ enabled: true });
+  useSSE({ enabled: shouldInit });
+  useGatewayWS({ enabled: shouldInit });
   
   // Fetch initial state on mount
   useEffect(() => {
+    // Don't fetch if not authenticated
+    if (!shouldInit) return;
+    
     // Fetch initial state (projects, tasks, agents, etc.)
     const loadState = async () => {
       try {
@@ -29,6 +43,11 @@ export function useDevSquadInit() {
           tasks: state.tasks?.length,
         });
       } catch (e) {
+        // Silently ignore auth errors (user not logged in yet)
+        if (e instanceof Error && e.message.includes('401')) {
+          console.log('[DevSquad] Not authenticated, skipping state load');
+          return;
+        }
         console.error('[DevSquad] Failed to load initial state:', e);
       }
     };

@@ -80,6 +80,18 @@ ARCH ya no bloquea por preguntas genéricas:
 - las preguntas se ajustan por tipo de proyecto: backend-service, frontend, laravel y documentation
 - si el brief ya es suficiente, el flujo sigue sin intervención humana
 
+### 13. Automatización Nativa OpenClaw
+La automatización del plan multiagente ahora usa la sesión `main` y el job oficial de OpenClaw:
+- job: `multiagent-phase-runner`
+- dispara una sola fase o un solo paso por tick
+- usa `HEARTBEAT.md` como recordatorio ligero, no como runner paralelo
+- compacta según el calendario de `STATE_multiagent.md`
+- notifica avances y bloqueos por Telegram desde el flujo oficial de OpenClaw
+- no toca el flujo del dashboard
+
+Documentación completa:
+- [docs/cron-oficial-nuevas-tareas.md](/var/www/openclaw-multi-agents/docs/cron-oficial-nuevas-tareas.md)
+
 ---
 
 ## Architecture
@@ -235,8 +247,8 @@ Variables clave:
 | Variable | Valor ejemplo | Descripción |
 |-----------------------|--------------------------------|------------------------------------|
 | `DASHBOARD_API_KEY` | `dev-squad-api-key-2026` | Protege todos los endpoints del API |
-| `TELEGRAM_BOT_TOKEN` | `123456:ABC-...` | Notificaciones (opcional) |
-| `TELEGRAM_CHAT_ID` | `-100123456789` | Chat destino de Telegram |
+| `TELEGRAM_BOT_TOKEN` | `123456:ABC-...` | Notificaciones por env; si falta, se toma de `channels.telegram.botToken` en `~/.openclaw/openclaw.json` |
+| `TELEGRAM_CHAT_ID` | `-100123456789` | Chat destino por env; si falta, se toma de `channels.telegram.chatId` o `allowFrom[0]` |
 | `MINIVERSE_URL` | `http://localhost:4321` | Mundo pixel local o público |
 | `GIT_AUTHOR_NAME` | `OpenClaw` | Identidad para git commits |
 | `GIT_AUTHOR_EMAIL` | `openclaw@example.com` | Email para git commits |

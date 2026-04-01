@@ -4,7 +4,7 @@ import path from 'path'
 
 // https://vite.dev/config/
 export default defineConfig({
-  base: '/devsquad/',
+  base: '/',
   plugins: [react()],
   resolve: {
     alias: {
@@ -20,7 +20,7 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/devsquad/api': {
+      '/api': {
         target: 'http://localhost:8001',
         changeOrigin: true,
       },

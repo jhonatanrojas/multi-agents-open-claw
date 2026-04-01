@@ -1,0 +1,15 @@
+{
+  "run_id": "run-test-003",
+  "project_id": "proj-003",
+  "status": "executing",
+  "current_phase": "discovery",
+  "current_agent": null,
+  "plan_version": 1,
+  "tasks": [],
+  "artifacts": [],
+  "blockers": [],
+  "milestones": [],
+  "started_at": "2026-03-31T14:18:25.626992",
+  "updated_at": "2026-03-31T14:18:25.627022",
+  "schema_version": 1
+}

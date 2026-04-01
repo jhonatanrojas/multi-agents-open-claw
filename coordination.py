@@ -14,6 +14,7 @@ from typing import Any, Literal, TypedDict
 import requests
 
 from shared_state import BASE_DIR, load_memory, refresh_project_runtime_state, save_memory, utc_now
+from openclaw_sdk import load_openclaw_config
 
 PROJECTS_ROOT = BASE_DIR / "projects"
 WORKSPACES_ROOT = BASE_DIR / "workspaces"
@@ -86,10 +87,30 @@ class ProjectClarificationRequired(RuntimeError):
 
 def get_telegram_credentials() -> tuple[str | None, str | None]:
     """Return the configured Telegram bot token and chat id, if any."""
-    return (
-        os.getenv("TELEGRAM_BOT_TOKEN"),
-        os.getenv("TELEGRAM_CHAT_ID"),
-    )
+    env_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    env_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if env_token and env_chat_id:
+        return env_token, env_chat_id
+
+    config = load_openclaw_config()
+    channels = config.get("channels") if isinstance(config, dict) else None
+    telegram = channels.get("telegram") if isinstance(channels, dict) else None
+    if not isinstance(telegram, dict):
+        return env_token, env_chat_id
+
+    token = env_token or str(telegram.get("botToken") or telegram.get("bot_token") or "").strip() or None
+    chat_id = env_chat_id or str(telegram.get("chatId") or telegram.get("chat_id") or "").strip() or None
+
+    if not chat_id:
+        allow_from = telegram.get("allowFrom")
+        if isinstance(allow_from, list):
+            for entry in allow_from:
+                candidate = str(entry).strip()
+                if candidate:
+                    chat_id = candidate
+                    break
+
+    return token, chat_id
 
 
 def _telegram_compact_text(value: str | None, *, limit: int = 220) -> str:
@@ -1882,8 +1903,9 @@ def send_telegram_message(
     backoff_seconds: float = 2.0,
 ) -> dict[str, Any]:
     """Send a Telegram notification when credentials are available."""
-    resolved_token = token or os.getenv("TELEGRAM_BOT_TOKEN")
-    resolved_chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+    default_token, default_chat_id = get_telegram_credentials()
+    resolved_token = token or default_token
+    resolved_chat_id = chat_id or default_chat_id
 
     if not resolved_token or not resolved_chat_id:
         return {
@@ -1965,7 +1987,7 @@ def fetch_telegram_updates(
     token: str | None = None,
 ) -> dict[str, Any]:
     """Fetch bot updates using Telegram long polling."""
-    resolved_token = token or os.getenv("TELEGRAM_BOT_TOKEN")
+    resolved_token = token or get_telegram_credentials()[0]
     if not resolved_token:
         return {"ok": False, "reason": "Falta TELEGRAM_BOT_TOKEN", "updates": []}
 
