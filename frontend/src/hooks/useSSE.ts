@@ -180,15 +180,13 @@ export function useSSE(options: UseSSEOptions = {}) {
   // Single effect to handle connection lifecycle
   useEffect(() => {
     if (!enabled) {
-      setConnectionState('disconnected');
-      setConnected(false);
+      // Only disconnect if explicitly disabled, not during auth check
       return;
     }
 
-    // Only connect if authenticated
+    // Wait for authentication before connecting
     if (!isAuthenticated) {
-      setConnectionState('disconnected');
-      setConnected(false);
+      // Don't set disconnected during auth check - let the auth flow handle it
       return;
     }
 

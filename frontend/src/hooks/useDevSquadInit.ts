@@ -19,9 +19,18 @@ export function useDevSquadInit(options: UseDevSquadInitOptions = {}) {
   const { enabled = true } = options;
   const activeTab = useUIStore((state) => state.activeTab);
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+  const sessionChecked = useAuthStore((state) => state.sessionChecked);
+  const checkSession = useAuthStore((state) => state.checkSession);
   
   // Only initialize if enabled and authenticated
   const shouldInit = enabled && isAuthenticated;
+
+  // Check session on mount if not already checked
+  useEffect(() => {
+    if (!sessionChecked) {
+      checkSession();
+    }
+  }, [sessionChecked, checkSession]);
 
   // Connect SSE and WebSocket
   useSSE({ enabled: shouldInit });
