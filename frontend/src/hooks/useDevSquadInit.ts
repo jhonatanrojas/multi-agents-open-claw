@@ -117,7 +117,7 @@ export function useDevSquadInit(options: UseDevSquadInitOptions = {}) {
       clearInterval(modelsInterval);
       clearInterval(stateInterval);
     };
-  }, []);
+  }, [shouldInit]);
   
   // Fetch miniverse when tab is active
   useEffect(() => {

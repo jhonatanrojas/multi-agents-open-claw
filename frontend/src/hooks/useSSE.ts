@@ -86,7 +86,8 @@ class EventSourceWithCredentials {
         this.eventSource?.close();
         this.eventSource = null;
         
-        if (!this.isIntentionallyClosed) {
+        // Don't reconnect if intentionally closed or max attempts reached
+        if (!this.isIntentionallyClosed && this.reconnectAttempts < this.maxReconnectAttempts) {
           this.attemptReconnect();
         }
       };
@@ -234,6 +235,13 @@ export function useSSE(options: UseSSEOptions = {}) {
       
       eventSource.onerror = () => {
         setConnected(false);
+        // Check if session is still valid on error
+        verifySession().then(isValid => {
+          if (!isValid) {
+            console.log('[SSE] Session invalid, stopping reconnect attempts');
+            disconnect();
+          }
+        });
       };
 
       eventSource.onreconnect = (attempt, maxAttempts) => {
