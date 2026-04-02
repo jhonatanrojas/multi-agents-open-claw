@@ -202,6 +202,16 @@ _COOKIE_AUTH_PATHS = {
     "/api/runs",
     "/api/tasks",
     "/api/agents",
+    # Project endpoints (POST actions)
+    "/api/project/start",
+    "/api/project/load",
+    "/api/project/extend",
+    "/api/project/pause",
+    "/api/project/delete",
+    "/api/project/resume",
+    "/api/project/retry-planning",
+    "/api/project/clarification/reply",
+    # WebSocket endpoints
     "/ws/state",
     "/ws/gateway-events"
 }
