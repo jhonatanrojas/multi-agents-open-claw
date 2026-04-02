@@ -118,6 +118,8 @@ export async function fetchRepos(): Promise<ReposResponse> {
 }
 
 export interface StartProjectParams {
+  name: string;
+  description?: string;
   brief: string;
   repo_url?: string | null;
   repo_name?: string | null;

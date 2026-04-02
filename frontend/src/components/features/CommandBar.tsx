@@ -35,6 +35,15 @@ const PLACEHOLDER: Record<Mode, string> = {
   clarify: 'Escribe tu respuesta a la aclaración...',
 };
 
+/** Extracts a project name from the brief (first sentence or first 50 chars) */
+function extractProjectName(brief: string): string {
+  const cleaned = brief.trim();
+  // Try to get first sentence (up to first ., !, ? or newline)
+  const firstSentence = cleaned.split(/[.!?\n]/)[0]?.trim() || cleaned;
+  // Limit to 80 characters
+  return firstSentence.length > 80 ? firstSentence.slice(0, 77) + '...' : firstSentence;
+}
+
 export function CommandBar() {
   const project  = useMemoryStore((state) => state.project);
   const blockers = useMemoryStore((state) => state.blockers);
@@ -161,10 +170,12 @@ export function CommandBar() {
       }
     } else if (mode === 'new') {
       startMutation.mutate({
-        brief:         trimmed,
-        repo_url:      repoUrl.trim() || undefined,
-        repo_name:     repoName.trim() || undefined,
-        branch:        branch.trim() || undefined,
+        name: extractProjectName(trimmed),
+        description: trimmed,
+        brief: trimmed,
+        repo_url: repoUrl.trim() || undefined,
+        repo_name: repoName.trim() || undefined,
+        branch: branch.trim() || undefined,
         allow_init_repo: allowInit,
       });
     } else if (mode === 'extend') {
