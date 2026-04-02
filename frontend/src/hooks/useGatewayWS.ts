@@ -30,74 +30,108 @@ export function useGatewayWS(options: UseGatewayWSOptions = {}) {
   const addEvent = useGatewayStore((state) => state.addEvent);
   const setStatus = useGatewayStore((state) => state.setStatus);
   
-  const connect = useCallback(() => {
-    // Close existing socket
-    if (socketRef.current) {
-      socketRef.current.close();
+  // Use refs to avoid recreating callbacks
+  const callbacksRef = useRef({ onOpen, onClose, onError });
+  useEffect(() => {
+    callbacksRef.current = { onOpen, onClose, onError };
+  }, [onOpen, onClose, onError]);
+  
+  // Single effect to handle connection lifecycle
+  useEffect(() => {
+    if (!enabled) {
+      setStatus({ connected: false });
+      return;
     }
     
-    try {
-      const url = getGatewayWsUrl();
-      const socket = new WebSocket(url);
-      socketRef.current = socket;
+    let isActive = true;
+    
+    const connect = () => {
+      if (!isActive) return;
       
-      socket.onopen = () => {
-        setStatus({ connected: true, last_error: undefined });
-        onOpen?.();
-      };
-      
-      socket.onmessage = (event) => {
-        try {
-          const data: GatewayWSMessage = JSON.parse(event.data);
-          
-          switch (data.type) {
-            case 'snapshot':
-              if (data.snapshot) {
-                setSnapshot(data.snapshot);
-              }
-              break;
-            case 'event':
-              if (data.event) {
-                addEvent(data.event);
-              }
-              break;
-            case 'status':
-              if (data.status) {
-                setStatus(data.status);
-              }
-              break;
-          }
-        } catch (e) {
-          console.error('Failed to parse Gateway WS message:', e);
-        }
-      };
-      
-      socket.onerror = () => {
-        setStatus({ connected: false });
-        onError?.(new Event('error'));
-      };
-      
-      socket.onclose = () => {
-        setStatus({ connected: false });
-        socketRef.current = null;
-        onClose?.();
+      try {
+        const url = getGatewayWsUrl();
+        const socket = new WebSocket(url);
+        socketRef.current = socket;
         
-        // Reconnect after 4 seconds
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-        }
-        reconnectTimeoutRef.current = window.setTimeout(() => {
-          reconnectTimeoutRef.current = null;
-          if (enabled) {
-            connect();
+        socket.onopen = () => {
+          if (!isActive) return;
+          setStatus({ connected: true, last_error: undefined });
+          callbacksRef.current.onOpen?.();
+        };
+        
+        socket.onmessage = (event) => {
+          if (!isActive) return;
+          try {
+            const data: GatewayWSMessage = JSON.parse(event.data);
+            
+            switch (data.type) {
+              case 'snapshot':
+                if (data.snapshot) {
+                  setSnapshot(data.snapshot);
+                }
+                break;
+              case 'event':
+                if (data.event) {
+                  addEvent(data.event);
+                }
+                break;
+              case 'status':
+                if (data.status) {
+                  setStatus(data.status);
+                }
+                break;
+            }
+          } catch (e) {
+            console.error('Failed to parse Gateway WS message:', e);
           }
-        }, 4000);
-      };
-    } catch (e) {
-      console.error('Failed to create WebSocket:', e);
-      setStatus({ connected: false, last_error: String(e) });
-    }
-  }, [enabled, setSnapshot, addEvent, setStatus, onOpen, onClose, onError]);
+        };
+        
+        socket.onerror = () => {
+          if (!isActive) return;
+          setStatus({ connected: false });
+          callbacksRef.current.onError?.(new Event('error'));
+        };
+        
+        socket.onclose = () => {
+          if (!isActive) return;
+          setStatus({ connected: false });
+          socketRef.current = null;
+          callbacksRef.current.onClose?.();
+          
+          // Reconnect after 4 seconds
+          if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+          }
+          reconnectTimeoutRef.current = window.setTimeout(() => {
+            reconnectTimeoutRef.current = null;
+            if (isActive) {
+              connect();
+            }
+          }, 4000);
+        };
+      } catch (e) {
+        console.error('Failed to create WebSocket:', e);
+        setStatus({ connected: false, last_error: String(e) });
+      }
+    };
+    
+    connect();
+    
+    // Cleanup function
+    return () => {
+      isActive = false;
+      if (socketRef.current) {
+        socketRef.current.close();
+        socketRef.current = null;
+      }
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+    };
+  // Only depend on enabled, not on callbacks or store actions
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled]);
   
   const disconnect = useCallback(() => {
     if (socketRef.current) {
@@ -111,19 +145,15 @@ export function useGatewayWS(options: UseGatewayWSOptions = {}) {
     setStatus({ connected: false });
   }, [setStatus]);
   
-  useEffect(() => {
-    if (enabled) {
-      connect();
-    }
-    
-    return () => {
-      disconnect();
-    };
-  }, [enabled, connect, disconnect]);
+  const reconnect = useCallback(() => {
+    disconnect();
+    // Force re-run of effect
+    setStatus({ connected: false });
+  }, [disconnect, setStatus]);
   
   return {
     isConnected: useGatewayStore((state) => state.status.connected),
     disconnect,
-    reconnect: connect,
+    reconnect,
   };
 }

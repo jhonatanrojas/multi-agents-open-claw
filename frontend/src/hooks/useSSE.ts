@@ -163,110 +163,91 @@ class EventSourceWithCredentials {
 export function useSSE(options: UseSSEOptions = {}) {
   const { enabled = true, onOpen, onClose, onError, onReconnect } = options;
   const eventSourceRef = useRef<EventSourceWithCredentials | null>(null);
-  const reconnectTimeoutRef = useRef<number | null>(null);
   const [connectionState, setConnectionState] = useState<SSEConnectionState>('connecting');
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [reconnectDelay, setReconnectDelay] = useState(0);
   
   const setMemory = useMemoryStore((state) => state.setMemory);
   const setConnected = useMemoryStore((state) => state.setConnected);
-  const { isAuthenticated, checkSession } = useAuthStore();
+  const { isAuthenticated } = useAuthStore();
+  
+  // Use refs to avoid recreating callbacks
+  const callbacksRef = useRef({ onOpen, onClose, onError, onReconnect });
+  useEffect(() => {
+    callbacksRef.current = { onOpen, onClose, onError, onReconnect };
+  }, [onOpen, onClose, onError, onReconnect]);
 
-  const verifySession = useCallback(async (): Promise<boolean> => {
-    try {
-      return await checkSession();
-    } catch (e) {
-      console.error('[SSE] Session verification failed:', e);
-      return false;
+  // Single effect to handle connection lifecycle
+  useEffect(() => {
+    if (!enabled) {
+      setConnectionState('disconnected');
+      setConnected(false);
+      return;
     }
-  }, [checkSession]);
-  
-  const isConnectingRef = useRef(false);
-  
-  const connect = useCallback(async () => {
-    // Prevent multiple simultaneous connection attempts
-    if (isConnectingRef.current) return;
-    
+
+    // Only connect if authenticated
     if (!isAuthenticated) {
-      const hasValidSession = await verifySession();
-      if (!hasValidSession) {
-        setConnectionState('disconnected');
-        setConnected(false);
-        return;
-      }
+      setConnectionState('disconnected');
+      setConnected(false);
+      return;
     }
 
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-    }
-    
     setConnectionState('connecting');
     setReconnectAttempt(0);
-    isConnectingRef.current = true;
     
-    try {
-      const eventSource = new EventSourceWithCredentials(SSE_URL, { 
-        withCredentials: true 
-      });
-      eventSourceRef.current = eventSource;
-      
-      eventSource.onopen = () => {
-        isConnectingRef.current = false;
+    const eventSource = new EventSourceWithCredentials(SSE_URL, { 
+      withCredentials: true 
+    });
+    eventSourceRef.current = eventSource;
+    
+    eventSource.onopen = () => {
+      setConnected(true);
+      setConnectionState('connected');
+      setReconnectAttempt(0);
+      callbacksRef.current.onOpen?.();
+    };
+    
+    eventSource.onmessage = (event: MessageEvent) => {
+      try {
+        if (event.data === ': keepalive') {
+          return;
+        }
+        
+        const data: Memory = JSON.parse(event.data);
+        setMemory(data);
         setConnected(true);
         setConnectionState('connected');
-        setReconnectAttempt(0);
-        onOpen?.();
-      };
-      
-      eventSource.onmessage = (event: MessageEvent) => {
-        try {
-          if (event.data === ': keepalive') {
-            return;
-          }
-          
-          const data: Memory = JSON.parse(event.data);
-          setMemory(data);
-          setConnected(true);
-          setConnectionState('connected');
-        } catch (e) {
-          console.error('[SSE] Failed to parse message:', e);
-        }
-      };
-      
-      eventSource.onerror = () => {
-        setConnected(false);
-        // Check if session is still valid on error
-        verifySession().then(isValid => {
-          if (!isValid) {
-            console.log('[SSE] Session invalid, stopping reconnect attempts');
-            disconnect();
-          }
-        });
-      };
-
-      eventSource.onreconnect = (attempt, maxAttempts) => {
-        setConnectionState('reconnecting');
-        setReconnectAttempt(attempt);
-        setReconnectDelay(eventSource.getNextReconnectDelay());
-        onReconnect?.(attempt, maxAttempts);
-      };
-    } catch (e) {
-      isConnectingRef.current = false;
-      console.error('[SSE] Failed to create EventSource:', e);
+      } catch (e) {
+        console.error('[SSE] Failed to parse message:', e);
+      }
+    };
+    
+    eventSource.onerror = () => {
       setConnected(false);
-      setConnectionState('disconnected');
-    }
-  }, [enabled, isAuthenticated, setMemory, setConnected, onOpen, onError, onReconnect, verifySession]);
+      callbacksRef.current.onError?.(new Event('error'));
+    };
+
+    eventSource.onreconnect = (attempt, maxAttempts) => {
+      setConnectionState('reconnecting');
+      setReconnectAttempt(attempt);
+      setReconnectDelay(eventSource.getNextReconnectDelay());
+      callbacksRef.current.onReconnect?.(attempt, maxAttempts);
+    };
+
+    // Cleanup function
+    return () => {
+      eventSource.close();
+      eventSourceRef.current = null;
+      callbacksRef.current.onClose?.();
+    };
+  // Only depend on enabled and isAuthenticated, not on callbacks or store actions
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, isAuthenticated]);
   
   const disconnect = useCallback(() => {
-    isConnectingRef.current = false; // Reset so connect() can run again after disconnect
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
-    }
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
     }
     setConnected(false);
     setConnectionState('disconnected');
@@ -275,25 +256,9 @@ export function useSSE(options: UseSSEOptions = {}) {
 
   const reconnect = useCallback(() => {
     disconnect();
-    connect();
-  }, [disconnect, connect]);
-
-  useEffect(() => {
-    if (enabled) {
-      connect();
-    } else {
-      disconnect();
-    }
-
-    return () => {
-      disconnect();
-    };
-  }, [enabled, connect, disconnect]);
-  // NOTE: The second useEffect that called reconnect() on connectionState === 'disconnected'
-  // was removed. It caused a race condition: both effects fired together when enabled became
-  // true, the second effect's disconnect() destroyed the EventSource created by the first,
-  // then connect() bailed out due to isConnectingRef still being true → stuck forever.
-  // Internal reconnection is handled by EventSourceWithCredentials (up to 10 attempts).
+    // Force re-run of effect by toggling a dummy state
+    setConnectionState('connecting');
+  }, [disconnect]);
   
   return {
     isConnected: useMemoryStore((state) => state.isConnected),
