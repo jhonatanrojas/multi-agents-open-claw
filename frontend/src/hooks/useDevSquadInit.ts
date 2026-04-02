@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useMemoryStore, useGatewayStore, useModelsStore, useRuntimeStore, useFilesStore, useContextStore, useUIStore, useMiniverseStore } from '@/store';
 import { useSSE } from './useSSE';
 import { useGatewayWS } from './useGatewayWS';
@@ -27,10 +27,15 @@ export function useDevSquadInit(options: UseDevSquadInitOptions = {}) {
   useSSE({ enabled: shouldInit });
   useGatewayWS({ enabled: shouldInit });
   
+  // Track if we've already initialized to prevent double-fetch
+  const hasInitialized = useRef(false);
+  
   // Fetch initial state on mount
   useEffect(() => {
-    // Don't fetch if not authenticated
-    if (!shouldInit) return;
+    // Don't fetch if not authenticated or already initialized
+    if (!shouldInit || hasInitialized.current) return;
+    
+    hasInitialized.current = true;
     
     // Fetch initial state (projects, tasks, agents, etc.)
     const loadState = async () => {
@@ -46,6 +51,7 @@ export function useDevSquadInit(options: UseDevSquadInitOptions = {}) {
         // Silently ignore auth errors (user not logged in yet)
         if (e instanceof Error && e.message.includes('401')) {
           console.log('[DevSquad] Not authenticated, skipping state load');
+          hasInitialized.current = false; // Allow retry after auth
           return;
         }
         console.error('[DevSquad] Failed to load initial state:', e);

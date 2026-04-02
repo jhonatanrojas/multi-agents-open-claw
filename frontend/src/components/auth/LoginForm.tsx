@@ -3,8 +3,10 @@ import { useAuthStore } from '@/store';
 import './LoginForm.css';
 
 export function LoginForm() {
-  const [apiKey, setApiKey] = useState('');
-  const [showKey, setShowKey] = useState(false);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+
   const { login, isLoading, error, clearError, checkSession, sessionChecked } = useAuthStore();
 
   // Check session on mount
@@ -16,11 +18,12 @@ export function LoginForm() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!apiKey.trim()) return;
-    
-    const success = await login(apiKey.trim());
+    if (!username.trim() || !password.trim()) return;
+
+    const success = await login(username.trim(), password.trim());
     if (success) {
-      setApiKey('');
+      setUsername('');
+      setPassword('');
     }
   };
 
@@ -34,27 +37,42 @@ export function LoginForm() {
 
         <form onSubmit={handleSubmit} className="login-form">
           <div className="form-group">
-            <label htmlFor="api-key">API Key</label>
+            <label htmlFor="username">Usuario</label>
+            <input
+              id="username"
+              type="text"
+              value={username}
+              onChange={(e) => {
+                setUsername(e.target.value);
+                if (error) clearError();
+              }}
+              placeholder="Ingresa tu usuario"
+              disabled={isLoading}
+              autoFocus
+            />
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="password">Contraseña</label>
             <div className="input-wrapper">
               <input
-                id="api-key"
-                type={showKey ? 'text' : 'password'}
-                value={apiKey}
+                id="password"
+                type={showPassword ? 'text' : 'password'}
+                value={password}
                 onChange={(e) => {
-                  setApiKey(e.target.value);
+                  setPassword(e.target.value);
                   if (error) clearError();
                 }}
-                placeholder="Enter your API key"
+                placeholder="Ingresa tu contraseña"
                 disabled={isLoading}
-                autoFocus
               />
               <button
                 type="button"
                 className="toggle-visibility"
-                onClick={() => setShowKey(!showKey)}
+                onClick={() => setShowPassword(!showPassword)}
                 tabIndex={-1}
               >
-                {showKey ? '🙈' : '👁️'}
+                {showPassword ? '🙈' : '👁️'}
               </button>
             </div>
           </div>
@@ -69,15 +87,15 @@ export function LoginForm() {
           <button
             type="submit"
             className="login-button"
-            disabled={isLoading || !apiKey.trim()}
+            disabled={isLoading || !username.trim() || !password.trim()}
           >
             {isLoading ? (
               <>
                 <span className="spinner"></span>
-                Authenticating...
+                Autenticando...
               </>
             ) : (
-              'Login'
+              'Iniciar Sesión'
             )}
           </button>
         </form>
@@ -87,7 +105,7 @@ export function LoginForm() {
             <strong>Dev Squad</strong> — ARCH, BYTE, PIXEL
           </p>
           <p className="hint">
-            Use your DASHBOARD_API_KEY to access the dashboard
+            Credenciales configuradas en el servidor
           </p>
         </div>
       </div>

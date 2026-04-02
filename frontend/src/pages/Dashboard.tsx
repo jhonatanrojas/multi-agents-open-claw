@@ -34,6 +34,9 @@ const TABS: Array<{ id: TabId; label: string }> = [
 ];
 
 export function Dashboard() {
+  // =====================
+  // ALL HOOKS MUST BE CALLED BEFORE ANY CONDITIONAL RETURNS
+  // =====================
   const activeTab = useUIStore((state) => state.activeTab);
   const setActiveTab = useUIStore((state) => state.setActiveTab);
   const projectViewMode = useUIStore((state) => state.projectViewMode);
@@ -49,6 +52,13 @@ export function Dashboard() {
   // Auth state
   const { isAuthenticated, isLoading: authLoading } = useAuthStore();
   const { success, error: showError } = useToast();
+
+  // Status message - MUST be before conditional returns
+  const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
+
+  // =====================
+  // CONDITIONAL RETURNS (AFTER ALL HOOKS)
+  // =====================
 
   // Show skeleton while checking auth
   if (authLoading) {
@@ -83,7 +93,6 @@ export function Dashboard() {
     });
   
   // Status message
-  const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
   
   // Check for duplicate active projects
   const checkDuplicateProject = (brief: string): Project | null => {

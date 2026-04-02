@@ -180,7 +180,12 @@ export function useSSE(options: UseSSEOptions = {}) {
     }
   }, [checkSession]);
   
+  const isConnectingRef = useRef(false);
+  
   const connect = useCallback(async () => {
+    // Prevent multiple simultaneous connection attempts
+    if (isConnectingRef.current) return;
+    
     if (!isAuthenticated) {
       const hasValidSession = await verifySession();
       if (!hasValidSession) {
@@ -196,6 +201,7 @@ export function useSSE(options: UseSSEOptions = {}) {
     
     setConnectionState('connecting');
     setReconnectAttempt(0);
+    isConnectingRef.current = true;
     
     try {
       const eventSource = new EventSourceWithCredentials(SSE_URL, { 
@@ -204,6 +210,7 @@ export function useSSE(options: UseSSEOptions = {}) {
       eventSourceRef.current = eventSource;
       
       eventSource.onopen = () => {
+        isConnectingRef.current = false;
         setConnected(true);
         setConnectionState('connected');
         setReconnectAttempt(0);
@@ -236,6 +243,7 @@ export function useSSE(options: UseSSEOptions = {}) {
         onReconnect?.(attempt, maxAttempts);
       };
     } catch (e) {
+      isConnectingRef.current = false;
       console.error('[SSE] Failed to create EventSource:', e);
       setConnected(false);
       setConnectionState('disconnected');
