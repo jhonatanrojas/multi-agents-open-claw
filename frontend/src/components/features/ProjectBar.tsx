@@ -1,8 +1,6 @@
-import { useState } from 'react';
 import { useMemoryStore } from '@/store';
 import {
   useDeleteProject,
-  useExtendProject,
   usePauseProject,
   useResumeProject,
   useRetryPlanning,
@@ -18,15 +16,8 @@ export function ProjectBar() {
   const pauseMutation = usePauseProject();
   const resumeMutation = useResumeProject();
   const retryPlanningMutation = useRetryPlanning();
-  const extendProjectMutation = useExtendProject();
   const deleteMutation = useDeleteProject();
-  const [extensionBrief, setExtensionBrief] = useState('');
-  const [autoResume, setAutoResume] = useState(true);
-  const [extensionFeedback, setExtensionFeedback] = useState<{
-    type: 'success' | 'error';
-    text: string;
-  } | null>(null);
-  
+
   if (!project) {
     return (
       <Panel title="Sin proyecto activo">
@@ -41,48 +32,9 @@ export function ProjectBar() {
   const completedTasks = tasks.filter((t: Task) => t.status === 'done').length;
   const totalTasks = tasks.length;
   const progress = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
-  const normalizedProjectStatus = String(project.status || '').toLowerCase();
-  const isDeliveredProject = normalizedProjectStatus === 'delivered' || normalizedProjectStatus === 'completed';
   const canRetryPlanning =
     project.orchestrator?.status === 'error' && project.orchestrator?.phase === 'planning';
 
-  const handleExtendProject = () => {
-    const brief = extensionBrief.trim();
-    if (!brief) {
-      setExtensionFeedback({
-        type: 'error',
-        text: 'Describe la nueva característica o modificación antes de agregarla.',
-      });
-      return;
-    }
-
-    setExtensionFeedback(null);
-    extendProjectMutation.mutate(
-      {
-        brief,
-        project_id: project.id,
-        auto_resume: autoResume,
-        source: 'dashboard',
-      },
-      {
-        onSuccess: (data) => {
-          setExtensionBrief('');
-          setExtensionFeedback({
-            type: 'success',
-            text: `${data.message}: ${data.task_id} · ${data.task_title}`,
-          });
-          window.setTimeout(() => setExtensionFeedback(null), 4000);
-        },
-        onError: (error) => {
-          setExtensionFeedback({
-            type: 'error',
-            text: `No se pudo agregar la extensión: ${String(error)}`,
-          });
-        },
-      }
-    );
-  };
-  
   return (
     <div className="project-bar">
       {/* Header */}
@@ -161,62 +113,6 @@ export function ProjectBar() {
         </div>
       </div>
 
-      <div className="project-extension">
-        <div className="project-extension-header">
-          <div>
-            <div className="project-extension-title">Extender proyecto</div>
-            <div className="project-extension-subtitle">
-              {isDeliveredProject
-                ? 'El proyecto está entregado. Esta acción lo reabre en la misma memoria y encola una nueva tarea sin crear otro proyecto.'
-                : 'Agrega una nueva característica o modificación al proyecto actual sin crear un proyecto nuevo.'}
-            </div>
-          </div>
-          <Badge variant={isDeliveredProject ? 'warning' : 'info'}>
-            {isDeliveredProject ? 'Reabrir' : 'Extensión'}
-          </Badge>
-        </div>
-
-        <textarea
-          className="input-field project-extension-textarea"
-          value={extensionBrief}
-          onChange={(e) => {
-            setExtensionBrief(e.target.value);
-            setExtensionFeedback(null);
-          }}
-          placeholder="Ej: Agregar autenticación JWT, documentar el flujo del coordinador o mejorar el selector de modelos."
-          rows={4}
-        />
-
-        <label className="project-extension-toggle">
-          <input
-            type="checkbox"
-            checked={autoResume}
-            onChange={(e) => setAutoResume(e.target.checked)}
-          />
-          Reanudar automáticamente al encolar la extensión
-        </label>
-
-        {extensionFeedback && (
-          <div className={`project-extension-feedback ${extensionFeedback.type}`}>
-            {extensionFeedback.text}
-          </div>
-        )}
-
-        <div className="form-actions project-extension-actions">
-          <button
-            type="button"
-            className="btn-primary"
-            onClick={handleExtendProject}
-            disabled={extendProjectMutation.isPending || !extensionBrief.trim()}
-          >
-            {extendProjectMutation.isPending
-              ? 'Encolando...'
-              : autoResume
-                ? 'Agregar y reanudar'
-                : 'Agregar extensión'}
-          </button>
-        </div>
-      </div>
     </div>
   );
 }

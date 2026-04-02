@@ -259,6 +259,7 @@ export function useSSE(options: UseSSEOptions = {}) {
   }, [enabled, isAuthenticated, setMemory, setConnected, onOpen, onError, onReconnect, verifySession]);
   
   const disconnect = useCallback(() => {
+    isConnectingRef.current = false; // Reset so connect() can run again after disconnect
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
@@ -276,24 +277,23 @@ export function useSSE(options: UseSSEOptions = {}) {
     disconnect();
     connect();
   }, [disconnect, connect]);
-  
+
   useEffect(() => {
     if (enabled) {
       connect();
     } else {
       disconnect();
     }
-    
+
     return () => {
       disconnect();
     };
   }, [enabled, connect, disconnect]);
-
-  useEffect(() => {
-    if (enabled && isAuthenticated && connectionState === 'disconnected') {
-      reconnect();
-    }
-  }, [enabled, isAuthenticated, connectionState, reconnect]);
+  // NOTE: The second useEffect that called reconnect() on connectionState === 'disconnected'
+  // was removed. It caused a race condition: both effects fired together when enabled became
+  // true, the second effect's disconnect() destroyed the EventSource created by the first,
+  // then connect() bailed out due to isConnectingRef still being true → stuck forever.
+  // Internal reconnection is handled by EventSourceWithCredentials (up to 10 attempts).
   
   return {
     isConnected: useMemoryStore((state) => state.isConnected),

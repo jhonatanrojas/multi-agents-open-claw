@@ -87,6 +87,36 @@ export async function testModel(model: string): Promise<{
 
 // ============ PROJECTS ============
 
+export interface RepoLocal {
+  name: string;
+  path: string;
+  url: string | null;
+}
+
+export interface RepoGitHub {
+  name: string;
+  full_name: string;
+  url: string;
+  ssh_url?: string;
+  description: string;
+  private: boolean;
+  default_branch: string;
+  updated_at?: string;
+  is_local: boolean;
+}
+
+export interface ReposResponse {
+  local: RepoLocal[];
+  github: RepoGitHub[];
+  has_github_token: boolean;
+  github_error?: string;
+  error?: string;
+}
+
+export async function fetchRepos(): Promise<ReposResponse> {
+  return apiCall<ReposResponse>('/project/repos');
+}
+
 export interface StartProjectParams {
   brief: string;
   repo_url?: string | null;

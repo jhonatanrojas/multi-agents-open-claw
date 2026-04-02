@@ -972,13 +972,12 @@ async def _auth_middleware(request: Request, call_next):
         # Check header auth first
         if request.headers.get("X-API-Key") == _API_KEY:
             return await call_next(request)
-        
-        # Check cookie auth for streaming endpoints (F0.1)
-        if path in _COOKIE_AUTH_PATHS:
-            session_token = request.cookies.get("dashboard_session")
-            if _validate_session(session_token):
-                return await call_next(request)
-        
+
+        # Check cookie auth for all authenticated endpoints (F0.1)
+        session_token = request.cookies.get("dashboard_session")
+        if _validate_session(session_token):
+            return await call_next(request)
+
         # Unauthorized
         return JSONResponse(
             {"error": "Unauthorized — provide a valid X-API-Key header or session cookie"},

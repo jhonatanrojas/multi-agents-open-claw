@@ -64,6 +64,17 @@ export function useTestModel() {
   });
 }
 
+// ============ REPOS ============
+
+export function useRepos(enabled = false) {
+  return useQuery({
+    queryKey: ['repos'],
+    queryFn: api.fetchRepos,
+    enabled,
+    staleTime: 30_000, // re-fetch after 30s
+  });
+}
+
 // ============ PROJECTS ============
 
 export function useStartProject(options?: { 

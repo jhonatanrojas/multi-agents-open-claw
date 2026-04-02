@@ -1,10 +1,84 @@
 """Projects router - handles project management endpoints."""
 
+import json
+import subprocess
+import urllib.request
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Optional
 
 router = APIRouter(prefix="/api/project", tags=["projects"])
+
+
+@router.get("/repos")
+def list_repos():
+    """List available repositories: local clones + GitHub repos (if token configured)."""
+    try:
+        from pathlib import Path
+        from coordination import PROJECTS_ROOT
+        from config import config
+
+        result: dict = {"local": [], "github": [], "has_github_token": False}
+
+        # ── Local repos (PROJECTS_ROOT scan) ──────────────────────────────
+        if PROJECTS_ROOT.exists():
+            for entry in sorted(PROJECTS_ROOT.iterdir()):
+                if not entry.is_dir():
+                    continue
+                git_dir = entry / ".git"
+                if not git_dir.exists():
+                    continue
+                url = None
+                try:
+                    url = subprocess.check_output(
+                        ["git", "remote", "get-url", "origin"],
+                        cwd=str(entry),
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        timeout=3,
+                    ).strip()
+                except Exception:
+                    pass
+                result["local"].append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "url": url,
+                })
+
+        # ── GitHub repos ──────────────────────────────────────────────────
+        token = config.GITHUB_TOKEN or config.OPENCLAW_GITHUB_TOKEN
+        if token:
+            result["has_github_token"] = True
+            try:
+                req = urllib.request.Request(
+                    "https://api.github.com/user/repos?per_page=50&sort=updated&affiliation=owner,collaborator",
+                    headers={
+                        "Authorization": f"token {token}",
+                        "Accept": "application/vnd.github.v3+json",
+                        "User-Agent": "OpenClaw-Dashboard/1.0",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    repos = json.loads(resp.read().decode())
+                    local_names = {r["name"] for r in result["local"]}
+                    for repo in repos:
+                        result["github"].append({
+                            "name": repo["name"],
+                            "full_name": repo["full_name"],
+                            "url": repo["clone_url"],
+                            "ssh_url": repo.get("ssh_url"),
+                            "description": repo.get("description") or "",
+                            "private": repo.get("private", False),
+                            "default_branch": repo.get("default_branch", "main"),
+                            "updated_at": repo.get("updated_at"),
+                            "is_local": repo["name"] in local_names,
+                        })
+            except Exception as exc:
+                result["github_error"] = str(exc)
+
+        return result
+    except Exception as exc:
+        return {"local": [], "github": [], "has_github_token": False, "error": str(exc)}
 
 
 class ProjectStartRequest(BaseModel):

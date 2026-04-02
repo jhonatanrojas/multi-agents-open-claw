@@ -37,6 +37,12 @@ body {
   min-height: 100vh;
 }
 
+/* ── Global animations ── */
+@keyframes liveBlip {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.3; transform: scale(0.7); }
+}
+
 /* Utility classes */
 .wrap {
   padding: 1.5rem 1rem;

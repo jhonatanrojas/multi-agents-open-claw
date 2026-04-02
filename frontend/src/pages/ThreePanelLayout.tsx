@@ -199,10 +199,21 @@ export function ThreePanelLayout() {
       
       default:
         return (
-          <div className="right-panel-content empty">
-            <div className="empty-hint">
-              <span>📌</span>
-              <p>Selecciona un archivo o tab para ver contenido aquí</p>
+          <div className="right-panel-content">
+            <div className="right-panel-header">
+              <span>💬 Actividad en vivo</span>
+            </div>
+            <div className="gateway-chats">
+              {chatEvents.length === 0 ? (
+                <div className="empty-hint">
+                  <span>📡</span>
+                  <p>Los mensajes de los agentes aparecerán aquí</p>
+                </div>
+              ) : (
+                chatEvents.slice(0, 8).map((event, i) => (
+                  <GatewayChatCard key={i} event={event} compact />
+                ))
+              )}
             </div>
           </div>
         );

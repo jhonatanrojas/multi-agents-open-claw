@@ -22,41 +22,52 @@ export function useDevSquadInit(options: UseDevSquadInitOptions = {}) {
   
   // Only initialize if enabled and authenticated
   const shouldInit = enabled && isAuthenticated;
-  
+
   // Connect SSE and WebSocket
   useSSE({ enabled: shouldInit });
   useGatewayWS({ enabled: shouldInit });
-  
+
   // Track if we've already initialized to prevent double-fetch
   const hasInitialized = useRef(false);
-  
+
+  // Fetch initial state (projects, tasks, agents, etc.)
+  const loadState = async () => {
+    try {
+      const state = await fetchState();
+      useMemoryStore.getState().setMemory(state);
+      console.log('[DevSquad] Initial state loaded:', {
+        project: state.project?.name,
+        projects: state.projects?.length,
+        tasks: state.tasks?.length,
+      });
+    } catch (e) {
+      // Silently ignore auth errors (user not logged in yet)
+      if (e instanceof Error && e.message.includes('401')) {
+        console.log('[DevSquad] Not authenticated, skipping state load');
+        hasInitialized.current = false; // Allow retry after auth
+        return;
+      }
+      console.error('[DevSquad] Failed to load initial state:', e);
+    }
+  };
+
+  // Immediately load state when auth transitions to true (avoids waiting for the 3s interval)
+  const prevAuthRef = useRef(isAuthenticated);
+  useEffect(() => {
+    if (isAuthenticated && !prevAuthRef.current) {
+      loadState();
+    }
+    prevAuthRef.current = isAuthenticated;
+  // loadState is stable (defined outside effects with store refs only)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated]);
+
   // Fetch initial state on mount only
   useEffect(() => {
-    // Only run once on mount - auth changes are handled by SSE reconnect
+    // Only run once on mount - auth changes handled by the effect above + SSE
     if (hasInitialized.current) return;
-    
+
     hasInitialized.current = true;
-    
-    // Fetch initial state (projects, tasks, agents, etc.)
-    const loadState = async () => {
-      try {
-        const state = await fetchState();
-        useMemoryStore.getState().setMemory(state);
-        console.log('[DevSquad] Initial state loaded:', {
-          project: state.project?.name,
-          projects: state.projects?.length,
-          tasks: state.tasks?.length,
-        });
-      } catch (e) {
-        // Silently ignore auth errors (user not logged in yet)
-        if (e instanceof Error && e.message.includes('401')) {
-          console.log('[DevSquad] Not authenticated, skipping state load');
-          hasInitialized.current = false; // Allow retry after auth
-          return;
-        }
-        console.error('[DevSquad] Failed to load initial state:', e);
-      }
-    };
     
     // Fetch models on mount
     const loadModels = async () => {

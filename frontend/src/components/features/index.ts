@@ -17,7 +17,7 @@ export { FilePreview } from './FilePreview';
 export { ProjectItem } from './ProjectItem';
 export { ProjectSelector } from './ProjectSelector';
 export { ProjectsPanel } from './ProjectsPanel';
-export { StartProjectForm } from './StartProjectForm';
+export { CommandBar } from './CommandBar';
 export { CopilotTab } from './CopilotTab';
 export { ModelSelect } from './ModelSelect';
 export { ModelsPanel } from './ModelsPanel';
