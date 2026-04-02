@@ -30,10 +30,10 @@ export function useDevSquadInit(options: UseDevSquadInitOptions = {}) {
   // Track if we've already initialized to prevent double-fetch
   const hasInitialized = useRef(false);
   
-  // Fetch initial state on mount
+  // Fetch initial state on mount only
   useEffect(() => {
-    // Don't fetch if not authenticated or already initialized
-    if (!shouldInit || hasInitialized.current) return;
+    // Only run once on mount - auth changes are handled by SSE reconnect
+    if (hasInitialized.current) return;
     
     hasInitialized.current = true;
     
@@ -117,7 +117,10 @@ export function useDevSquadInit(options: UseDevSquadInitOptions = {}) {
       clearInterval(modelsInterval);
       clearInterval(stateInterval);
     };
-  }, [shouldInit]);
+  // Empty dependency array - only run on mount
+  // Auth state changes are handled by SSE/WebSocket reconnection logic
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   
   // Fetch miniverse when tab is active
   useEffect(() => {
